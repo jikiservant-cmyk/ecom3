@@ -1,0 +1,6 @@
+{
+  "name": "Drum Palace",
+  "description": "Premium Musical Instruments & Pro Audio Gear for stage, studio, and performance.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
