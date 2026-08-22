@@ -13,115 +13,49 @@ export function DrumPalaceLogo({ className = "", size = 64, showText = false }: 
     <div className={`inline-flex flex-col items-center select-none ${className}`}>
       <svg
         width={size}
-        height={size}
-        viewBox="0 0 160 160"
+        height={size * (853 / 1280)}
+        viewBox="0 0 1280 853"
         fill="none"
         xmlns="http://www.w3.org/2000/svg"
         className="shrink-0 transition-transform duration-300 hover:scale-105"
       >
-        {/* Outer and Inner Circle Rings */}
-        <circle cx="80" cy="80" r="76" stroke="#049da4" strokeWidth="2.5" strokeDasharray="3 3" opacity="0.4" />
-        <circle cx="80" cy="80" r="72" stroke="#049da4" strokeWidth="2.5" />
-        <circle cx="80" cy="80" r="67" stroke="#049da4" strokeWidth="1.2" opacity="0.8" />
-        <circle cx="80" cy="80" r="46" stroke="#049da4" strokeWidth="1" strokeDasharray="2 2" opacity="0.5" />
-
-        {/* Curved Path Definition for Top Text */}
         <defs>
-          <path id="curveTop" d="M 28 80 A 52 52 0 0 1 132 80" />
-          <path id="curveBottom" d="M 132 80 A 52 52 0 0 1 28 80" />
-          <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
-            <feDropShadow dx="0" dy="1" stdDeviation="1" floodColor="#049da4" floodOpacity="0.25" />
+          <linearGradient id="tealGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#c9fbf7"/>
+            <stop offset="28%" stopColor="#4be9dd"/>
+            <stop offset="60%" stopColor="#12b7ab"/>
+            <stop offset="100%" stopColor="#08867d"/>
+          </linearGradient>
+          <linearGradient id="whiteGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#ffffff"/>
+            <stop offset="60%" stopColor="#ffffff"/>
+            <stop offset="100%" stopColor="#d6d6d6"/>
+          </linearGradient>
+          <filter id="tealShadow" x="-20%" y="-20%" width="140%" height="140%">
+            <feDropShadow dx="0" dy="0" stdDeviation="14" floodColor="#37e5d8" floodOpacity="0.55"/>
+            <feDropShadow dx="4" dy="5" stdDeviation="0" floodColor="#063f3a" floodOpacity="0.9"/>
+          </filter>
+          <filter id="whiteShadow" x="-20%" y="-20%" width="140%" height="140%">
+            <feDropShadow dx="0" dy="0" stdDeviation="10" floodColor="#ffffff" floodOpacity="0.3"/>
+            <feDropShadow dx="4" dy="5" stdDeviation="0" floodColor="#3a3a3a" floodOpacity="0.85"/>
           </filter>
         </defs>
 
-        {/* Top Arc Text: ALL ABOUT QUALITY */}
-        <text
-          fontSize="9.5"
-          fontWeight="800"
-          fill="#101a1b"
-          letterSpacing="2.2"
-          textAnchor="middle"
-          className="dark:fill-teal-300"
-        >
-          <textPath href="#curveTop" startOffset="50%">
-            ALL ABOUT QUALITY
-          </textPath>
-        </text>
+        <rect x="0" y="0" width="1280" height="853" fill="transparent"/>
 
-        {/* Center Drum Kit Silhouette */}
-        <g transform="translate(48, 50) scale(0.65)" stroke="#101a1b" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round" fill="none" className="dark:stroke-teal-100">
-          {/* Bass Drum */}
-          <circle cx="50" cy="52" r="24" fill="#049da4" fillOpacity="0.12" stroke="#049da4" strokeWidth="3" />
-          <circle cx="50" cy="52" r="19" stroke="#049da4" strokeWidth="1.5" strokeDasharray="3 2" />
-          
-          {/* Bass drum spurs */}
-          <path d="M 28 66 L 16 78" strokeWidth="3" />
-          <path d="M 72 66 L 84 78" strokeWidth="3" />
-
-          {/* Snare Drum & High Tom */}
-          <ellipse cx="22" cy="38" rx="14" ry="7" fill="#049da4" fillOpacity="0.1" />
-          <path d="M 8 38 L 8 46 Q 22 53 36 46 L 36 38" />
-          <line x1="22" y1="46" x2="22" y2="76" strokeWidth="2" />
-          <path d="M 14 76 L 30 76" strokeWidth="2" />
-
-          {/* Floor Tom */}
-          <ellipse cx="78" cy="40" rx="14" ry="7" fill="#049da4" fillOpacity="0.1" />
-          <path d="M 64 40 L 64 48 Q 78 55 92 48 L 92 40" />
-          <line x1="78" y1="48" x2="78" y2="76" strokeWidth="2" />
-
-          {/* Cymbals (Hi-Hat & Crash) */}
-          <path d="M 6 22 Q 22 14 38 22" stroke="#049da4" strokeWidth="2.5" />
-          <line x1="22" y1="18" x2="22" y2="38" strokeWidth="2" />
-
-          <path d="M 62 18 Q 78 10 94 18" stroke="#049da4" strokeWidth="2.5" />
-          <line x1="78" y1="14" x2="78" y2="40" strokeWidth="2" />
-
-          {/* Drumsticks crossed */}
-          <line x1="32" y1="28" x2="68" y2="60" stroke="#049da4" strokeWidth="2" />
-          <line x1="68" y1="28" x2="32" y2="60" stroke="#049da4" strokeWidth="2" />
-        </g>
-
-        {/* DRUM PALACE Center Banner */}
-        <rect x="20" y="106" width="120" height="22" rx="3" fill="#ffffff" stroke="#049da4" strokeWidth="1.5" className="dark:fill-slate-900" />
-        <text
-          x="80"
-          y="121"
-          textAnchor="middle"
-          fontSize="12"
-          fontWeight="900"
-          letterSpacing="1.8"
-          fill="#101a1b"
-          className="dark:fill-white"
-        >
-          DRUM PALACE
-        </text>
-
-        {/* Bottom Arc Text: EST. 2024 */}
-        <text
-          fontSize="8.5"
-          fontWeight="700"
-          fill="#049da4"
-          letterSpacing="3"
-          textAnchor="middle"
-        >
-          <textPath href="#curveBottom" startOffset="50%">
-            EST. 2024
-          </textPath>
-        </text>
+        <path d="M 419 447 L 475 447 L 502 383 L 649 383 L 684 371 L 707 349 L 718 322 L 718 291 L 709 264 L 703 255 L 683 238 L 651 226 L 436 224 L 436 279 L 641 278 L 655 283 L 662 290 L 667 309 L 656 325 L 642 330 L 465 331 Z M 108 225 L 108 278 L 111 282 L 115 282 L 113 278 L 317 279 L 342 289 L 357 303 L 366 321 L 367 339 L 357 366 L 344 379 L 330 386 L 304 390 L 194 389 L 226 312 L 237 306 L 169 304 L 106 448 L 324 445 L 348 439 L 372 426 L 402 391 L 417 345 L 417 322 L 407 284 L 411 283 L 394 258 L 372 241 L 344 229 L 312 224 Z" fill="url(#tealGrad)" fillRule="evenodd" filter="url(#tealShadow)"/>
+        <path d="M 951 535 L 951 565 L 974 565 L 974 560 L 958 560 L 957 559 L 957 553 L 958 552 L 959 552 L 960 551 L 968 551 L 969 552 L 971 552 L 971 547 L 959 547 L 957 545 L 957 541 L 958 540 L 969 540 L 970 539 L 974 539 L 974 535 Z M 907 535 L 907 565 L 912 565 L 913 564 L 913 547 L 914 546 L 915 546 L 916 547 L 916 548 L 919 551 L 919 552 L 921 554 L 921 555 L 924 558 L 924 559 L 928 563 L 928 564 L 929 565 L 935 565 L 935 561 L 934 560 L 934 535 L 929 535 L 929 551 L 928 552 L 927 552 L 924 549 L 924 548 L 921 545 L 921 544 L 917 540 L 917 539 L 913 535 Z M 873 535 L 872 536 L 872 564 L 873 565 L 896 565 L 896 560 L 879 560 L 878 559 L 878 553 L 879 552 L 886 552 L 887 551 L 888 551 L 889 552 L 891 552 L 892 551 L 892 547 L 880 547 L 878 545 L 878 541 L 879 540 L 894 540 L 895 539 L 896 539 L 896 535 Z M 832 535 L 832 558 L 833 559 L 833 560 L 834 561 L 834 562 L 835 563 L 836 563 L 838 565 L 840 565 L 841 566 L 849 566 L 850 565 L 852 565 L 854 563 L 855 563 L 857 561 L 857 559 L 858 558 L 858 535 L 853 535 L 853 555 L 852 556 L 852 557 L 849 560 L 847 560 L 846 561 L 843 561 L 842 560 L 841 560 L 839 558 L 839 557 L 838 556 L 838 536 L 837 535 Z M 764 535 L 764 565 L 769 565 L 769 535 Z M 720 535 L 720 565 L 726 565 L 726 547 L 727 546 L 728 546 L 729 547 L 729 548 L 732 551 L 732 552 L 735 555 L 735 556 L 738 559 L 738 560 L 740 562 L 740 563 L 742 565 L 747 565 L 748 564 L 748 535 L 742 535 L 742 551 L 741 552 L 740 552 L 738 550 L 738 549 L 735 546 L 735 545 L 730 540 L 730 539 L 727 536 L 727 535 Z M 677 535 L 677 554 L 678 555 L 678 559 L 680 561 L 680 562 L 681 563 L 682 563 L 684 565 L 686 565 L 687 566 L 695 566 L 696 565 L 698 565 L 703 560 L 703 559 L 704 558 L 704 535 L 699 535 L 699 554 L 698 555 L 698 557 L 695 560 L 694 560 L 693 561 L 689 561 L 688 560 L 687 560 L 683 556 L 683 535 Z M 609 535 L 610 536 L 610 537 L 609 538 L 609 565 L 626 565 L 627 564 L 630 564 L 631 563 L 632 563 L 634 561 L 635 561 L 636 560 L 636 559 L 638 557 L 638 555 L 639 554 L 639 545 L 638 544 L 638 543 L 637 542 L 637 541 L 634 538 L 633 538 L 632 537 L 631 537 L 630 536 L 628 536 L 627 535 Z M 617 540 L 626 540 L 627 541 L 628 541 L 629 542 L 630 542 L 631 543 L 631 544 L 632 545 L 632 546 L 633 547 L 633 553 L 632 554 L 632 555 L 629 558 L 628 558 L 627 559 L 625 559 L 624 560 L 617 560 L 616 559 L 616 541 Z M 567 535 L 567 565 L 572 565 L 572 564 L 573 563 L 573 547 L 574 546 L 575 546 L 576 547 L 576 548 L 579 551 L 579 552 L 582 555 L 582 556 L 585 559 L 585 560 L 588 563 L 588 564 L 589 565 L 595 565 L 595 535 L 589 535 L 589 552 L 588 553 L 587 553 L 586 552 L 586 551 L 584 549 L 584 548 L 580 544 L 580 543 L 576 539 L 576 538 L 573 535 Z M 534 535 L 534 536 L 533 537 L 533 538 L 532 539 L 532 541 L 531 542 L 531 543 L 530 544 L 530 545 L 529 546 L 529 548 L 528 549 L 528 550 L 527 551 L 527 552 L 526 553 L 526 554 L 525 555 L 525 557 L 524 558 L 524 560 L 522 562 L 522 563 L 521 564 L 521 565 L 528 565 L 528 563 L 529 562 L 529 560 L 530 559 L 544 559 L 547 562 L 547 563 L 548 564 L 548 565 L 554 565 L 554 564 L 553 563 L 553 561 L 552 560 L 552 559 L 551 558 L 551 556 L 550 555 L 550 554 L 548 552 L 548 550 L 547 549 L 547 547 L 546 546 L 546 545 L 545 544 L 545 542 L 544 541 L 544 540 L 543 539 L 543 537 L 541 535 Z M 537 543 L 538 543 L 540 545 L 540 546 L 541 547 L 541 549 L 542 550 L 542 551 L 543 552 L 543 553 L 542 554 L 540 554 L 539 553 L 534 553 L 533 552 L 533 551 L 534 550 L 534 549 L 535 548 L 535 547 L 536 546 L 536 544 Z M 461 535 L 461 536 L 464 539 L 464 540 L 465 541 L 465 542 L 466 543 L 466 544 L 468 546 L 468 547 L 469 548 L 469 549 L 471 551 L 471 552 L 472 553 L 472 565 L 478 565 L 478 552 L 480 550 L 480 549 L 481 548 L 481 547 L 483 545 L 483 544 L 485 542 L 485 541 L 488 538 L 488 537 L 489 536 L 489 535 L 482 535 L 482 536 L 481 537 L 481 538 L 479 540 L 479 541 L 478 542 L 478 543 L 476 545 L 474 545 L 473 544 L 473 543 L 472 542 L 472 541 L 470 539 L 470 538 L 468 536 L 468 535 Z M 425 535 L 425 540 L 435 540 L 436 541 L 436 565 L 442 565 L 442 541 L 443 540 L 452 540 L 452 535 Z M 407 535 L 407 565 L 412 565 L 413 564 L 413 535 Z M 375 535 L 375 565 L 397 565 L 397 560 L 382 560 L 381 559 L 381 535 Z M 343 535 L 342 536 L 342 537 L 341 538 L 341 539 L 340 540 L 340 541 L 339 542 L 339 544 L 338 545 L 338 546 L 337 547 L 337 548 L 336 549 L 336 551 L 335 552 L 335 553 L 334 554 L 334 556 L 333 557 L 333 558 L 332 559 L 332 560 L 331 561 L 331 563 L 330 564 L 330 565 L 336 565 L 337 564 L 337 562 L 338 561 L 338 560 L 339 559 L 353 559 L 355 561 L 355 562 L 356 563 L 356 564 L 357 565 L 363 565 L 363 564 L 362 563 L 362 562 L 361 561 L 361 560 L 360 559 L 360 557 L 359 556 L 359 555 L 358 554 L 358 553 L 357 552 L 357 551 L 356 550 L 356 548 L 354 546 L 354 544 L 353 543 L 353 542 L 352 541 L 352 539 L 351 538 L 351 537 L 350 536 L 350 535 Z M 346 542 L 347 542 L 348 543 L 348 545 L 349 546 L 349 547 L 350 548 L 350 550 L 351 551 L 351 552 L 350 553 L 343 553 L 342 552 L 342 550 L 343 549 L 343 547 L 344 546 L 344 545 L 345 544 L 345 543 Z M 292 535 L 292 558 L 293 559 L 293 560 L 294 561 L 294 562 L 295 563 L 296 563 L 297 564 L 298 564 L 299 565 L 301 565 L 302 566 L 309 566 L 310 565 L 312 565 L 313 564 L 314 564 L 318 560 L 318 559 L 319 558 L 319 535 L 314 535 L 314 553 L 313 554 L 313 556 L 312 557 L 312 558 L 310 560 L 308 560 L 307 561 L 303 561 L 302 560 L 301 560 L 298 557 L 298 535 Z M 1033 534 L 1032 535 L 1030 535 L 1029 536 L 1028 536 L 1027 537 L 1026 537 L 1026 538 L 1025 539 L 1025 541 L 1024 542 L 1024 545 L 1025 546 L 1025 547 L 1027 549 L 1028 549 L 1029 550 L 1030 550 L 1031 551 L 1034 551 L 1035 552 L 1037 552 L 1038 553 L 1039 553 L 1040 554 L 1041 554 L 1042 555 L 1042 558 L 1040 560 L 1039 560 L 1038 561 L 1034 561 L 1033 560 L 1031 560 L 1030 559 L 1029 559 L 1028 558 L 1027 558 L 1026 557 L 1025 557 L 1023 559 L 1023 561 L 1025 563 L 1026 563 L 1027 564 L 1029 564 L 1030 565 L 1032 565 L 1033 566 L 1040 566 L 1041 565 L 1042 565 L 1043 564 L 1044 564 L 1045 563 L 1046 563 L 1046 562 L 1048 560 L 1048 553 L 1047 552 L 1047 551 L 1045 549 L 1044 549 L 1043 548 L 1041 548 L 1040 547 L 1037 547 L 1036 546 L 1033 546 L 1031 544 L 1031 541 L 1033 539 L 1038 539 L 1039 540 L 1041 540 L 1042 541 L 1045 541 L 1045 540 L 1046 539 L 1046 537 L 1045 537 L 1044 536 L 1043 536 L 1042 535 L 1038 535 L 1037 534 Z M 996 534 L 995 535 L 993 535 L 992 536 L 991 536 L 989 538 L 989 539 L 988 540 L 988 546 L 989 547 L 989 548 L 990 548 L 992 550 L 993 550 L 994 551 L 997 551 L 998 552 L 1001 552 L 1002 553 L 1003 553 L 1004 554 L 1005 554 L 1006 555 L 1006 559 L 1005 560 L 1004 560 L 1003 561 L 997 561 L 996 560 L 994 560 L 993 559 L 992 559 L 991 558 L 990 558 L 989 557 L 987 559 L 987 560 L 986 561 L 987 561 L 990 564 L 992 564 L 993 565 L 996 565 L 997 566 L 1003 566 L 1004 565 L 1006 565 L 1007 564 L 1008 564 L 1012 560 L 1012 553 L 1011 552 L 1011 551 L 1010 550 L 1009 550 L 1008 549 L 1007 549 L 1006 548 L 1004 548 L 1003 547 L 1000 547 L 999 546 L 997 546 L 996 545 L 995 545 L 994 544 L 994 541 L 995 540 L 996 540 L 997 539 L 1001 539 L 1002 540 L 1005 540 L 1006 541 L 1007 541 L 1008 542 L 1011 539 L 1011 538 L 1010 537 L 1009 537 L 1008 536 L 1007 536 L 1006 535 L 1003 535 L 1002 534 Z M 786 540 L 786 541 L 785 542 L 785 543 L 784 544 L 784 545 L 783 546 L 783 554 L 784 555 L 784 557 L 785 558 L 785 559 L 790 564 L 791 564 L 792 565 L 795 565 L 796 566 L 801 566 L 802 565 L 805 565 L 806 564 L 808 564 L 809 565 L 813 565 L 814 564 L 815 564 L 815 563 L 813 561 L 813 560 L 814 559 L 814 558 L 816 556 L 816 554 L 817 553 L 817 547 L 816 546 L 816 544 L 814 542 L 814 541 L 810 537 L 809 537 L 808 536 L 807 536 L 806 535 L 803 535 L 802 534 L 797 534 L 796 535 L 793 535 L 792 536 L 791 536 L 790 537 L 789 537 Z M 799 539 L 801 539 L 802 540 L 805 540 L 809 544 L 809 545 L 810 546 L 810 553 L 809 554 L 809 555 L 807 557 L 805 557 L 804 556 L 802 556 L 801 557 L 803 559 L 803 560 L 802 561 L 797 561 L 796 560 L 795 560 L 790 555 L 790 553 L 789 552 L 789 547 L 790 546 L 790 545 L 791 544 L 791 543 L 793 541 L 794 541 L 795 540 L 798 540 Z M 249 538 L 249 539 L 247 541 L 247 542 L 245 544 L 245 547 L 244 548 L 244 552 L 245 553 L 245 556 L 246 557 L 246 558 L 247 559 L 247 560 L 249 562 L 250 562 L 252 564 L 253 564 L 254 565 L 256 565 L 257 566 L 264 566 L 265 565 L 267 565 L 268 564 L 271 564 L 272 565 L 276 565 L 277 564 L 278 564 L 278 563 L 276 561 L 276 559 L 277 558 L 277 557 L 278 556 L 278 555 L 279 554 L 279 547 L 278 546 L 278 544 L 277 543 L 277 542 L 275 540 L 275 539 L 274 539 L 272 537 L 271 537 L 270 536 L 269 536 L 268 535 L 265 535 L 264 534 L 257 534 L 256 535 L 255 535 L 254 536 L 253 536 L 252 537 L 251 537 L 250 538 Z M 260 539 L 264 539 L 265 540 L 267 540 L 271 544 L 271 545 L 272 546 L 272 547 L 273 548 L 273 553 L 272 554 L 272 555 L 270 557 L 267 557 L 266 556 L 263 556 L 263 558 L 264 559 L 264 560 L 263 561 L 258 561 L 257 560 L 256 560 L 252 556 L 252 555 L 251 554 L 251 546 L 252 545 L 252 544 L 255 541 L 256 541 L 257 540 L 259 540 Z M 1036 226 L 1032 232 L 1032 353 L 1032 329 L 1035 329 L 1035 448 L 1032 448 L 1032 450 L 1197 449 L 1237 396 L 1092 396 L 1091 225 Z M 676 448 L 741 449 L 850 290 L 854 292 L 918 392 L 818 393 L 819 399 L 787 446 L 782 448 L 1022 449 L 1022 446 L 869 225 L 832 225 Z" fill="url(#whiteGrad)" fillRule="evenodd" filter="url(#whiteShadow)"/>
       </svg>
-
       {showText && (
         <div className="text-center mt-2">
-          <h2 className="text-base font-bold text-slate-900 dark:text-white leading-tight">Drum Palace</h2>
           <p className="text-[11px] font-semibold text-teal-600 dark:text-teal-400 mt-0.5">
             Premium Instruments & Pro Audio Gear
-          </p>
-          <p className="text-[10px] text-slate-500 dark:text-slate-400 mt-0.5">
-            For Stage. For Studio. For You.
           </p>
         </div>
       )}
     </div>
   );
 }
+
 export default DrumPalaceLogo;
+

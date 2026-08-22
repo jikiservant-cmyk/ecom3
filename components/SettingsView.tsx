@@ -200,7 +200,7 @@ export function SettingsView({
 
         {/* Center: Brand Logo */}
         <div className="absolute left-1/2 -translate-x-1/2 flex items-center">
-          <DrumPalaceLogo size={42} />
+          <DrumPalaceLogo size={100} />
         </div>
 
         {/* Right Header Icons */}

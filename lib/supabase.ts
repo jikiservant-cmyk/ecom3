@@ -505,7 +505,14 @@ CREATE TABLE IF NOT EXISTS public.store_settings (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 13. Enable Row Level Security (RLS) with Permissive Public Policies for E-commerce
+-- 13. Grant Schema & Table Access to Anon & Authenticated Users
+GRANT USAGE ON SCHEMA public TO anon, authenticated;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated;
+
+-- 14. Enable Row Level Security (RLS) with Permissive Public Policies for E-commerce
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.categories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.products ENABLE ROW LEVEL SECURITY;
@@ -563,7 +570,7 @@ CREATE POLICY "Public read/write reviews" ON public.reviews FOR ALL USING (true)
 DROP POLICY IF EXISTS "Public read/write wishlists" ON public.wishlists;
 CREATE POLICY "Public read/write wishlists" ON public.wishlists FOR ALL USING (true);
 DROP POLICY IF EXISTS "Public read/write store_settings" ON public.store_settings;
-CREATE POLICY "Public read/write store_settings" ON public.store_settings FOR ALL USING (true);
+CREATE POLICY "Public read/write store_settings" ON public.store_settings FOR ALL USING (true) WITH CHECK (true);
 
 -- Trigger to auto-create public.profiles on new Auth signups
 CREATE OR REPLACE FUNCTION public.handle_new_user()

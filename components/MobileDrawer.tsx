@@ -76,11 +76,8 @@ export function MobileDrawer({
 
         {/* Brand Header */}
         <div className="px-6 pb-5 pt-0 flex flex-col items-center text-center">
-          <DrumPalaceLogo size={78} />
-          <h2 className="text-[17px] font-bold text-slate-900 dark:text-white tracking-tight mt-2.5">
-            Drum Palace
-          </h2>
-          <p className="text-[12px] font-semibold text-[#049da4] dark:text-[#36d8db] mt-0.5">
+          <DrumPalaceLogo size={160} />
+          <p className="text-[12px] font-semibold text-[#049da4] dark:text-[#36d8db] mt-1.5">
             Premium Instruments & Pro Audio Gear
           </p>
           <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">

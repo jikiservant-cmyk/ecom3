@@ -21,7 +21,6 @@ import {
   syncCartWithDb, 
   getProfilesFromDb 
 } from '@/lib/supabaseDb';
-import { ALL_PRODUCTS } from '@/lib/productsData';
 import { ProductItem } from '@/lib/types';
 import { formatMoney } from '@/lib/utils';
 import { 
@@ -80,36 +79,6 @@ const PHOTOS = {
   mic: 'https://images.unsplash.com/photo-1516280440614-37939bbacd81?auto=format&fit=crop&w=700&q=85'
 };
 
-const DEFAULT_CATEGORIES: CategoryInfo[] = [
-  { id: 'drums', name: 'Drums', sub: 'Acoustic & Electronic', image: PHOTOS.drums },
-  { id: 'guitars', name: 'Guitars', sub: 'Electric & Acoustic', image: PHOTOS.guitars },
-  { id: 'keyboards', name: 'Keyboards', sub: 'Digital Pianos & Synths', image: PHOTOS.keyboards },
-  { id: 'lighting', name: 'Stage Lighting', sub: 'LED & Effect Lights', image: PHOTOS.lighting },
-  { id: 'speakers', name: 'Speakers', sub: 'PA & Passive Speakers', image: PHOTOS.speakers },
-  { id: 'mixers', name: 'Mixers & Audio', sub: 'Mixers & Interfaces', image: PHOTOS.mixers },
-];
-
-const INITIAL_MAPPED_PRODUCTS: Product[] = ALL_PRODUCTS.map((p) => {
-  let catKey = 'mixers';
-  const c = (p.category || '').toLowerCase();
-  if (c.includes('drum')) catKey = 'drums';
-  else if (c.includes('guitar') || c.includes('bass')) catKey = 'guitars';
-  else if (c.includes('key') || c.includes('piano') || c.includes('synth')) catKey = 'keyboards';
-  else if (c.includes('light')) catKey = 'lighting';
-  else if (c.includes('speak') || c.includes('pa')) catKey = 'speakers';
-  else if (c.includes('mix') || c.includes('audio') || c.includes('mic')) catKey = 'mixers';
-
-  return {
-    id: p.id,
-    name: p.name,
-    cat: catKey,
-    price: p.price,
-    desc: p.description || p.subtitle || '',
-    image: p.image || PHOTOS.drums,
-    images: p.images,
-  };
-});
-
 const themeListeners = new Set<() => void>();
 const subscribeTheme = (callback: () => void) => {
   themeListeners.add(callback);
@@ -154,14 +123,14 @@ export default function DrumPalaceApp() {
   const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
   const currency = useSyncExternalStore(subscribeCurrency, getCurrencySnapshot, getCurrencyServerSnapshot);
   const storeSettings = useSyncExternalStore(subscribeStoreSettings, getStoreSettingsSnapshot, getStoreSettingsServerSnapshot);
-  const [categories, setCategories] = useState<CategoryInfo[]>(DEFAULT_CATEGORIES);
-  const [products, setProducts] = useState<Product[]>(INITIAL_MAPPED_PRODUCTS);
-  const [isLoadingProducts, setIsLoadingProducts] = useState<boolean>(false);
+  const [categories, setCategories] = useState<CategoryInfo[]>([]);
+  const [products, setProducts] = useState<Product[]>([]);
+  const [isLoadingProducts, setIsLoadingProducts] = useState<boolean>(true);
   const [cart, setCart] = useState<CartItem[]>([]);
   const [wish, setWish] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
-  const [activeProductId, setActiveProductId] = useState<string>(INITIAL_MAPPED_PRODUCTS[0]?.id || 'g-1');
+  const [activeProductId, setActiveProductId] = useState<string>('');
   const [selectedImageIndex, setSelectedImageIndex] = useState<number>(0);
   const [detailQty, setDetailQty] = useState<number>(1);
   const [paymentMethod, setPaymentMethod] = useState<'momo' | 'card' | 'cod'>('momo');
@@ -249,11 +218,11 @@ export default function DrumPalaceApp() {
         setProducts(mapped);
         setActiveProductId((prev) => (mapped.some((x) => x.id === prev) ? prev : mapped[0]?.id || ''));
       } else {
-        setProducts(INITIAL_MAPPED_PRODUCTS);
+        setProducts([]);
       }
     } catch (err) {
-      console.warn('Failed to load DB products (using default catalog):', err);
-      setProducts(INITIAL_MAPPED_PRODUCTS);
+      console.error('Failed to load DB products:', err);
+      setProducts([]);
     } finally {
       setIsLoadingProducts(false);
     }
@@ -325,13 +294,13 @@ export default function DrumPalaceApp() {
           setProducts(mapped);
           setActiveProductId((prev) => (mapped.some((x) => x.id === prev) ? prev : mapped[0]?.id || ''));
         } else {
-          setProducts(INITIAL_MAPPED_PRODUCTS);
+          setProducts([]);
         }
       })
       .catch((err) => {
-        console.warn('Failed to load DB products on mount (using default catalog):', err);
+        console.error('Failed to load DB products on mount:', err);
         if (isMounted) {
-          setProducts(INITIAL_MAPPED_PRODUCTS);
+          setProducts([]);
         }
       })
       .finally(() => {
@@ -840,15 +809,7 @@ export default function DrumPalaceApp() {
             className="flex items-center text-left focus:outline-none group cursor-pointer flex-shrink-0"
           >
             <div className="flex items-center gap-1.5 xs:gap-2 sm:gap-3">
-              <DrumPalaceLogo size={36} />
-              <div>
-                <span className="block font-heading text-xs xs:text-sm sm:text-base md:text-[18px] font-bold tracking-[1.5px] xs:tracking-[2px] sm:tracking-[2.5px] leading-tight text-[var(--ink)]">
-                  {storeSettings.storeName || 'DRUM PALACE'}
-                </span>
-                <small className="block text-[6px] xs:text-[7px] sm:text-[8px] font-bold tracking-[1px] xs:tracking-[1.5px] text-[var(--accent)]">
-                  {storeSettings.storeTagline || 'ALL ABOUT QUALITY'}
-                </small>
-              </div>
+              <DrumPalaceLogo size={140} />
             </div>
           </button>
 
@@ -1144,13 +1105,8 @@ export default function DrumPalaceApp() {
                         matchedProd = products.find(p => p.name.toLowerCase() === deal.customTitle?.toLowerCase());
                       }
 
-                      // 3. Try finding in fallback/initial products list
-                      if (!matchedProd) {
-                        matchedProd = INITIAL_MAPPED_PRODUCTS.find(p => p.id === deal.productId || (p as any).slug === deal.productId);
-                      }
-
-                      // 4. Guaranteed fallback to an existing product in the catalog
-                      const prod = matchedProd || products[idx % Math.max(1, products.length)] || INITIAL_MAPPED_PRODUCTS[idx % Math.max(1, INITIAL_MAPPED_PRODUCTS.length)];
+                      // 3. Fallback to an existing product in the catalog if available
+                      const prod = matchedProd || (products.length > 0 ? products[idx % products.length] : null);
                       
                       if (!prod) return null;
                       
@@ -2747,7 +2703,7 @@ export default function DrumPalaceApp() {
       <footer className="border-t border-[var(--line)] py-8 px-4 text-xs text-[var(--muted)] bg-[var(--surface)] pb-24 md:pb-8">
         <div className="shell flex flex-col md:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2.5">
-            <DrumPalaceLogo size={28} />
+            <DrumPalaceLogo size={70} />
             <p>© 2026 {storeSettings.storeName || 'Drum Palace'} · {storeSettings.storeTagline || 'All About Quality'} · Uganda</p>
           </div>
           <div className="flex items-center gap-4 sm:gap-5 flex-wrap justify-center font-medium">

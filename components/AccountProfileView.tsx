@@ -209,7 +209,7 @@ export function AccountProfileView({
         </button>
 
         <div className="flex items-center gap-2">
-          <DrumPalaceLogo size={32} />
+          <DrumPalaceLogo size={80} />
           <span className="hidden sm:inline font-heading font-black text-sm tracking-tight text-[#101a1b] dark:text-white">
             Customer Dashboard
           </span>
@@ -790,7 +790,7 @@ export function AccountProfileView({
             {/* Header */}
             <div className="flex items-center justify-between pb-4 border-b border-black/[0.08] dark:border-white/[0.08]">
               <div className="flex items-center gap-2">
-                <DrumPalaceLogo size={28} />
+                <DrumPalaceLogo size={70} />
                 <div>
                   <h3 className="font-heading font-black text-sm text-[#101a1b] dark:text-white">
                     Drum Palace Uganda

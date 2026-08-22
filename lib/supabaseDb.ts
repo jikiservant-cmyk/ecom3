@@ -1,6 +1,5 @@
 import { supabase, isSupabaseConfigured, getActiveSupabaseConfig } from './supabase';
 import { ProductItem } from './types';
-import { ALL_PRODUCTS } from './productsData';
 
 export interface DbOrder {
   id: string;
@@ -108,8 +107,8 @@ export function ensureValidUuid(id?: string | null): string {
  */
 export async function getProductsFromDb(): Promise<ProductItem[]> {
   try {
-    // 1. Normalized relational query: products + product_variants + product_images + categories with 6s timeout
-    const fetchPromise = (supabase.from('products') as any)
+    // 1. First attempt: Normalized relational query (products + product_variants + product_images + categories)
+    const { data: normalizedProducts, error: normErr } = await (supabase.from('products') as any)
       .select(`
         id,
         name,
@@ -143,21 +142,13 @@ export async function getProductsFromDb(): Promise<ProductItem[]> {
       `)
       .order('created_at', { ascending: false });
 
-    const timeoutPromise = new Promise<{ data: null; error: { message: string } }>((resolve) =>
-      setTimeout(() => resolve({ data: null, error: { message: 'Query timeout' } }), 6000)
-    );
-
-    const { data: normalizedProducts, error: normErr } = await Promise.race([fetchPromise, timeoutPromise]);
-
-    if (!normErr && normalizedProducts) {
-      const dbProducts = normalizedProducts.map((p: any) => {
-        // Sort variants by position or pick the first
+    if (!normErr && Array.isArray(normalizedProducts) && normalizedProducts.length > 0) {
+      return normalizedProducts.map((p: any) => {
         const sortedVariants = Array.isArray(p.product_variants)
           ? [...p.product_variants].sort((a: any, b: any) => (a.position || 0) - (b.position || 0))
           : [];
         const primaryVariant = sortedVariants[0];
 
-        // Sort images by position and primary flag
         const sortedImages = Array.isArray(p.product_images)
           ? [...p.product_images].sort((a: any, b: any) => {
               if (a.is_primary && !b.is_primary) return -1;
@@ -168,12 +159,11 @@ export async function getProductsFromDb(): Promise<ProductItem[]> {
         const primaryImage = sortedImages.find((img: any) => img.is_primary) || sortedImages[0];
         const secondaryImages = sortedImages.filter((img: any) => img !== primaryImage).map((img: any) => img.storage_path);
 
-        // Derive price from price_minor_units (or fallback)
         const rawPrice = primaryVariant?.price_minor_units
           ? Number(primaryVariant.price_minor_units) / 100
-          : 99;
+          : 0;
 
-        const categoryName = p.categories?.name || 'Drums';
+        const categoryName = p.categories?.name || 'Instruments';
         const attributes = (primaryVariant?.attributes && typeof primaryVariant.attributes === 'object')
           ? primaryVariant.attributes
           : {};
@@ -184,27 +174,27 @@ export async function getProductsFromDb(): Promise<ProductItem[]> {
 
         const parsedSpecs = attributes.specs && typeof attributes.specs === 'object'
           ? attributes.specs
-          : { Type: 'Professional Gear', Origin: 'Drum Palace Uganda' };
+          : {};
 
-        const soundProfile = attributes.soundProfile || 'Resonant & High Definition';
+        const soundProfile = attributes.soundProfile || 'High Definition Audio';
         const badge = attributes.badge || undefined;
         const freeShipping = attributes.freeShipping !== false;
         const originalPrice = attributes.originalPrice ? Number(attributes.originalPrice) : Math.round(rawPrice * 1.25);
         const rating = attributes.rating ? Number(attributes.rating) : 4.9;
-        const reviewsCount = attributes.reviewsCount ? Number(attributes.reviewsCount) : 32;
-        const soldCount = attributes.soldCount || '1.2k+ sold';
+        const reviewsCount = attributes.reviewsCount ? Number(attributes.reviewsCount) : 0;
+        const soldCount = attributes.soldCount || 'In Stock';
 
         return {
-          id: p.id || String(Math.random()),
+          id: p.id,
           name: p.name || 'Instrument',
           category: categoryName,
           subtitle: p.description || '',
-          price: rawPrice > 0 ? rawPrice : 99,
+          price: rawPrice,
           originalPrice,
           rating,
           reviewsCount,
           soldCount,
-          image: primaryImage?.storage_path || 'https://images.unsplash.com/photo-1564186763535-ebb21ef5277f?auto=format&fit=crop&w=800&q=85',
+          image: primaryImage?.storage_path || 'https://images.unsplash.com/photo-1519892300165-cb5542fb47c7?auto=format&fit=crop&w=800&q=85',
           images: secondaryImages.length > 0 ? secondaryImages : undefined,
           badge,
           description: p.description || '',
@@ -214,17 +204,62 @@ export async function getProductsFromDb(): Promise<ProductItem[]> {
           freeShipping,
         };
       });
+    }
 
-      if (dbProducts.length > 0) {
-        return dbProducts;
+    // 2. Direct individual table queries (if PostgREST relationship cache wasn't linked)
+    const { data: rawProducts, error: prodErr } = await (supabase.from('products') as any)
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (!prodErr && Array.isArray(rawProducts) && rawProducts.length > 0) {
+      const prodIds = rawProducts.map((p: any) => p.id);
+      const [{ data: rawVariants }, { data: rawImages }, { data: rawCats }] = await Promise.all([
+        (supabase.from('product_variants') as any).select('*').in('product_id', prodIds),
+        (supabase.from('product_images') as any).select('*').in('product_id', prodIds),
+        (supabase.from('categories') as any).select('*'),
+      ]);
+
+      const catMap = new Map<string, string>();
+      if (Array.isArray(rawCats)) {
+        rawCats.forEach((c: any) => catMap.set(c.id, c.name));
       }
+
+      return rawProducts.map((p: any) => {
+        const variants = (rawVariants || []).filter((v: any) => v.product_id === p.id);
+        const images = (rawImages || []).filter((img: any) => img.product_id === p.id);
+        const primaryVariant = variants[0];
+        const primaryImg = images.find((i: any) => i.is_primary) || images[0];
+        const secondaryImgs = images.filter((i: any) => i !== primaryImg).map((i: any) => i.storage_path);
+        const rawPrice = primaryVariant?.price_minor_units ? Number(primaryVariant.price_minor_units) / 100 : 0;
+        const attributes = primaryVariant?.attributes || {};
+
+        return {
+          id: p.id,
+          name: p.name || 'Instrument',
+          category: catMap.get(p.category_id) || 'Instruments',
+          subtitle: p.description || '',
+          price: rawPrice,
+          originalPrice: attributes.originalPrice || Math.round(rawPrice * 1.25),
+          rating: attributes.rating || 4.9,
+          reviewsCount: attributes.reviewsCount || 0,
+          soldCount: attributes.soldCount || 'In Stock',
+          image: primaryImg?.storage_path || 'https://images.unsplash.com/photo-1519892300165-cb5542fb47c7?auto=format&fit=crop&w=800&q=85',
+          images: secondaryImgs.length > 0 ? secondaryImgs : undefined,
+          badge: attributes.badge || undefined,
+          description: p.description || '',
+          specs: attributes.specs || {},
+          soundProfile: attributes.soundProfile || 'High Definition Audio',
+          variants: attributes.variants || ['Standard'],
+          freeShipping: attributes.freeShipping !== false,
+        };
+      });
     }
   } catch (err) {
-    console.warn('Database product query error (falling back to default product catalog):', err);
+    console.error('Database product query error:', err);
   }
 
-  // Gracefully return complete product catalog if database is empty or restricted by RLS
-  return ALL_PRODUCTS;
+  // Return real database products only (empty array if no records in database)
+  return [];
 }
 
 /**
@@ -264,43 +299,41 @@ export async function getProductByIdFromDb(productId: string): Promise<ProductIt
           slug
         )
       `)
-      .eq('id', validId)
+      .or(`id.eq.${validId},id.eq.${productId},slug.eq.${productId}`)
       .maybeSingle();
 
     if (!error && data) {
       const primaryVariant = data.product_variants?.[0];
       const primaryImage = data.product_images?.find((img: any) => img.is_primary) || data.product_images?.[0];
       const secondaryImages = data.product_images?.filter((img: any) => !img.is_primary).map((img: any) => img.storage_path) || [];
-      const rawPrice = primaryVariant?.price_minor_units ? Number(primaryVariant.price_minor_units) / 100 : 99;
+      const rawPrice = primaryVariant?.price_minor_units ? Number(primaryVariant.price_minor_units) / 100 : 0;
       const attributes = primaryVariant?.attributes || {};
 
       return {
         id: data.id,
         name: data.name,
-        category: data.categories?.name || 'Guitars',
+        category: data.categories?.name || 'Instruments',
         subtitle: data.description || '',
         price: rawPrice,
         originalPrice: attributes.originalPrice || Math.round(rawPrice * 1.25),
         rating: attributes.rating || 4.9,
-        reviewsCount: attributes.reviewsCount || 28,
-        soldCount: attributes.soldCount || '1k+ sold',
-        image: primaryImage?.storage_path || 'https://images.unsplash.com/photo-1564186763535-ebb21ef5277f?auto=format&fit=crop&w=800&q=85',
+        reviewsCount: attributes.reviewsCount || 0,
+        soldCount: attributes.soldCount || 'In Stock',
+        image: primaryImage?.storage_path || 'https://images.unsplash.com/photo-1519892300165-cb5542fb47c7?auto=format&fit=crop&w=800&q=85',
         images: secondaryImages.length > 0 ? secondaryImages : undefined,
         description: data.description || '',
         badge: attributes.badge || undefined,
         specs: attributes.specs || {},
-        soundProfile: attributes.soundProfile || 'Warm & Resonant',
+        soundProfile: attributes.soundProfile || 'High Definition Audio',
         variants: attributes.variants || ['Standard'],
         freeShipping: attributes.freeShipping !== false,
       };
     }
   } catch (err) {
-    console.warn('Single product database fetch notice:', err);
+    console.error('Single product database fetch notice:', err);
   }
 
-  // Fallback to static catalog item if not found in database table
-  const fallback = ALL_PRODUCTS.find((p) => p.id === productId || (p as any).slug === productId);
-  return fallback || null;
+  return null;
 }
 
 /**
@@ -883,102 +916,10 @@ export async function seedInitialDataToSupabase(): Promise<{ success: boolean; m
       // Continue
     }
 
-    // 2. Fetch seeded category map for foreign key links
-    const { data: dbCats } = await (supabase.from('categories') as any).select('id, slug, name');
-    const catMap = new Map<string, string>();
-    if (dbCats) {
-      dbCats.forEach((c: any) => {
-        catMap.set(c.slug, c.id);
-        catMap.set(c.name.toLowerCase(), c.id);
-      });
-    }
-
-    // 3. Prepare Batch Products, Variants, and Images
-    const productsPayload: any[] = [];
-    const variantsPayload: any[] = [];
-    const imagesPayload: any[] = [];
-
-    for (const prod of ALL_PRODUCTS) {
-      const validProdId = ensureValidUuid(prod.id);
-      const baseSlug = (prod.name || 'product').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'item';
-      const slug = `${baseSlug}-${validProdId.slice(0, 8)}`;
-      const catKey = (prod.category || '').toLowerCase();
-      let matchedCatId = catMap.get(catKey) || null;
-      if (!matchedCatId) {
-        if (catKey.includes('drum')) matchedCatId = catMap.get('drums') || null;
-        else if (catKey.includes('guitar')) matchedCatId = catMap.get('guitars') || null;
-        else if (catKey.includes('key')) matchedCatId = catMap.get('keyboards') || null;
-        else if (catKey.includes('mix') || catKey.includes('audio')) matchedCatId = catMap.get('mixers') || null;
-        else if (catKey.includes('speak')) matchedCatId = catMap.get('speakers') || null;
-        else if (catKey.includes('light')) matchedCatId = catMap.get('lighting') || null;
-      }
-
-      productsPayload.push({
-        id: validProdId,
-        name: prod.name,
-        slug,
-        description: prod.description || prod.subtitle || '',
-        category_id: matchedCatId,
-        status: 'active',
-        created_at: now,
-        updated_at: now,
-      });
-
-      const priceMinor = Math.round((Number(prod.price) || 0) * 100);
-      variantsPayload.push({
-        product_id: validProdId,
-        sku: `${baseSlug.toUpperCase().slice(0, 10)}-STD`,
-        attributes: {
-          variants: prod.variants || ['Standard'],
-          specs: prod.specs || {},
-          soundProfile: prod.soundProfile || 'Warm & Resonant',
-          badge: prod.badge || null,
-          freeShipping: prod.freeShipping !== false,
-          originalPrice: prod.originalPrice || Math.round((Number(prod.price) || 99) * 1.25),
-          rating: prod.rating || 4.9,
-          reviewsCount: prod.reviewsCount || 28,
-          soldCount: prod.soldCount || '1.2k+ sold',
-        },
-        price_minor_units: priceMinor,
-        currency: 'UGX',
-        inventory_quantity: 45,
-        status: 'active',
-        position: 0,
-        created_at: now,
-        updated_at: now,
-      });
-
-      if (prod.image) {
-        imagesPayload.push({
-          product_id: validProdId,
-          storage_path: prod.image,
-          alt_text: prod.name,
-          position: 0,
-          is_primary: true,
-          created_at: now,
-        });
-      }
-    }
-
-    // Batch upsert products
-    let seeded = 0;
-    let lastError = null;
-    try {
-      const { error: prodErr } = await (supabase.from('products') as any).upsert(productsPayload, { onConflict: 'id' });
-      if (!prodErr) {
-        seeded = productsPayload.length;
-      } else {
-        lastError = prodErr.message;
-        console.warn('Batch product upsert notice:', prodErr.message);
-      }
-    } catch (e: any) {
-      lastError = e?.message;
-    }
-
     return {
       success: true,
-      message: `Successfully populated database with ${seeded || productsPayload.length} catalog products! Error: ${lastError}`,
-      seededCount: seeded || productsPayload.length,
+      message: `Successfully populated database with categories!`,
+      seededCount: categoriesToSeed.length,
     };
   } catch (err: any) {
     return {
