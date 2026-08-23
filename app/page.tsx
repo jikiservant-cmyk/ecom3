@@ -698,9 +698,14 @@ export default function DrumPalaceApp() {
       return;
     }
 
+    if (!checkoutAddress.trim()) {
+      showToast('Please enter your delivery address and location details.');
+      return;
+    }
+
     const customerDisplayName = currentUser?.name || checkoutName.trim() || 'Valued Musician';
     const customerEmail = currentUser?.email || checkoutEmail.trim() || 'guest@drumpalace.ug';
-    const customerShipping = checkoutAddress.trim() || 'Standard Delivery, Kampala, Uganda';
+    const customerShipping = checkoutAddress.trim();
 
     setIsProcessingPayment(true);
     showToast(paymentMethod === 'momo' ? 'Initiating LivePay mobile prompt…' : 'Processing order via LivePay Uganda…');
@@ -1854,33 +1859,43 @@ export default function DrumPalaceApp() {
                           />
                         </div>
                       </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        <div>
-                          <label className="block text-[11px] font-bold text-[var(--ink)] mb-1">Contact Phone</label>
-                          <input
-                            type="tel"
-                            placeholder="+256 7XX XXX XXX"
-                            value={checkoutPhone}
-                            onChange={(e) => {
-                              setCheckoutPhone(e.target.value);
-                              if (!momoPhone) setMomoPhone(e.target.value);
-                            }}
-                            className="w-full bg-[var(--surface)] border border-[var(--line)] rounded-lg p-2.5 text-xs sm:text-sm text-[var(--ink)] outline-none focus:border-[var(--accent)]"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-[11px] font-bold text-[var(--ink)] mb-1">Delivery Address (Uganda)</label>
-                          <input
-                            type="text"
-                            placeholder="e.g. Plot 12 Kampala Rd / Jinja / Entebbe"
-                            value={checkoutAddress}
-                            onChange={(e) => setCheckoutAddress(e.target.value)}
-                            className="w-full bg-[var(--surface)] border border-[var(--line)] rounded-lg p-2.5 text-xs sm:text-sm text-[var(--ink)] outline-none focus:border-[var(--accent)]"
-                          />
-                        </div>
-                      </div>
                     </div>
                   )}
+
+                  {/* Delivery & Contact Information - Always Visible */}
+                  <div className="bg-[var(--surface-2)] border border-[var(--line)] rounded-xl p-4 sm:p-5 space-y-3 shadow-sm mt-5">
+                    <div className="flex items-center justify-between border-b border-[var(--line)] pb-2">
+                      <h2 className="text-xs sm:text-sm font-bold text-[var(--ink)] flex items-center gap-1.5">
+                        <span>📍</span> Delivery Information
+                      </h2>
+                    </div>
+                    <div className="grid grid-cols-1 gap-3">
+                      <div>
+                        <label className="block text-[11px] font-bold text-[var(--ink)] mb-1">Contact Phone</label>
+                        <input
+                          type="tel"
+                          placeholder="+256 7XX XXX XXX"
+                          value={checkoutPhone}
+                          onChange={(e) => {
+                            setCheckoutPhone(e.target.value);
+                            if (!momoPhone) setMomoPhone(e.target.value);
+                          }}
+                          className="w-full bg-[var(--surface)] border border-[var(--line)] rounded-lg p-2.5 text-xs sm:text-sm text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-bold text-[var(--ink)] mb-1">Delivery Address & Location Details (Uganda)</label>
+                        <textarea
+                          rows={2}
+                          placeholder="e.g. Kampala, Plot 12, NSSF Building. Next to the main entrance..."
+                          value={checkoutAddress}
+                          onChange={(e) => setCheckoutAddress(e.target.value)}
+                          className="w-full bg-[var(--surface)] border border-[var(--line)] rounded-lg p-2.5 text-xs sm:text-sm text-[var(--ink)] outline-none focus:border-[var(--accent)] resize-none"
+                        />
+                        <p className="text-[10px] text-[var(--muted)] mt-1">Please provide specific details like district, street, or nearby landmarks so we can deliver your order accurately.</p>
+                      </div>
+                    </div>
+                  </div>
 
                   {/* Payment Method Selector */}
                   <div>
