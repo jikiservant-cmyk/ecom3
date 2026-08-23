@@ -6,7 +6,11 @@ export async function POST(req: NextRequest) {
     const apiKey = body.apiKey || process.env.LIVEPAY_API_KEY;
     const secretKey = body.secretKey || process.env.LIVEPAY_SECRET_KEY;
     const merchantId = body.merchantId || process.env.LIVEPAY_MERCHANT_ID;
-    const apiUrl = (body.apiUrl || process.env.LIVEPAY_API_URL || 'https://api.livepay.me/v1').replace(/\/+$/, '');
+    let baseApiUrl = body.apiUrl || process.env.LIVEPAY_API_URL || 'https://livepay.me/api';
+    if (baseApiUrl.includes('api.livepay.me')) {
+      baseApiUrl = 'https://livepay.me/api';
+    }
+    const apiUrl = baseApiUrl.replace(/\/+$/, '');
 
     const isConfigured = !!(apiKey && !apiKey.includes('YOUR_'));
 

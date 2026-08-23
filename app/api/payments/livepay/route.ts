@@ -36,47 +36,65 @@ export async function POST(req: NextRequest) {
     }
 
     const livepayApiKey = process.env.LIVEPAY_API_KEY;
-    const livepaySecretKey = process.env.LIVEPAY_SECRET_KEY;
-    const livepayMerchantId = process.env.LIVEPAY_MERCHANT_ID;
-    const livepayApiUrl = (process.env.LIVEPAY_API_URL || 'https://api.livepay.me/v1').replace(/\/+$/, '');
+    const livepayAccountNumber = process.env.LIVEPAY_MERCHANT_ID || '';
+    
+    // Check if the user has the old incorrect API URL in their environment secrets and override it
+    let baseApiUrl = process.env.LIVEPAY_API_URL || 'https://livepay.me/api';
+    if (baseApiUrl.includes('api.livepay.me')) {
+      baseApiUrl = 'https://livepay.me/api';
+    }
+    const livepayApiUrl = baseApiUrl.replace(/\/+$/, '');
+
     const appUrl = (process.env.APP_URL || 'https://drumpalace.ug').replace(/\/+$/, '');
 
-    const transactionReference = `LP-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
+    // Max 30 chars, no spaces for reference
+    const transactionReference = `ORD${orderNumber}`.replace(/\s+/g, '').substring(0, 30);
     const callbackUrl = `${appUrl}/api/payments/livepay/webhook`;
     const redirectUrl = returnUrl || `${appUrl}/?order=${orderNumber}&status=completed`;
 
     // If live API credentials are provided (not placeholder), dispatch request to LivePay Gateway (docs.livepay.me)
     if (livepayApiKey && !livepayApiKey.includes('YOUR_')) {
       try {
-        const livepayPayload = {
-          merchant_id: livepayMerchantId || undefined,
-          reference: transactionReference,
-          order_id: orderId,
-          order_number: orderNumber,
-          amount: Math.round(amount),
-          currency: currency.toUpperCase(),
-          description: `Drum Palace Uganda Musical Gear Order #${orderNumber}`,
-          customer: {
-            name: customerName,
-            email: customerEmail,
-            phone: phoneNumber || '',
-          },
-          payment_channel: paymentMethod === 'momo' ? 'mobile_money' : paymentMethod === 'crypto' ? 'crypto' : 'card',
-          network: body.network || (phoneNumber?.startsWith('+25677') || phoneNumber?.startsWith('077') ? 'MTN' : 'AIRTEL'),
-          country: 'UG',
-          callback_url: callbackUrl,
-          webhook_url: callbackUrl,
-          return_url: redirectUrl,
-          redirect_url: redirectUrl,
-        };
+        let endpoint = '';
+        let livepayPayload: any = {};
 
-        const response = await fetch(`${livepayApiUrl}/payments/initialize`, {
+        if (paymentMethod === 'card') {
+          if (currency !== 'USD') {
+            return NextResponse.json({ success: false, error: 'Only USD currency is supported for card payments' }, { status: 400 });
+          }
+          endpoint = `${livepayApiUrl}/card-collection`;
+          livepayPayload = {
+            accountNumber: livepayAccountNumber,
+            amount: Number(amount),
+            currency: 'USD',
+            reference: transactionReference,
+            email: customerEmail,
+            name: customerName,
+            description: `Order #${orderNumber}`,
+            return_url: redirectUrl
+          };
+        } else {
+          // Default to mobile money
+          endpoint = `${livepayApiUrl}/collect-money`;
+          livepayPayload = {
+            accountNumber: livepayAccountNumber,
+            phoneNumber: phoneNumber || '',
+            amount: Number(amount),
+            currency: currency.toUpperCase(),
+            reference: transactionReference,
+            description: `Order #${orderNumber}`
+          };
+          
+          if (currency.toUpperCase() !== 'UGX') {
+            livepayPayload.network = body.network || (phoneNumber?.startsWith('+25677') || phoneNumber?.startsWith('077') ? 'MTN' : 'AIRTEL');
+          }
+        }
+
+        const response = await fetch(endpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${livepaySecretKey || livepayApiKey}`,
-            'X-API-KEY': livepayApiKey,
-            'X-Merchant-ID': livepayMerchantId || '',
+            'Authorization': `Bearer ${livepayApiKey}`
           },
           body: JSON.stringify(livepayPayload),
         });
@@ -85,27 +103,22 @@ export async function POST(req: NextRequest) {
           const data = await response.json();
           return NextResponse.json({
             success: true,
-            transactionId: data.transaction_id || data.id || transactionReference,
-            reference: transactionReference,
-            status: data.status || 'pending',
-            checkoutUrl: data.checkout_url || data.payment_url || data.url || null,
-            gateway: 'LivePay Gateway (docs.livepay.me)',
-            message: data.message || (paymentMethod === 'momo' 
-              ? `LivePay USSD prompt dispatched to ${phoneNumber || 'your mobile device'}` 
-              : 'LivePay transaction initialized successfully'),
+            transactionId: data.internal_reference || transactionReference,
+            reference: data.reference || transactionReference,
+            status: 'pending',
+            checkoutUrl: data.checkout_url || null,
+            gateway: 'LivePay Gateway',
+            message: data.message || 'Transaction initialized successfully',
             raw: data,
           });
         } else {
           const errorData = await response.json().catch(() => ({}));
           console.warn('LivePay Gateway response error:', response.status, errorData);
-          // Return clear notice if gateway returned validation error
-          if (errorData?.message) {
-            return NextResponse.json({
-              success: false,
-              error: `LivePay Gateway: ${errorData.message}`,
-              status: response.status,
-            }, { status: 400 });
-          }
+          return NextResponse.json({
+            success: false,
+            error: `LivePay Gateway: ${errorData.error || errorData.message || 'Payment processing failed'}`,
+            status: response.status,
+          }, { status: 400 });
         }
       } catch (err: any) {
         console.warn('LivePay API connection exception:', err?.message);
