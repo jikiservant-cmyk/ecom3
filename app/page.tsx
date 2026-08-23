@@ -916,16 +916,6 @@ export default function DrumPalaceApp() {
               <span className="text-[9px] text-[var(--muted)]">▼</span>
             </button>
 
-            {/* Theme Toggle */}
-            <button
-              onClick={toggleTheme}
-              aria-label="Toggle dark mode"
-              className="rounded-full border border-[var(--line)] bg-[var(--surface)] p-2 sm:px-2.5 sm:py-1.5 text-xs font-semibold text-[var(--ink)] hover:bg-[var(--surface-2)] transition cursor-pointer flex items-center gap-1.5"
-              suppressHydrationWarning
-            >
-              <span suppressHydrationWarning>{isDarkMode ? '☀️' : '🌙'}</span>
-            </button>
-
             {/* Account / User Menu */}
             {currentUser ? (
               <div className="flex items-center gap-1">
@@ -959,20 +949,6 @@ export default function DrumPalaceApp() {
                 <span className="inline">Sign In</span>
               </button>
             )}
-
-            {/* Wishlist Button */}
-            <button
-              onClick={() => navigateTo('wishlist')}
-              aria-label="Wishlist"
-              className="relative grid place-items-center h-8 w-8 sm:h-9 sm:w-9 rounded-lg text-[var(--ink)] hover:bg-[var(--surface-2)] transition cursor-pointer"
-            >
-              <Heart size={19} />
-              {wish.size > 0 && (
-                <span className="absolute -top-0.5 -right-0.5 flex h-4 w-4 items-center justify-center rounded-full bg-[#e04e5c] text-[9px] font-bold text-white">
-                  {wish.size}
-                </span>
-              )}
-            </button>
 
             {/* Cart Button */}
             <button
