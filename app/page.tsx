@@ -45,7 +45,7 @@ import {
   getCurrencySnapshot, 
   getCurrencyServerSnapshot 
 } from '@/lib/currency';
-import { Menu, Heart, ShoppingCart, User, Shield, Search, Flame, ChevronLeft, ChevronRight, Sparkles } from 'lucide-react';
+import { Menu, Heart, ShoppingCart, User, Shield, Search, Flame, ChevronLeft, ChevronRight, Sparkles, X } from 'lucide-react';
 
 interface Product {
   id: string;
@@ -915,59 +915,23 @@ export default function DrumPalaceApp() {
             <button
               onClick={() => navigateTo('settings')}
               title="Change Currency & Settings"
-              className="hidden sm:flex items-center gap-1 px-2.5 py-1 rounded-full border border-[var(--line)] bg-[var(--surface)] text-[11px] font-bold text-[var(--ink)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition cursor-pointer"
+              className="flex items-center gap-1 px-2.5 py-1 sm:py-1.5 rounded-full border border-[var(--line)] bg-[var(--surface)] text-[11px] sm:text-xs font-bold text-[var(--ink)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition cursor-pointer shadow-2xs"
             >
               <span>{currency}</span>
               <span className="text-[9px] text-[var(--muted)]">▼</span>
             </button>
 
-            {/* Account / User Menu */}
-            {currentUser ? (
-              <div className="flex items-center gap-1">
-                {currentUser.role === 'admin' && (
-                  <button
-                    onClick={openAdminPortal}
-                    title="Open Store Administration"
-                    className="rounded-full bg-[#049da4] text-white px-2 py-1 xs:px-2.5 text-[11px] xs:text-xs font-bold hover:bg-[#03858b] transition cursor-pointer flex items-center gap-1 shadow-xs"
-                  >
-                    <Shield size={12} />
-                    <span className="hidden sm:inline">Admin</span>
-                  </button>
-                )}
-                <button
-                  onClick={() => navigateTo('account')}
-                  title={`Signed in as ${currentUser.name || currentUser.email} — View Profile & Transactions`}
-                  className="rounded-full bg-[var(--hero-tint)] border border-[var(--accent)] px-2 xs:px-2.5 py-1 text-[11px] xs:text-xs font-bold text-[var(--accent)] hover:opacity-90 max-w-[80px] xs:max-w-[110px] sm:max-w-none truncate flex items-center gap-1 cursor-pointer"
-                >
-                  <User size={13} />
-                  <span className="hidden xs:inline">{currentUser.name || currentUser.email.split('@')[0]}</span>
-                </button>
-              </div>
-            ) : (
+            {/* Admin Quick Trigger (if admin is signed in) */}
+            {currentUser?.role === 'admin' && (
               <button
-                onClick={() => navigateTo('login')}
-                aria-label="Sign In"
-                title="Sign in to your account"
-                className="flex items-center gap-1 px-2 xs:px-2.5 py-1 sm:py-1.5 rounded-full border border-[var(--line)] bg-[var(--surface)] text-[11px] xs:text-xs font-bold text-[var(--ink)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition cursor-pointer shadow-2xs shrink-0"
+                onClick={openAdminPortal}
+                title="Open Store Administration"
+                className="rounded-full bg-[#049da4] text-white px-2 py-1 xs:px-2.5 text-[11px] xs:text-xs font-bold hover:bg-[#03858b] transition cursor-pointer flex items-center gap-1 shadow-xs"
               >
-                <User size={14} className="text-[var(--accent)] shrink-0" />
-                <span className="inline">Sign In</span>
+                <Shield size={12} />
+                <span className="hidden sm:inline">Admin</span>
               </button>
             )}
-
-            {/* Cart Button */}
-            <button
-              onClick={() => navigateTo('cart')}
-              aria-label="Cart"
-              className="relative grid place-items-center h-8 w-8 sm:h-9 sm:w-9 rounded-lg text-[var(--ink)] hover:bg-[var(--surface-2)] transition cursor-pointer"
-            >
-              <ShoppingCart size={19} />
-              {totalCartCount > 0 && (
-                <span className="absolute -top-0.5 -right-0.5 flex h-4 w-4 items-center justify-center rounded-full bg-[var(--accent)] text-[9px] sm:text-[10px] font-bold text-white">
-                  {totalCartCount}
-                </span>
-              )}
-            </button>
 
             {/* Hamburger Menu Drawer Trigger */}
             <button
@@ -1415,7 +1379,7 @@ export default function DrumPalaceApp() {
             {/* Shop Search Bar */}
             <div className="flex flex-col sm:flex-row gap-2 sm:gap-2.5 max-w-3xl mb-4 sm:mb-6">
               <label className="flex flex-1 items-center gap-3 bg-[var(--surface)] border border-[var(--line)] rounded-xl px-3.5 sm:px-4 py-0 shadow-[var(--shadow)]">
-                <span className="text-[var(--muted)] text-base sm:text-lg">⌕</span>
+                <Search size={18} className="text-[var(--muted)] shrink-0" />
                 <input
                   type="text"
                   value={searchQuery}
@@ -1423,12 +1387,27 @@ export default function DrumPalaceApp() {
                   placeholder="Search for instruments, lighting, speakers and more..."
                   className="h-[46px] sm:h-[50px] w-full border-0 outline-none bg-transparent text-[var(--ink)] text-xs sm:text-sm md:text-base placeholder:text-[var(--muted)]"
                 />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setSearchQuery('')}
+                    title="Clear search query"
+                    className="p-1 text-[var(--muted)] hover:text-[var(--ink)] rounded-full transition cursor-pointer"
+                  >
+                    <X size={16} />
+                  </button>
+                )}
               </label>
               <button
-                onClick={() => setSearchQuery('')}
-                className="rounded-xl border border-[var(--accent)] bg-[var(--accent)] px-5 py-2.5 sm:py-3 text-xs sm:text-sm font-semibold text-white hover:opacity-90 transition cursor-pointer"
+                type="button"
+                onClick={() => {
+                  const input = document.querySelector('input[placeholder*="Search for instruments"]') as HTMLInputElement;
+                  if (input) input.focus();
+                }}
+                className="rounded-xl border border-[var(--accent)] bg-[var(--accent)] px-5 py-2.5 sm:py-3 text-xs sm:text-sm font-semibold text-white hover:opacity-90 transition cursor-pointer flex items-center justify-center gap-2"
               >
-                Clear
+                <Search size={15} />
+                <span>Search</span>
               </button>
             </div>
 
