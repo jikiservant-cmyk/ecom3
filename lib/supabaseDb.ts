@@ -1,6 +1,21 @@
 import { supabase, isSupabaseConfigured, getActiveSupabaseConfig } from './supabase';
 import { ProductItem } from './types';
 
+const ORDER_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+
+/** Cryptographically random, collision-resistant order number (DP-XXXX-XXXX). */
+export function generateSecureOrderNumber(): string {
+  const bytes = new Uint8Array(8);
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  let out = '';
+  for (let i = 0; i < 8; i++) out += ORDER_ALPHABET[bytes[i] % ORDER_ALPHABET.length];
+  return `DP-${out.slice(0, 4)}-${out.slice(4)}`;
+}
+
 export interface DbOrder {
   id: string;
   orderNumber: string;
@@ -590,7 +605,7 @@ export async function createOrderInDb(orderData: {
   phone?: string;
   customerId?: string;
 }): Promise<{ success: boolean; orderId?: string; orderNumber?: string; error?: string }> {
-  const orderNumber = `DP-${Math.floor(100000 + Math.random() * 900000)}`;
+  const orderNumber = generateSecureOrderNumber();
   const orderId = generateUuid();
   const createdAt = new Date().toISOString();
   const totalMinorUnits = Math.round(orderData.total * 100);
@@ -599,7 +614,9 @@ export async function createOrderInDb(orderData: {
   const safeCustomerId = isValidUuid(orderData.customerId) ? orderData.customerId : null;
 
   try {
-    // 1. Insert into database orders table with safe payload
+    // 1. Insert into database orders table with safe payload.
+    // SECURITY: orders are ALWAYS created Pending. Only a verified payment
+    // webhook may advance payment_status to Paid.
     const orderPayload: any = {
       id: orderId,
       order_number: orderNumber,
@@ -608,7 +625,7 @@ export async function createOrderInDb(orderData: {
       customer_name: orderData.customerName || 'Valued Musician',
       customer_phone: orderData.phone || null,
       shipping_address: { address: orderData.shippingAddress || 'Standard Delivery, Uganda', phone: orderData.phone || null },
-      status: 'Processing',
+      status: 'Pending',
       currency: 'UGX',
       subtotal_minor_units: totalMinorUnits,
       discount_minor_units: 0,
@@ -616,7 +633,7 @@ export async function createOrderInDb(orderData: {
       tax_minor_units: 0,
       total_minor_units: totalMinorUnits,
       total_amount: orderData.total,
-      payment_status: 'Paid',
+      payment_status: 'Pending',
       created_at: createdAt,
       updated_at: createdAt,
     };
@@ -635,12 +652,12 @@ export async function createOrderInDb(orderData: {
         customer_name: orderData.customerName || 'Valued Musician',
         customer_phone: orderData.phone || null,
         shipping_address: { address: orderData.shippingAddress || 'Standard Delivery, Uganda', phone: orderData.phone || null },
-        status: 'processing',
+        status: 'pending',
         currency: 'UGX',
         subtotal_minor_units: totalMinorUnits,
         total_minor_units: totalMinorUnits,
         total_amount: orderData.total,
-        payment_status: 'paid',
+        payment_status: 'Pending',
         created_at: createdAt,
         updated_at: createdAt,
       };
@@ -690,7 +707,7 @@ export async function createOrderInDb(orderData: {
         order_id: orderId,
         provider: orderData.paymentMethod || 'livepay',
         provider_reference: paymentReference,
-        status: 'paid',
+        status: 'pending',
         amount_minor_units: totalMinorUnits,
         currency: 'UGX',
         raw_payload: {
@@ -721,12 +738,10 @@ export async function saveContactMessageToDb(data: {
   topic: string;
   message: string;
 }): Promise<{ success: boolean; error?: string }> {
-  const messageId = `msg_${Date.now()}`;
   const createdAt = new Date().toISOString();
 
   try {
     const { error } = await (supabase.from('contact_messages') as any).insert({
-      id: messageId,
       name: data.name,
       email: data.email,
       topic: data.topic,
@@ -829,8 +844,14 @@ export async function getOrdersFromDb(): Promise<DbOrder[]> {
 /**
  * Update order status directly in database orders table
  */
+const ALLOWED_ORDER_STATUSES: DbOrder['status'][] = ['Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled'];
+
 export async function updateOrderStatusInDb(orderId: string, newStatus: DbOrder['status']): Promise<boolean> {
   try {
+    if (!ALLOWED_ORDER_STATUSES.includes(newStatus)) {
+      console.error('Rejected order status update with disallowed status:', newStatus);
+      return false;
+    }
     const { error } = await (supabase.from('orders') as any)
       .update({ status: newStatus, updated_at: new Date().toISOString() })
       .eq('id', orderId);
@@ -956,15 +977,9 @@ export async function getOrderByIdOrNumber(idOrNumber: string): Promise<DbOrder 
           unit_price_minor_units,
           quantity,
           line_total_minor_units
-        ),
-        payments (
-          id,
-          status,
-          provider,
-          provider_reference
         )
       `)
-      .or(`id.eq.${queryTerm},order_number.eq.${queryTerm},order_number.ilike.%${queryTerm}%`)
+      .or(`id.eq.${queryTerm},order_number.eq.${queryTerm}`)
       .maybeSingle();
 
     if (!error && data) {
@@ -1006,8 +1021,9 @@ export async function getOrderByIdOrNumber(idOrNumber: string): Promise<DbOrder 
     console.error('Single order database fetch error:', err);
   }
 
-  const allOrders = await getOrdersFromDb();
-  return allOrders.find((o) => o.id === queryTerm || o.orderNumber.toLowerCase() === queryTerm.toLowerCase() || o.orderNumber.includes(queryTerm)) || null;
+  // SECURITY: no full-table fallback and no wildcard matching — exact
+  // id/order_number only, so strangers cannot enumerate orders.
+  return null;
 }
 
 /**
@@ -1046,8 +1062,8 @@ export async function updateUserProfileInDb(userId: string, data: Partial<DbUser
     const payload: any = { updated_at: new Date().toISOString() };
     if (data.name !== undefined) payload.full_name = data.name;
     if (data.phone !== undefined) payload.phone = data.phone;
-    if (data.role !== undefined) payload.role = data.role;
-    if (data.email !== undefined) payload.email = data.email;
+    // SECURITY: role and email changes are intentionally NOT supported here.
+    // Role changes require an administrator acting directly on the database.
 
     const { error } = await (supabase.from('profiles') as any)
       .update(payload)
@@ -1105,10 +1121,12 @@ export async function addReviewToDb(review: Omit<DbReview, 'id' | 'createdAt'>):
       id: revId,
       product_id: review.productId,
       user_name: review.userName,
-      user_email: review.userEmail || null,
+      user_email: null, // SECURITY: reviewer emails are not persisted
       rating: review.rating,
       comment: review.comment,
-      verified_purchase: review.verifiedPurchase,
+      // SECURITY: never trust the client — verified status is derived from
+      // real order history server-side, defaulting to false here.
+      verified_purchase: false,
       created_at: now,
     });
 
@@ -1188,6 +1206,7 @@ export async function syncCartWithDb(cartItems: { id: string; qty: number }[], c
       await (supabase.from('cart_items') as any).delete().eq('cart_id', cartId);
       const itemsPayload = cartItems.map((ci) => ({
         cart_id: cartId,
+        product_id: ci.id,
         quantity: ci.qty,
         created_at: now,
         updated_at: now,

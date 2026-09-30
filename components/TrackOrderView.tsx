@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
   ArrowLeft,
   Search,
@@ -15,7 +15,18 @@ import {
   ChevronRight
 } from 'lucide-react';
 import { formatPrice, getSavedCurrency } from '@/lib/currency';
-import { getOrderByIdOrNumber, DbOrder, getOrdersFromDb } from '@/lib/supabaseDb';
+
+interface TrackedOrder {
+  id: string;
+  orderNumber: string;
+  status: string;
+  paymentStatus: string;
+  total: number;
+  currency: string;
+  createdAt: string;
+  itemCount: number;
+  items: { productName: string; quantity: number; variant?: string }[];
+}
 
 interface TrackOrderViewProps {
   onBack: () => void;
@@ -25,26 +36,13 @@ interface TrackOrderViewProps {
 export function TrackOrderView({ onBack, onNavigate }: TrackOrderViewProps) {
   const [orderQuery, setOrderQuery] = useState('');
   const [isSearching, setIsSearching] = useState(false);
-  const [searchedOrder, setSearchedOrder] = useState<DbOrder | null>(null);
+  const [searchedOrder, setSearchedOrder] = useState<TrackedOrder | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
   const [notFound, setNotFound] = useState(false);
   const currency = getSavedCurrency();
 
-  // On initial mount, load the latest order from the database to showcase live tracking
-  useEffect(() => {
-    let isMounted = true;
-    getOrdersFromDb().then((orders) => {
-      if (isMounted && orders && orders.length > 0) {
-        const latest = orders[0];
-        setOrderQuery(latest.orderNumber);
-        setSearchedOrder(latest);
-        setHasSearched(true);
-      }
-    });
-    return () => {
-      isMounted = false;
-    };
-  }, []);
+  // NOTE: we deliberately do NOT auto-load "the latest order" here anymore —
+  // that exposed another customer's PII to whoever opened this page.
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -53,9 +51,11 @@ export function TrackOrderView({ onBack, onNavigate }: TrackOrderViewProps) {
     setNotFound(false);
 
     try {
-      const order = await getOrderByIdOrNumber(orderQuery.trim());
-      if (order) {
-        setSearchedOrder(order);
+      // Public tracking endpoint returns a PII-redacted view of the order.
+      const res = await fetch(`/api/orders?track=${encodeURIComponent(orderQuery.trim())}`);
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.success && data.order) {
+        setSearchedOrder(data.order);
         setNotFound(false);
       } else {
         setSearchedOrder(null);
@@ -70,7 +70,7 @@ export function TrackOrderView({ onBack, onNavigate }: TrackOrderViewProps) {
     }
   };
 
-  const getStepStatus = (status: DbOrder['status']) => {
+  const getStepStatus = (status: string) => {
     const s = (status || 'Processing').toLowerCase();
     if (s === 'delivered') return 4;
     if (s === 'shipped') return 3;
@@ -152,17 +152,17 @@ export function TrackOrderView({ onBack, onNavigate }: TrackOrderViewProps) {
                 </div>
                 <h2 className="text-xl font-extrabold tracking-tight">Order #{searchedOrder.orderNumber}</h2>
                 <p className="text-xs text-teal-100 mt-1">
-                  Recipient: <span className="font-bold text-white">{searchedOrder.customerName}</span> ({searchedOrder.customerEmail})
+                  Customer details are kept private for your security.
                 </p>
 
                 <div className="mt-4 pt-4 border-t border-white/20 grid grid-cols-2 gap-4 text-xs">
                   <div>
                     <span className="text-teal-200 block text-[10px] uppercase font-bold">Payment</span>
-                    <span className="font-semibold text-white">{searchedOrder.paymentStatus} · {formatPrice(searchedOrder.total * 3750, currency)}</span>
+                    <span className="font-semibold text-white">{searchedOrder.paymentStatus} · {formatPrice(searchedOrder.total, currency)}</span>
                   </div>
                   <div>
-                    <span className="text-teal-200 block text-[10px] uppercase font-bold">Destination</span>
-                    <span className="font-semibold text-white truncate block">{searchedOrder.shippingAddress || 'Express Delivery, Uganda'}</span>
+                    <span className="text-teal-200 block text-[10px] uppercase font-bold">Placed</span>
+                    <span className="font-semibold text-white truncate block">{new Date(searchedOrder.createdAt).toLocaleDateString()}</span>
                   </div>
                 </div>
               </div>
@@ -251,9 +251,6 @@ export function TrackOrderView({ onBack, onNavigate }: TrackOrderViewProps) {
                           </span>
                         </div>
                       </div>
-                      <span className="font-bold text-teal-600 dark:text-teal-400">
-                        {formatPrice(item.price * item.quantity * 3750, currency)}
-                      </span>
                     </div>
                   ))
                 ) : (

@@ -16,10 +16,8 @@ import {
 import { 
   getProductsFromDb, 
   getCategoriesFromDb,
-  createOrderInDb, 
   saveContactMessageToDb, 
-  syncCartWithDb, 
-  getProfilesFromDb 
+  syncCartWithDb
 } from '@/lib/supabaseDb';
 import { ProductItem } from '@/lib/types';
 import { formatMoney } from '@/lib/utils';
@@ -395,7 +393,7 @@ export default function DrumPalaceApp() {
   // Sync cart to Supabase carts & cart_items tables
   useEffect(() => {
     if (cart.length > 0) {
-      syncCartWithDb(cart, currentUser?.email ? currentUser.email : undefined);
+      syncCartWithDb(cart, currentUser?.id || undefined);
     }
   }, [cart, currentUser]);
 
@@ -544,37 +542,10 @@ export default function DrumPalaceApp() {
       }
     }
 
-    // Local / offline database profile lookup (strict database record match)
-    const dbProfiles = await getProfilesFromDb();
-    const matchedProfile = dbProfiles.find(
-      (p) => p.email.toLowerCase() === loginEmail.trim().toLowerCase()
-    );
-    const resolvedRole = matchedProfile?.role === 'admin' ? 'admin' : 'customer';
-    const resolvedName = matchedProfile?.name || loginEmail.split('@')[0];
-
-    const localUserObj = {
-      id: matchedProfile?.id || 'local_user',
-      email: loginEmail,
-      name: resolvedName,
-      role: resolvedRole,
-      phone: matchedProfile?.phone,
-    };
-
-    setCurrentUser(localUserObj);
-
-    if (resolvedRole === 'admin') {
-      showToast(`Welcome Administrator, ${resolvedName}! Opening Admin Dashboard…`);
-      setShowAdminPortal(true);
-      navigateTo('account');
-    } else {
-      showToast(`Welcome back, ${resolvedName}!`);
-      if (pendingCheckout) {
-        setPendingCheckout(false);
-        navigateTo('checkout');
-      } else {
-        navigateTo('account');
-      }
-    }
+    // SECURITY: the old "offline fallback" logged in anyone whose email matched
+    // a stored profile — without a password — and granted that profile's role.
+    // It has been removed; sign-in requires Supabase Auth.
+    showToast('Sign-in is currently unavailable. Please configure the cloud database connection.');
   };
 
   const handleRegister = async (e: React.FormEvent) => {
@@ -720,41 +691,57 @@ export default function DrumPalaceApp() {
         };
       });
 
-      // 1. Create order in Supabase database (orders, order_items, payments)
-      const result = await createOrderInDb({
-        customerId: currentUser?.id,
-        customerName: customerDisplayName,
-        customerEmail: customerEmail,
-        items: orderItems,
-        total: grandTotal,
-        paymentMethod,
-        phone: effectivePhone,
-        shippingAddress: customerShipping,
+      // 1. Create the order through the SERVER API. The server validates the
+      //    payload, recomputes the total from the line items, and records the
+      //    order as Pending. Payment state can only advance via a verified webhook.
+      let accessToken: string | null = null;
+      if (currentUser?.id) {
+        try {
+          const { data: sessionData } = await supabase.auth.getSession();
+          accessToken = sessionData?.session?.access_token || null;
+        } catch {
+          accessToken = null;
+        }
+      }
+      const orderRes = await fetch('/api/orders', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
+        body: JSON.stringify({
+          customerName: customerDisplayName,
+          customerEmail: customerEmail,
+          items: orderItems,
+          total: grandTotal,
+          phone: effectivePhone,
+          shippingAddress: customerShipping,
+        }),
       });
-
-      const orderNumber = result.orderNumber || `DP-${Math.floor(100000 + Math.random() * 900000)}`;
-
-      // 2. Dispatch to LivePay Uganda payment gateway
-      try {
-        await fetch('/api/payments/livepay', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            orderId: result.orderId || orderNumber,
-            orderNumber,
-            amount: grandTotal,
-            currency: 'UGX',
-            phoneNumber: effectivePhone,
-            customerName: customerDisplayName,
-            customerEmail: customerEmail,
-            paymentMethod,
-          }),
-        });
-      } catch (livePayErr) {
-        console.warn('LivePay API notice:', livePayErr);
+      const orderData = await orderRes.json().catch(() => null);
+      if (!orderRes.ok || !orderData?.success || !orderData.orderId) {
+        showToast(orderData?.error || 'Could not create your order. Please try again.');
+        return;
       }
 
-      showToast(`Order #${orderNumber} successfully registered! Total: ${formatMoney(grandTotal)}`);
+      // 2. Initiate the LivePay payment. The server reads the amount from the
+      //    database order — the client never controls the charged amount.
+      const payRes = await fetch('/api/payments/livepay', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          orderId: orderData.orderId,
+          phoneNumber: effectivePhone,
+          paymentMethod,
+        }),
+      });
+      const payData = await payRes.json().catch(() => null);
+      if (!payRes.ok || !payData?.success) {
+        showToast(payData?.error || 'Payment could not be started. Your order is saved as pending.');
+        return;
+      }
+
+      showToast(`Order #${orderData.orderNumber} created. Complete the LivePay prompt to pay. Total: ${formatMoney(grandTotal)}`);
       setCart([]);
       setMomoPhone('');
       setCheckoutName('');
@@ -764,10 +751,7 @@ export default function DrumPalaceApp() {
       navigateTo('home');
     } catch (err: any) {
       console.error('Checkout processing error:', err);
-      showToast('Order saved in system — thank you for shopping with Drum Palace!');
-      setCart([]);
-      setMomoPhone('');
-      navigateTo('home');
+      showToast('Checkout failed. You have not been charged — please try again.');
     } finally {
       setIsProcessingPayment(false);
     }
