@@ -1,5 +1,23 @@
 # Production-Readiness Audit — Drum Palace (`ecom3`)
 
+> ## Remediation status (2026-09-30, same branch)
+> **All Critical blockers and the High items below have been fixed and
+> re-verified live** (see commit history on `arena/01a0f40a-ecom3`):
+> SSRF/secret exfiltration removed; authn/authz on every route; hardened RLS
+> schema (`lib/schemaSql.ts`); payments fail closed with DB-sourced amounts;
+> mandatory HMAC webhook verification + idempotency; orders created Pending;
+> offline login & admin backdoor removed; role escalation killed; Next.js
+> upgraded to 16.3.8 (`npm audit` now **0 vulnerabilities**); storage bucket
+> admin-write only; PII-redacted public tracking; rate limiting, security
+> headers, `/api/health`, structured logging, vitest suite (21 tests), hermetic
+> build. Post-fix attack re-run: SSRF→401, forged webhook→503, payment→503
+> (no simulated success), data routes→401, rate limiter→429. Remaining work is
+> the Medium/Low non-blocking list plus the operational items in §4
+> (Supabase project hardening verification, LivePay docs confirmation, CI,
+> load testing, backups).
+> The original audit findings are preserved below for reference.
+
+
 **Date:** 2026-09-30 · **Branch:** `arena/01a0f40a-ecom3` @ `35ab887`
 **Project:** "Drum Palace" e-commerce storefront (Uganda, UGX)
 **Stack:** Next.js 15.5.23 (App Router, React 19, TypeScript) + Supabase (Postgres/PostgREST, Auth, Storage) + LivePay payment gateway (momo/card)

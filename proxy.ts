@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { consumeRateLimit, rateLimitHeaders, clientIp } from '@/lib/server/rateLimit';
 
 /**
- * Global edge middleware:
+ * Global proxy (formerly middleware):
  * - Per-IP sliding-window rate limiting (stricter for mutating/expensive routes).
  * - Baseline security headers.
  *
@@ -33,7 +33,7 @@ const LIMITS: RouteLimit[] = [
   { match: /^\/api\//, methods: ['GET', 'POST', 'PATCH', 'DELETE'], windowMs: MINUTE, max: 120, bucket: 'api' },
 ];
 
-export function middleware(req: NextRequest) {
+export function proxy(req: NextRequest) {
   const { pathname, method } = { pathname: req.nextUrl.pathname, method: req.method.toUpperCase() };
 
   if (!pathname.startsWith('/api/')) {
