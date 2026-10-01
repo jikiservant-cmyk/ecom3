@@ -133,36 +133,13 @@ export default function AdminPortal({
   const [isMobileNavOpen, setIsMobileNavOpen] = useState(false);
 
   // LivePay Payment Gateway States (https://docs.livepay.me/)
-  const [livepayApiKey, setLivepayApiKey] = useState<string>(() => {
-    if (typeof window !== "undefined") {
-      return localStorage.getItem("dp_livepay_api_key") || "";
-    }
-    return "";
-  });
-  const [livepaySecretKey, setLivepaySecretKey] = useState<string>(() => {
-    if (typeof window !== "undefined") {
-      return localStorage.getItem("dp_livepay_secret_key") || "";
-    }
-    return "";
-  });
-  const [livepayMerchantId, setLivepayMerchantId] = useState<string>(() => {
-    if (typeof window !== "undefined") {
-      return localStorage.getItem("dp_livepay_merchant_id") || "";
-    }
-    return "";
-  });
-  const [livepayApiUrl, setLivepayApiUrl] = useState<string>(() => {
-    if (typeof window !== "undefined") {
-      return localStorage.getItem("dp_livepay_api_url") || "https://api.livepay.me/v1";
-    }
-    return "https://api.livepay.me/v1";
-  });
-  const [livepayWebhookSecret, setLivepayWebhookSecret] = useState<string>(() => {
-    if (typeof window !== "undefined") {
-      return localStorage.getItem("dp_livepay_webhook_secret") || "";
-    }
-    return "";
-  });
+  // SECURITY: gateway credentials are server-side environment variables ONLY.
+  // They are no longer typed into the browser or stored in localStorage.
+  const [livepayApiKey, setLivepayApiKey] = useState<string>("");
+  const [livepaySecretKey, setLivepaySecretKey] = useState<string>("");
+  const [livepayMerchantId, setLivepayMerchantId] = useState<string>("");
+  const [livepayApiUrl, setLivepayApiUrl] = useState<string>("");
+  const [livepayWebhookSecret, setLivepayWebhookSecret] = useState<string>("");
   const [isTestingLivepay, setIsTestingLivepay] = useState<boolean>(false);
   const [livepayTestResult, setLivepayTestResult] = useState<any>(null);
   const [copiedWebhook, setCopiedWebhook] = useState<boolean>(false);
@@ -302,41 +279,11 @@ export default function AdminPortal({
         return;
       }
 
-      // 2. Fallback check for offline/preview database admin accounts
-      const existingProfiles = await getProfilesFromDb();
-      const matchedAdmin = existingProfiles.find(
-        (p) => p.email.toLowerCase() === adminEmail.trim().toLowerCase()
-      );
-
-      if (matchedAdmin) {
-        if (matchedAdmin.role !== "admin") {
-          setAuthError(`Access Denied: The account "${adminEmail.trim()}" is registered as a ${matchedAdmin.role} and does not have administrator privileges.`);
-          setIsAuthenticating(false);
-          return;
-        }
-
-        if (adminPassword.length < 4) {
-          setAuthError("Invalid password provided for administrator account.");
-          setIsAuthenticating(false);
-          return;
-        }
-
-        const adminObj = {
-          id: matchedAdmin.id,
-          name: matchedAdmin.name,
-          email: matchedAdmin.email,
-          role: "admin",
-        };
-
-        setActiveAdmin(adminObj);
-        if (onAdminAuthenticated) {
-          onAdminAuthenticated(adminObj);
-        }
-        showToast("Authenticated as Store Administrator");
-        return;
-      }
-
-      // If no valid admin match found
+      // SECURITY: the previous "offline fallback" accepted any profile whose role
+      // was admin as long as the typed password was 4+ characters — a backdoor.
+      // Removed. Admin access now requires a valid Supabase Auth session whose
+      // database profile role is 'admin' (checked above and re-checked server-side
+      // by every privileged API route).
       setAuthError("Authentication failed: Invalid administrator credentials or unauthorized user account.");
     } catch (err: any) {
       setAuthError(err?.message || "An unexpected error occurred during administrator authentication.");
@@ -809,15 +756,11 @@ export default function AdminPortal({
     setIsTestingLivepay(true);
     setLivepayTestResult(null);
     try {
+      // Server uses its own env credentials; no secrets are sent from the browser.
       const res = await fetch("/api/payments/livepay/test-connection", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          apiKey: livepayApiKey,
-          secretKey: livepaySecretKey,
-          merchantId: livepayMerchantId,
-          apiUrl: livepayApiUrl,
-        }),
+        body: "{}",
       });
       const data = await res.json();
       setLivepayTestResult(data);
@@ -838,14 +781,11 @@ export default function AdminPortal({
 
   const handleSaveLivepaySettings = (e: React.FormEvent) => {
     e.preventDefault();
-    if (typeof window !== "undefined") {
-      localStorage.setItem("dp_livepay_api_key", livepayApiKey.trim());
-      localStorage.setItem("dp_livepay_secret_key", livepaySecretKey.trim());
-      localStorage.setItem("dp_livepay_merchant_id", livepayMerchantId.trim());
-      localStorage.setItem("dp_livepay_api_url", livepayApiUrl.trim());
-      localStorage.setItem("dp_livepay_webhook_secret", livepayWebhookSecret.trim());
-    }
-    showToast("LivePay gateway configuration saved!");
+    // SECURITY: credentials are configured on the server via environment
+    // variables (LIVEPAY_API_KEY, LIVEPAY_SECRET_KEY, LIVEPAY_MERCHANT_ID,
+    // LIVEPAY_API_URL, LIVEPAY_WEBHOOK_SECRET). This app never stores them
+    // in the browser. We only run a connectivity test here.
+    showToast("LivePay credentials are managed via server environment variables.");
     handleTestLivepayConnection();
   };
 

@@ -8,8 +8,9 @@ export function cn(...inputs: ClassValue[]) {
 
 export function formatMoney(amount: number, customCurrency?: CurrencyCode | string): string {
   if (amount === undefined || amount === null || isNaN(amount)) return "UGX 0";
-  // Standardize amount to UGX base:
-  const ugxVal = amount < 10000 && amount > 0 ? Math.round(amount * 3750) : Math.round(amount);
+  // SECURITY/CORRECTNESS: all app amounts are UGX. The previous heuristic
+  // multiplied any value under 10,000 by 3,750, silently distorting prices.
+  const ugxVal = Math.round(amount);
   const cur = (customCurrency as CurrencyCode) || getSavedCurrency();
   return formatPrice(ugxVal, cur);
 }

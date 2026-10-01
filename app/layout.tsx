@@ -1,9 +1,10 @@
 import type { Metadata, Viewport } from 'next';
-import { DM_Sans, Space_Grotesk } from 'next/font/google';
 import './globals.css'; // Global styles
 
-const dmSans = DM_Sans({ subsets: ['latin'], variable: '--font-dm-sans', display: 'swap' });
-const spaceGrotesk = Space_Grotesk({ subsets: ['latin'], variable: '--font-space-grotesk', display: 'swap' });
+// NOTE: custom web fonts were previously loaded via next/font/google, which made
+// the production build depend on reaching fonts.googleapis.com. Builds must be
+// hermetic, so the app now uses the system font fallback chain defined in
+// globals.css (--font-dm-sans / --font-space-grotesk resolve to system-ui).
 
 export const viewport: Viewport = {
   width: 'device-width',
@@ -30,7 +31,7 @@ export const metadata: Metadata = {
 export default function RootLayout({children}: {children: React.ReactNode}) {
   return (
     <html lang="en">
-      <body className={`${dmSans.variable} ${spaceGrotesk.variable} font-sans`} suppressHydrationWarning>{children}</body>
+      <body className="font-sans" suppressHydrationWarning>{children}</body>
     </html>
   );
 }

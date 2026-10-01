@@ -1,14 +1,15 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
 import { getCategoriesFromDb } from '@/lib/supabaseDb';
+import { logger } from '@/lib/server/logging';
 
-export async function GET(req: NextRequest) {
+export const dynamic = 'force-dynamic';
+
+export async function GET() {
   try {
     const categories = await getCategoriesFromDb();
     return NextResponse.json({ success: true, count: categories.length, categories });
-  } catch (err: any) {
-    return NextResponse.json(
-      { success: false, error: err?.message || 'Failed to fetch categories' },
-      { status: 500 }
-    );
+  } catch (e: any) {
+    logger.error('categories_get_error', { error: e?.message });
+    return NextResponse.json({ success: false, error: 'Failed to fetch categories' }, { status: 500 });
   }
 }

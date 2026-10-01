@@ -25,14 +25,17 @@ export async function signInWithEmail(email: string, password: string): Promise<
 }
 
 /**
- * Sign up with email, password, and optional full name, phone, and role
+ * Sign up with email, password, and optional full name / phone.
+ *
+ * SECURITY: new accounts are ALWAYS customers. The previous version accepted a
+ * client-supplied role which let anyone self-assign 'admin' at signup. Admins
+ * are provisioned directly in the database by an existing operator.
  */
 export async function signUpWithEmail(
-  email: string, 
-  password: string, 
+  email: string,
+  password: string,
   fullName?: string,
-  phone?: string,
-  role: 'customer' | 'admin' = 'customer'
+  phone?: string
 ): Promise<{ user: User | null; session: Session | null; error: AuthError | null }> {
   try {
     const { data, error } = await supabase.auth.signUp({
@@ -43,7 +46,7 @@ export async function signUpWithEmail(
           full_name: fullName || email.split('@')[0],
           name: fullName || email.split('@')[0],
           phone: phone || null,
-          role: role,
+          // role deliberately omitted — the DB trigger hard-codes 'customer'
         },
       },
     });
@@ -55,7 +58,6 @@ export async function signUpWithEmail(
           email: data.user.email,
           full_name: fullName || email.split('@')[0],
           phone: phone || null,
-          role: role,
           updated_at: new Date().toISOString(),
         });
       } catch (profErr) {
