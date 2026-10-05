@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerAdminClient } from '@/lib/server/supabaseServer';
 import { getWebhookSecret, verifyLivePayWebhook, webhookUrlCandidates, DEFAULT_SIGNATURE_MAX_AGE_SECONDS } from '@/lib/server/webhook';
-import { reconcilePaymentAmount } from '@/lib/server/orders';
+import { reconcilePaymentAmount, valueOrderAgainstCatalog, buildCatalogPriceIndex } from '@/lib/server/orders';
 import { logger } from '@/lib/server/logging';
 
 export const dynamic = 'force-dynamic';
@@ -159,6 +159,48 @@ export async function POST(req: NextRequest) {
     });
     // Record but do NOT mark paid — admin reconciles via the portal.
     return NextResponse.json({ received: true, verified: false, reason: 'amount mismatch' });
+  }
+
+  // 7b. FINANCIAL INTEGRITY: the reconciliation above only proves the gateway
+  //     paid what the ORDER ROW says it costs. The row itself is insertable by
+  //     anon, and the guard triggers police `payment_status` only — never the
+  //     total. Re-derive the value from the catalog so a forged low total can
+  //     never be marked Paid.
+  if (outcome === 'paid') {
+    try {
+      const { data: orderItems } = await (client.from('order_items') as any)
+        .select('product_name, quantity')
+        .eq('order_id', order.id);
+
+      const productNames = [...new Set((orderItems || []).map((it: any) => String(it?.product_name || '')).filter(Boolean))];
+      const { data: catalogRows } = await (client.from('products') as any)
+        .select('id, name, status, product_variants ( price_minor_units, position, status )')
+        .in('name', productNames);
+
+      const valuation = valueOrderAgainstCatalog({
+        items: (orderItems || []).map((it: any) => ({
+          productName: String(it?.product_name || ''),
+          quantity: Number(it?.quantity) || 0,
+        })),
+        prices: buildCatalogPriceIndex(catalogRows || []),
+        storedTotalMinorUnits: expectedMinor,
+      });
+
+      if (!valuation.ok || paidMinor < valuation.catalogTotalMinor) {
+        logger.error('webhook_amount_below_catalog_value', {
+          orderId: order.id,
+          paidMinor,
+          storedTotalMinor: expectedMinor,
+          catalogTotalMinor: valuation.catalogTotalMinor,
+          unknownItems: valuation.unknownItems,
+        });
+        return NextResponse.json({ received: true, verified: false, reason: 'amount below catalog value' });
+      }
+    } catch (e: any) {
+      // Fail closed: never mark an order Paid when its value cannot be verified.
+      logger.error('webhook_catalog_valuation_error', { orderId: order.id, error: e?.message });
+      return NextResponse.json({ received: true, verified: false, reason: 'valuation unavailable' });
+    }
   }
 
   // 8. Apply the terminal state.

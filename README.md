@@ -166,11 +166,20 @@ silently forgotten.
   Defence in depth still helps: anyone holding the `NEXT_PUBLIC` anon key could
   call Supabase Auth directly and bypass these limits. Dashboard-level rate
   limiting or a captcha on the sign-in form would close that too.
-- **Apply `lib/schemaSql.ts` to Supabase.** The RLS policies and the
-  `orders_force_pending` / `orders_protect_payment_status` /
+- **Apply `lib/schemaSql.ts` to Supabase — this is now blocking.** The RLS
+  policies and the `orders_force_pending` / `orders_protect_payment_status` /
   `order_items_require_pending_order` triggers exist only as text until run.
   Until they are applied, an anonymous PostgREST client can still insert an
-  order marked `Paid`.
+  order marked `Paid`. The same script also revokes anon `INSERT` on
+  `orders`/`order_items` and anon `EXECUTE` on `create_order_v2`, which is what
+  closes the forged-order-total hole at the database level.
+- **Set `SUPABASE_SERVICE_ROLE_KEY`.** Order creation now refuses to run without
+  it (the anon fallback was the forge path). Payments, the webhook and the admin
+  portal already required it.
+- **Deploy `create_order_v2`.** It is the only path that decrements stock
+  atomically and raises on oversell. The fallback insert path does a
+  best-effort, non-atomic stock pre-check, so concurrent checkouts can still
+  oversell until the function is deployed.
 - **Set `TRUSTED_PROXY_HOPS`** to the number of reverse proxies in front of the
   app, otherwise `X-Forwarded-For` may be attributed to the wrong client.
 - **Complete the CSP.** `script-src` still needs `'unsafe-inline'` because the

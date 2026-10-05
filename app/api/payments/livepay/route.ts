@@ -3,7 +3,7 @@ import { getServerAdminClient } from '@/lib/server/supabaseServer';
 import { logger } from '@/lib/server/logging';
 import { readJsonBody, isNonEmptyString, jsonError } from '@/lib/server/validation';
 import { consumeRateLimit } from '@/lib/server/rateLimit';
-import { safeReturnUrl } from '@/lib/server/orders';
+import { safeReturnUrl, valueOrderAgainstCatalog, buildCatalogPriceIndex } from '@/lib/server/orders';
 
 export const dynamic = 'force-dynamic';
 
@@ -99,6 +99,59 @@ export async function POST(req: NextRequest) {
   if (!(amountUgx > 0)) {
     logger.error('livepay_invalid_order_amount', { orderId });
     return jsonError('Order has an invalid amount', 422);
+  }
+
+  // 1b. FINANCIAL INTEGRITY: re-derive the order's value from the catalog and
+  //     refuse to charge a total the items do not justify. Without this, an
+  //     attacker who inserts an order row directly (anon has INSERT on
+  //     public.orders and the insert policy is `WITH CHECK (true)`) could set
+  //     total_amount to 1 UGX, pay 1 UGX here, and then receive a webhook that
+  //     reconciles against that same forged total and marks the order Paid.
+  try {
+    const { data: orderItems } = await (client.from('order_items') as any)
+      .select('product_name, quantity, variant_sku')
+      .eq('order_id', order.id);
+
+    if (!Array.isArray(orderItems) || orderItems.length === 0) {
+      logger.error('livepay_order_has_no_items', { orderId });
+      return jsonError('This order has no items and cannot be paid.', 422);
+    }
+
+    const productNames = [...new Set(orderItems.map((it: any) => String(it?.product_name || '')).filter(Boolean))];
+    const { data: catalogRows, error: catErr } = await (client.from('products') as any)
+      .select('id, name, status, product_variants ( price_minor_units, position, status )')
+      .in('name', productNames);
+    if (catErr) {
+      logger.error('livepay_catalog_lookup_error', { error: catErr.message });
+      return jsonError('Payment could not be started', 500);
+    }
+
+    const valuation = valueOrderAgainstCatalog({
+      items: orderItems.map((it: any) => ({
+        productName: String(it?.product_name || ''),
+        quantity: Number(it?.quantity) || 0,
+      })),
+      prices: buildCatalogPriceIndex(catalogRows || []),
+      storedTotalMinorUnits: Number(order.total_minor_units ?? Math.round(Number(order.total_amount || 0) * 100)),
+    });
+
+    if (!valuation.ok) {
+      logger.error('livepay_order_total_not_justified_by_catalog', {
+        orderId,
+        orderNumber: order.order_number,
+        storedTotalMinor: Number(order.total_minor_units),
+        catalogTotalMinor: valuation.catalogTotalMinor,
+        shortByMinor: valuation.shortByMinor,
+        unknownItems: valuation.unknownItems,
+      });
+      return jsonError(
+        'The total on this order no longer matches our catalog. Please place a new order.',
+        409
+      );
+    }
+  } catch (e: any) {
+    logger.error('livepay_order_valuation_exception', { orderId, error: e?.message });
+    return jsonError('Payment could not be started', 500);
   }
 
   const effectivePhone = phoneNumber || (order.customer_phone || '').replace(/[^\d+]/g, '');

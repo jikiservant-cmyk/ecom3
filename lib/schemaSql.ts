@@ -227,9 +227,14 @@ GRANT SELECT ON public.categories, public.products, public.product_variants,
   public.product_images, public.reviews, public.store_settings TO anon, authenticated;
 
 -- Checkout writes (RLS narrows these further)
-GRANT SELECT, INSERT ON public.orders TO anon, authenticated;
+-- anon may NOT insert orders: order rows are written only by the server under
+-- the service role. Granting anon INSERT let a caller forge an order with an
+-- arbitrary total (e.g. 1 UGX for a 5,000 UGX cart) and then pay it.
+GRANT SELECT ON public.orders TO anon;
+GRANT SELECT, INSERT ON public.orders TO authenticated;
 GRANT UPDATE, DELETE ON public.orders TO authenticated;
-GRANT SELECT, INSERT ON public.order_items TO anon, authenticated;
+GRANT SELECT ON public.order_items TO anon;
+GRANT SELECT, INSERT ON public.order_items TO authenticated;
 GRANT INSERT ON public.contact_messages TO anon, authenticated;
 GRANT SELECT, UPDATE ON public.contact_messages TO authenticated;
 GRANT INSERT ON public.reviews TO authenticated;
@@ -386,7 +391,9 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) TO anon, authenticated;
+-- Revoked from anon: calling the RPC directly writes orders with caller-chosen
+-- totals, bypassing the catalog re-pricing in app/api/orders/route.ts.
+GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) TO authenticated;
 
 -- 20b. CRITICAL — order state may never be supplied by a client.
 -- public.orders is INSERTable by anon/authenticated (guest checkout) and
@@ -547,7 +554,7 @@ CREATE POLICY "Profiles self update" ON public.profiles FOR UPDATE TO authentica
 
 -- Orders: server/guest insert allowed (API validates), owner+admin read, admin update/delete
 DROP POLICY IF EXISTS "Orders insert" ON public.orders;
-CREATE POLICY "Orders insert" ON public.orders FOR INSERT WITH CHECK (true);
+CREATE POLICY "Orders insert" ON public.orders FOR INSERT TO authenticated WITH CHECK (public.is_admin());
 DROP POLICY IF EXISTS "Orders owner or admin read" ON public.orders;
 CREATE POLICY "Orders owner or admin read" ON public.orders FOR SELECT TO authenticated USING (customer_id = auth.uid() OR public.is_admin());
 DROP POLICY IF EXISTS "Orders admin update" ON public.orders;

@@ -12,7 +12,7 @@
  *   explicit error propagation when the function is not deployed.
  */
 import { randomBytes } from 'crypto';
-import { getServerAdminClient, getServerAnonClient, hasServiceRoleKey } from './supabaseServer';
+import { getServerAdminClient } from './supabaseServer';
 import { logger } from './logging';
 
 const ORDER_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'; // no 0/O/1/I/L
@@ -45,6 +45,98 @@ export function computeOrderTotals(lineTotalsMinorUnits: number[]): OrderTotals 
 /** True when the client's claimed total matches the server-computed total. */
 export function totalsMatch(server: OrderTotals, claimedTotalMinorUnits: number, toleranceMinorUnits = 1): boolean {
   return Number.isFinite(claimedTotalMinorUnits) && Math.abs(server.totalMinorUnits - claimedTotalMinorUnits) <= toleranceMinorUnits;
+}
+
+export interface CatalogPriceIndex {
+  /** Authoritative price in minor units, keyed by product id. */
+  byId: Map<string, number>;
+  /** Authoritative price in minor units, keyed by product name (fallback). */
+  byName: Map<string, number>;
+}
+
+export interface CatalogValuation {
+  /** True when the stored total is justified by what the catalog says the items cost. */
+  ok: boolean;
+  catalogSubtotalMinor: number;
+  catalogTotalMinor: number;
+  /** How far the stored total understates the catalog value. 0 when ok. */
+  shortByMinor: number;
+  /** Items with no active catalog price — an order containing one is not chargeable. */
+  unknownItems: string[];
+}
+
+/**
+ * Re-derive an order's value from the catalog and compare it to the total
+ * stored on the order row.
+ *
+ * Why this exists: `anon` can INSERT into `public.orders` (guest checkout), the
+ * insert policy is `WITH CHECK (true)`, and the guard triggers only force
+ * `payment_status` — nothing ever checks that `total_minor_units` reflects what
+ * the items actually cost. An attacker can therefore insert an order for real
+ * products with a 1-UGX total, call the public payment endpoint, pay 1 UGX, and
+ * receive a webhook that reconciles against that same forged total and marks the
+ * order Paid. Re-pricing here closes that regardless of how the row got there.
+ *
+ * A stored total BELOW the catalog value is the money-losing direction and is
+ * always refused. A total above it (catalog price dropped after checkout) is
+ * allowed — that is a normal price change, not a loss.
+ */
+export function valueOrderAgainstCatalog(opts: {
+  items: { productName: string; quantity: number; productId?: string | null }[];
+  prices: CatalogPriceIndex;
+  storedTotalMinorUnits: number;
+}): CatalogValuation {
+  const lineTotalsMinor: number[] = [];
+  const unknownItems: string[] = [];
+
+  for (const item of opts.items || []) {
+    const quantity = Number.isFinite(Number(item?.quantity)) ? Math.max(0, Math.round(Number(item.quantity))) : 0;
+    const byId = item?.productId ? opts.prices.byId.get(String(item.productId)) : undefined;
+    const priceMinor = byId !== undefined ? byId : opts.prices.byName.get(String(item?.productName || ''));
+    if (priceMinor === undefined || !Number.isFinite(priceMinor) || priceMinor <= 0) {
+      unknownItems.push(String(item?.productName || '(unnamed)'));
+      continue;
+    }
+    lineTotalsMinor.push(priceMinor * quantity);
+  }
+
+  const catalog = computeOrderTotals(lineTotalsMinor);
+  const stored = Number.isFinite(Number(opts.storedTotalMinorUnits)) ? Math.round(Number(opts.storedTotalMinorUnits)) : NaN;
+  const shortByMinor = Number.isFinite(stored) ? Math.max(0, catalog.totalMinorUnits - stored) : Infinity;
+
+  return {
+    ok: unknownItems.length === 0 && Number.isFinite(stored) && shortByMinor === 0,
+    catalogSubtotalMinor: catalog.subtotalMinorUnits,
+    catalogTotalMinor: catalog.totalMinorUnits,
+    shortByMinor: Number.isFinite(shortByMinor) ? shortByMinor : 0,
+    unknownItems,
+  };
+}
+
+/**
+ * Build a {@link CatalogPriceIndex} from `products` rows shaped like
+ * `select('id, name, status, product_variants ( price_minor_units, position, status )')`.
+ * Inactive products are skipped; the first product wins a given name so a
+ * duplicate name can never silently re-price a line to a cheaper product.
+ */
+export function buildCatalogPriceIndex(products: any[]): CatalogPriceIndex {
+  const byId = new Map<string, number>();
+  const byName = new Map<string, number>();
+
+  for (const p of products || []) {
+    if (!p || p.status !== 'active') continue;
+    const variants = Array.isArray(p.product_variants) ? p.product_variants : [];
+    const active = variants
+      .filter((v: any) => v && v.status === 'active')
+      .sort((a: any, b: any) => (Number(a?.position) || 0) - (Number(b?.position) || 0));
+    const primary = active[0] || variants[0];
+    const price = Number(primary?.price_minor_units);
+    if (!primary || !Number.isFinite(price) || price <= 0) continue;
+    byId.set(String(p.id), price);
+    if (!byName.has(p.name)) byName.set(p.name, price);
+  }
+
+  return { byId, byName };
 }
 
 export interface Reconciliation {
@@ -158,7 +250,19 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
  * RLS policy documented for guest checkout.
  */
 export async function createOrderServer(input: CreateOrderInput): Promise<CreateOrderResult> {
-  const client = getServerAdminClient() || getServerAnonClient();
+  // FINANCIAL INTEGRITY: order writes require the service-role client. The
+  // previous `|| getServerAnonClient()` fallback only worked because anon was
+  // granted INSERT on public.orders — which is precisely what let an attacker
+  // forge an order row with an arbitrary (1 UGX) total and then pay it. Orders
+  // are now written only by this function, under the service role, from
+  // catalog-priced line items.
+  const client = getServerAdminClient();
+  if (!client) {
+    logger.error('order_create_no_service_role', {
+      hint: 'Set SUPABASE_SERVICE_ROLE_KEY — order creation is refused without it',
+    });
+    return { success: false, error: 'Checkout is temporarily unavailable. Please try again.' };
+  }
   const orderId = generateOrderId();
   const orderNumber = generateOrderNumber();
   const now = new Date().toISOString();
@@ -205,10 +309,49 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
   }
 
   // Path 2: sequential inserts with strict error propagation (no silent partials).
-  if (!hasServiceRoleKey) {
-    logger.warn('order_create_no_service_role', {
-      hint: 'Set SUPABASE_SERVICE_ROLE_KEY for reliable server-side order writes',
-    });
+  // Reached only when create_order_v2 is not deployed; `client` is already the
+  // service-role client (see the guard at the top of this function).
+  //
+  // create_order_v2 decrements stock atomically and raises on oversell. This
+  // fallback cannot — PostgREST has no way to express
+  // `inventory_quantity = inventory_quantity - n` without an RPC — so it does a
+  // best-effort pre-flight check instead. It is NOT atomic: two simultaneous
+  // checkouts can both pass it. Deploy create_order_v2 for the real guarantee.
+  try {
+    const names = [...new Set(input.items.map((it) => it.productName))];
+    const { data: variants, error: vErr } = await (client.from('product_variants') as any)
+      .select('product_id, inventory_quantity, status, position, products ( id, name, status )')
+      .eq('status', 'active')
+      .in('products.name', names);
+    if (vErr) {
+      logger.warn('order_stock_precheck_skipped', { error: vErr.message });
+    } else {
+      // Mirror create_order_v2: the lowest-position active variant of an active
+      // product is the sellable one.
+      const candidates = new Map<string, { position: number; qty: number }>();
+      for (const v of variants || []) {
+        const product = (v as any)?.products;
+        const name = product?.name;
+        if (!name || product?.status !== 'active') continue;
+        const position = Number((v as any)?.position) || 0;
+        const qty = Number((v as any)?.inventory_quantity) || 0;
+        const current = candidates.get(name);
+        if (!current || position < current.position) candidates.set(name, { position, qty });
+      }
+      for (const item of input.items) {
+        const available = candidates.get(item.productName)?.qty;
+        if (available !== undefined && item.quantity > available) {
+          logger.warn('order_insufficient_stock_fallback', {
+            productName: item.productName,
+            requested: item.quantity,
+            available,
+          });
+          return { success: false, error: `"${item.productName}" does not have enough stock for this order.` };
+        }
+      }
+    }
+  } catch (e: any) {
+    logger.warn('order_stock_precheck_exception', { error: e?.message });
   }
 
   try {
