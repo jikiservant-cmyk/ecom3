@@ -116,6 +116,11 @@ export async function POST(req: NextRequest) {
   const customerPhone = isNonEmptyString(body.phone, 32) ? sanitizeText(body.phone, 32) : null;
   const shippingAddress = isNonEmptyString(body.shippingAddress, 500) ? sanitizeText(body.shippingAddress, 500) : null;
 
+  // How the customer intends to pay. Recorded on the order so a Cash-on-Delivery
+  // order is never confused with an unpaid Mobile Money order — otherwise COD
+  // orders sit in Pending forever looking like abandoned payments.
+  const paymentMethod: 'momo' | 'cod' = body.paymentMethod === 'cod' ? 'cod' : 'momo';
+
   if (!customerName) return jsonError('A valid customer name is required', 400);
   if (!customerEmail) return jsonError('A valid customer email is required', 400);
   if (!shippingAddress) return jsonError('A shipping address is required', 400);
@@ -233,6 +238,7 @@ export async function POST(req: NextRequest) {
     customerPhone: customerPhone || undefined,
     shippingAddress: shippingAddress || undefined,
     customerId: auth?.userId || null,
+    paymentMethod,
     items,
     total: totals.totalMinorUnits / 100,
     subtotalMinorUnits: totals.subtotalMinorUnits,
@@ -299,8 +305,26 @@ export async function PATCH(req: NextRequest) {
       update.status = 'Processing'; // paying an order moves it into the pipeline
     }
   }
+  // Shipment tracking. Imported items are dispatched from abroad, so the admin
+  // records the carrier reference here for the customer to follow.
+  if (body.trackingNumber !== undefined) {
+    if (body.trackingNumber === null || body.trackingNumber === '') {
+      update.tracking_number = null;
+    } else if (isNonEmptyString(body.trackingNumber, 120)) {
+      // Strict charset: tracking codes are alphanumeric with dashes, and this
+      // keeps the value safe to render and to query.
+      const tn = sanitizeText(body.trackingNumber, 120);
+      if (!/^[A-Za-z0-9-]{3,120}$/.test(tn)) {
+        return jsonError('Tracking number may only contain letters, numbers and dashes', 400);
+      }
+      update.tracking_number = tn.toUpperCase();
+    } else {
+      return jsonError('Invalid tracking number', 400);
+    }
+  }
+
   if (Object.keys(update).length === 1) {
-    return jsonError('Provide status and/or paymentStatus', 400);
+    return jsonError('Provide status, paymentStatus and/or trackingNumber', 400);
   }
 
   try {
@@ -329,6 +353,7 @@ export async function PATCH(req: NextRequest) {
       orderId,
       status,
       paymentStatus,
+      trackingNumber: typeof update.tracking_number === 'string' ? update.tracking_number : undefined,
       // Manual Paid/Refunded writes bypass the gateway; the reason is the audit
       // trail that distinguishes reconciliation from an unexplained write.
       note: typeof update.payment_note === 'string' ? update.payment_note : undefined,

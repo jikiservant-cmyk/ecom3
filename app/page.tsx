@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useSyncExternalStore, useRef, useMemo } from 'react';
 import Image from 'next/image';
 import AdminPortal from '@/components/AdminPortal';
+import StoreRating from '@/components/StoreRating';
 import { supabase, isSupabaseConfigured } from '@/lib/supabase';
 import { 
   signInViaServer, 
@@ -724,6 +725,7 @@ export default function DrumPalaceApp() {
           total: grandTotal,
           phone: effectivePhone,
           shippingAddress: customerShipping,
+          paymentMethod,
         }),
       });
       const orderData = await orderRes.json().catch(() => null);
@@ -2655,6 +2657,9 @@ export default function DrumPalaceApp() {
       {/* ========================================================= */}
       {/* FOOTER */}
       {/* ========================================================= */}
+      {/* Customers who have paid can rate the shop */}
+      <StoreRating />
+
       <footer className="border-t border-[var(--line)] py-8 px-4 text-xs text-[var(--muted)] bg-[var(--surface)] pb-24 md:pb-8">
         <div className="shell flex flex-col md:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2.5">

@@ -27,6 +27,10 @@ export interface DbOrder {
   paymentStatus: 'Paid' | 'Pending' | 'Failed';
   createdAt: string;
   shippingAddress?: string;
+  /** How the customer is paying. COD orders must not be mistaken for unpaid ones. */
+  paymentMethod?: 'momo' | 'cod';
+  /** Carrier reference, set when the admin marks the order Shipped. */
+  trackingNumber?: string;
 }
 
 export interface DbUserProfile {
@@ -780,6 +784,8 @@ export async function getOrdersFromDb(): Promise<DbOrder[]> {
         subtotal_minor_units,
         total_minor_units,
         total_amount,
+        payment_method,
+        tracking_number,
         created_at,
         order_items (
           product_name,
@@ -831,6 +837,8 @@ export async function getOrdersFromDb(): Promise<DbOrder[]> {
           paymentStatus: (o.payment_status?.toLowerCase() === 'paid' ? 'Paid' : 'Pending') as any,
           createdAt: o.created_at || new Date().toISOString(),
           shippingAddress: address,
+          paymentMethod: o.payment_method === 'cod' ? 'cod' : 'momo',
+          trackingNumber: typeof o.tracking_number === 'string' && o.tracking_number ? o.tracking_number : undefined,
         };
       });
     }

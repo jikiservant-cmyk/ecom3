@@ -233,6 +233,8 @@ export interface CreateOrderInput {
   total: number; // major units
   shippingMinorUnits?: number;
   subtotalMinorUnits?: number;
+  /** 'momo' (gateway) or 'cod' (cash on delivery). Defaults to 'momo'. */
+  paymentMethod?: 'momo' | 'cod';
 }
 
 export interface CreateOrderResult {
@@ -366,6 +368,7 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       items: input.items,
       status: 'Pending',
       payment_status: 'Pending',
+      payment_method: input.paymentMethod === 'cod' ? 'cod' : 'momo',
       currency: 'UGX',
       subtotal_minor_units: subtotalMinorUnits,
       discount_minor_units: 0,

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import Image from "next/image";
 import {
   LayoutDashboard,
@@ -182,6 +182,11 @@ export default function AdminPortal({
   const [copiedSql, setCopiedSql] = useState(false);
   const [diagnosticResult, setDiagnosticResult] = useState<ConnectionDiagnosticResult | null>(null);
 
+  // New-order awareness: the admin portal is how orders are discovered, so it
+  // polls while open and flags anything newer than the last thing we showed.
+  const [newOrderCount, setNewOrderCount] = useState(0);
+  const newestSeenRef = useRef<string | null>(null);
+
   const showToast = (msg: string) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 3500);
@@ -208,6 +213,45 @@ export default function AdminPortal({
       setLoading(false);
     }
   }, [onProductsUpdated]);
+
+  // Poll for new orders while the portal is open (every 30s).
+  useEffect(() => {
+    if (!effectiveAdmin || effectiveAdmin.role !== "admin") return;
+    let cancelled = false;
+
+    const check = async () => {
+      try {
+        const ords = await getOrdersFromDb();
+        if (cancelled) return;
+        const newest = ords
+          .map((o) => o.createdAt)
+          .filter(Boolean)
+          .sort()
+          .pop() || null;
+
+        if (newestSeenRef.current === null) {
+          // First observation — establish the baseline without shouting about
+          // orders that were already there.
+          newestSeenRef.current = newest;
+        } else if (newest && newest > newestSeenRef.current) {
+          const fresh = ords.filter((o) => o.createdAt > (newestSeenRef.current || ""));
+          newestSeenRef.current = newest;
+          setNewOrderCount((c) => c + fresh.length);
+          setOrders(ords);
+          showToast(`🔔 ${fresh.length} new order${fresh.length === 1 ? "" : "s"} received`);
+        }
+      } catch {
+        // A failed poll is not worth surfacing; the next tick will retry.
+      }
+    };
+
+    const timer = setInterval(check, 30_000);
+    void check();
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [effectiveAdmin]);
 
   useEffect(() => {
     let isSubscribed = true;
@@ -474,6 +518,38 @@ export default function AdminPortal({
     await updateOrderStatusInDb(orderId, status);
     showToast(`Order status updated to "${status}"`);
     loadData();
+  };
+
+  /** Save a carrier tracking reference. Goes through the API so it is audit-logged. */
+  const handleSaveTracking = async (orderId: string, trackingNumber: string) => {
+    try {
+      let accessToken: string | null = null;
+      try {
+        const { data } = await supabase.auth.getSession();
+        accessToken = data?.session?.access_token || null;
+      } catch {
+        accessToken = null;
+      }
+      if (!accessToken) {
+        showToast("Session expired. Please sign in again to save tracking.");
+        return;
+      }
+      const res = await fetch("/api/orders", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+        body: JSON.stringify({ orderId, trackingNumber: trackingNumber || null }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.success) {
+        showToast(data?.error || "Could not save the tracking number.");
+        loadData();
+        return;
+      }
+      showToast(trackingNumber ? `Tracking ${trackingNumber} saved.` : "Tracking number cleared.");
+      loadData();
+    } catch {
+      showToast("Could not save the tracking number.");
+    }
   };
 
   // Manual payment reconciliation escape hatch (admin-only). Used when the gateway
@@ -1236,6 +1312,29 @@ export default function AdminPortal({
 
         {/* Tab Body Scrollable Container */}
         <main className="flex-1 overflow-y-auto p-3 sm:p-5 md:p-6">
+          {/* New-order alert. Orders arrive through POST /api/orders; this banner
+              is how the admin learns about them without refreshing. */}
+          {newOrderCount > 0 && (
+            <div className="mb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-3 rounded-xl border border-emerald-200 bg-emerald-50 dark:bg-emerald-950/40 dark:border-emerald-900">
+              <div className="text-sm font-bold text-emerald-800 dark:text-emerald-300">
+                🔔 {newOrderCount} new order{newOrderCount === 1 ? "" : "s"} since you opened the dashboard
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => { setCurrentTab("orders"); setNewOrderCount(0); }}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold whitespace-nowrap"
+                >
+                  View orders
+                </button>
+                <button
+                  onClick={() => setNewOrderCount(0)}
+                  className="px-2 py-1.5 rounded-lg border border-emerald-300 text-emerald-700 dark:text-emerald-300 dark:border-emerald-800 text-xs font-bold"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
           {/* ========================================================= */}
           {/* TAB 1: OVERVIEW & PERFORMANCE */}
           {/* ========================================================= */}
@@ -2497,8 +2596,28 @@ export default function AdminPortal({
                     >
                       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-100 dark:border-slate-800 text-xs">
                         <div>
-                          <div className="font-bold text-slate-900 dark:text-white text-sm">
+                          <div className="font-bold text-slate-900 dark:text-white text-sm flex items-center gap-2 flex-wrap">
                             {order.orderNumber}
+                            {order.paymentMethod === "cod" ? (
+                              <span
+                                title="Cash on Delivery — collect payment at handover, then mark it Paid"
+                                className="text-[10px] font-extrabold uppercase tracking-wide px-2 py-0.5 rounded-md bg-orange-100 text-orange-700 border border-orange-200 dark:bg-orange-950/40 dark:text-orange-300 dark:border-orange-900"
+                              >
+                                💵 Cash on Delivery
+                              </span>
+                            ) : (
+                              <span
+                                title="Mobile Money via LivePay"
+                                className="text-[10px] font-extrabold uppercase tracking-wide px-2 py-0.5 rounded-md bg-sky-100 text-sky-700 border border-sky-200 dark:bg-sky-950/40 dark:text-sky-300 dark:border-sky-900"
+                              >
+                                📱 Mobile Money
+                              </span>
+                            )}
+                            {order.paymentMethod === "cod" && order.paymentStatus !== "Paid" && (
+                              <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-amber-50 text-amber-700 border border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900">
+                                Collect on delivery
+                              </span>
+                            )}
                           </div>
                           <div className="text-slate-400 mt-0.5">
                             Customer: <span className="text-slate-700 dark:text-slate-300 font-semibold">{order.customerName}</span> ({order.customerEmail})
@@ -2533,6 +2652,33 @@ export default function AdminPortal({
                             <option value="Cancelled">Cancelled</option>
                           </select>
                         </div>
+                      </div>
+
+                      {/* Dispatch: tracking reference + one-click shipped */}
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                        <input
+                          defaultValue={order.trackingNumber || ""}
+                          onBlur={(e) => {
+                            const next = e.target.value.trim().toUpperCase();
+                            if (next !== (order.trackingNumber || "")) handleSaveTracking(order.id, next);
+                          }}
+                          onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+                          placeholder="Tracking no. (e.g. DHL-1234567)"
+                          className="flex-1 py-1 px-2.5 text-xs rounded-lg border border-slate-200 bg-slate-50 font-semibold focus:outline-none focus:ring-2 focus:ring-[var(--accent)]/40 dark:bg-slate-800 dark:border-slate-700"
+                        />
+                        {order.status !== "Shipped" && order.status !== "Delivered" && order.status !== "Cancelled" && (
+                          <button
+                            onClick={() => handleUpdateOrderStatus(order.id, "Shipped")}
+                            className="py-1 px-3 text-xs font-bold rounded-lg bg-[var(--accent)] text-white hover:opacity-90 whitespace-nowrap"
+                          >
+                            📦 Mark Shipped
+                          </button>
+                        )}
+                        {order.trackingNumber && (
+                          <span className="text-[11px] font-bold text-slate-500 dark:text-slate-400 whitespace-nowrap">
+                            Saved: {order.trackingNumber}
+                          </span>
+                        )}
                       </div>
 
                       {/* Items breakdown */}

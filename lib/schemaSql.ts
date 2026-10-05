@@ -57,6 +57,9 @@ CREATE TABLE IF NOT EXISTS public.products (
   sound_profile TEXT,
   variants JSONB DEFAULT '["Standard"]'::jsonb,
   free_shipping BOOLEAN DEFAULT TRUE,
+  -- 'imported' items ship from abroad and take longer; the admin flags them so
+  -- customers and dispatch see the difference.
+  origin TEXT DEFAULT 'local' CHECK (origin IN ('local', 'imported')),
   status TEXT DEFAULT 'active' CHECK (status IN ('draft', 'active', 'archived')),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -110,6 +113,11 @@ CREATE TABLE IF NOT EXISTS public.orders (
   -- Reason recorded whenever an admin moves payment_status by hand. Manual
   -- Paid/Refunded writes bypass the gateway, so they must leave a trail.
   payment_note TEXT,
+  -- How the customer intends to pay. Without this, a Cash-on-Delivery order is
+  -- indistinguishable from an unpaid Mobile Money order, so COD orders sit in
+  -- Pending forever looking like abandoned payments.
+  payment_method TEXT DEFAULT 'momo' CHECK (payment_method IN ('momo', 'cod')),
+  tracking_number TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -117,6 +125,9 @@ CREATE TABLE IF NOT EXISTS public.orders (
 -- For databases created before payment_note existed (CREATE TABLE IF NOT EXISTS
 -- will not add a column to a table that is already there).
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_note TEXT;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_method TEXT DEFAULT 'momo';
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS tracking_number TEXT;
+ALTER TABLE public.products ADD COLUMN IF NOT EXISTS origin TEXT DEFAULT 'local';
 
 -- 8. Order items
 CREATE TABLE IF NOT EXISTS public.order_items (
@@ -176,6 +187,51 @@ CREATE TABLE IF NOT EXISTS public.reviews (
   verified_purchase BOOLEAN DEFAULT FALSE,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- 12b. Store ratings. Unlike product reviews these rate the shop itself, and
+-- only a customer with at least one PAID order may leave one. The gate is
+-- enforced here as well as in the API so the rule survives a direct
+-- PostgREST insert.
+CREATE TABLE IF NOT EXISTS public.store_ratings (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
+  user_name TEXT NOT NULL,
+  rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+  comment TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  -- One rating per customer: they can change their mind, not spam the score.
+  CONSTRAINT store_ratings_one_per_user UNIQUE (user_id)
+);
+
+-- Refuse a store rating from anyone who has not actually paid for something.
+CREATE OR REPLACE FUNCTION public.store_rating_requires_paid_order()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF COALESCE(auth.role(), '') = 'service_role' THEN
+    RETURN NEW;
+  END IF
+  IF NEW.user_id IS NULL OR NEW.user_id <> auth.uid() THEN
+    RAISE EXCEPTION 'a store rating must belong to the signed-in user' USING ERRCODE = '42501';
+  END IF
+  IF NOT EXISTS (
+    SELECT 1 FROM public.orders o
+     WHERE o.customer_id = NEW.user_id
+       AND o.payment_status = 'Paid'
+  ) THEN
+    RAISE EXCEPTION 'only customers with a completed paid order can rate the store' USING ERRCODE = '42501';
+  END IF
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS store_rating_requires_paid_order ON public.store_ratings;
+CREATE TRIGGER store_rating_requires_paid_order
+  BEFORE INSERT OR UPDATE ON public.store_ratings
+  FOR EACH ROW EXECUTE PROCEDURE public.store_rating_requires_paid_order();
 
 -- 12. Store settings (single row)
 CREATE TABLE IF NOT EXISTS public.store_settings (
@@ -245,6 +301,8 @@ GRANT SELECT, INSERT ON public.order_items TO authenticated;
 GRANT INSERT ON public.contact_messages TO anon, authenticated;
 GRANT SELECT, UPDATE ON public.contact_messages TO authenticated;
 GRANT INSERT ON public.reviews TO authenticated;
+GRANT SELECT ON public.store_ratings TO anon, authenticated;
+GRANT INSERT, UPDATE ON public.store_ratings TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.wishlists TO authenticated;
 GRANT SELECT, UPDATE ON public.profiles TO authenticated;
 GRANT UPDATE ON public.store_settings TO authenticated;
@@ -530,6 +588,7 @@ ALTER TABLE public.reviews ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.store_settings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.carts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.cart_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.store_ratings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.payment_webhook_events ENABLE ROW LEVEL SECURITY;
 
 -- Catalog: public read, admin write
@@ -570,6 +629,11 @@ DROP POLICY IF EXISTS "Orders admin delete" ON public.orders;
 CREATE POLICY "Orders admin delete" ON public.orders FOR DELETE TO authenticated USING (public.is_admin());
 
 -- Order items: only for orders that exist; owner+admin read
+DROP POLICY IF EXISTS "Store ratings public read" ON public.store_ratings;
+CREATE POLICY "Store ratings public read" ON public.store_ratings FOR SELECT USING (true);
+DROP POLICY IF EXISTS "Store ratings own write" ON public.store_ratings;
+CREATE POLICY "Store ratings own write" ON public.store_ratings FOR ALL TO authenticated USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
+
 DROP POLICY IF EXISTS "Order items insert" ON public.order_items;
 CREATE POLICY "Order items insert" ON public.order_items FOR INSERT WITH CHECK (
   EXISTS (SELECT 1 FROM public.orders o WHERE o.id = order_id)
