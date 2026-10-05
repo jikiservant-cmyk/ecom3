@@ -311,6 +311,8 @@ CREATE TRIGGER profiles_protect_role
   FOR EACH ROW EXECUTE PROCEDURE public.protect_profile_role();
 
 -- 20. Atomic order creation with stock decrement (used by the API server).
+-- Drop any older signature first so CREATE OR REPLACE can change the argument list.
+DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, TIMESTAMPTZ);
 CREATE OR REPLACE FUNCTION public.create_order_v2(
   p_order_id TEXT,
   p_order_number TEXT,
@@ -320,6 +322,8 @@ CREATE OR REPLACE FUNCTION public.create_order_v2(
   p_customer_phone TEXT,
   p_shipping_address TEXT,
   p_items JSONB,
+  p_subtotal_minor_units BIGINT,
+  p_shipping_minor_units BIGINT,
   p_total_minor_units BIGINT,
   p_created_at TIMESTAMPTZ
 )
@@ -341,7 +345,7 @@ BEGIN
   ) VALUES (
     p_order_id, p_order_number, p_customer_id, p_customer_name, p_customer_email, p_customer_phone,
     jsonb_build_object('address', COALESCE(p_shipping_address, '')), p_items, 'Pending', 'Pending', 'UGX',
-    p_total_minor_units, 0, 0, 0,
+    p_subtotal_minor_units, 0, p_shipping_minor_units, 0,
     p_total_minor_units, ROUND(p_total_minor_units / 100.0, 2), p_created_at, p_created_at
   );
 
@@ -382,7 +386,41 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, TIMESTAMPTZ) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) TO anon, authenticated;
+
+-- 20b. Remove LEGACY permissive policies from the pre-audit schema (if present).
+-- The grants were already revoked above, but the policies themselves must go.
+DO $$
+DECLARE
+  r RECORD;
+BEGIN
+  FOR r IN
+    SELECT pol.polname, cls.relname
+    FROM pg_policy pol
+    JOIN pg_class cls ON cls.oid = pol.polrelid
+    JOIN pg_namespace nsp ON nsp.oid = cls.relnamespace
+    WHERE nsp.nspname = 'public'
+      AND pol.polname IN (
+        'Public read categories','Admin manage categories',
+        'Public read products','Admin manage products',
+        'Public read variants','Admin manage variants',
+        'Public read images','Admin manage images',
+        'Public read profiles','Users manage profiles',
+        'Public read orders','Public insert orders','Admin update orders',
+        'Public insert order_items','Public insert payments',
+        'Public insert contact_messages',
+        'Public read/write reviews','Public read/write wishlists',
+        'Public read/write store_settings'
+      )
+  LOOP
+    EXECUTE format('DROP POLICY %I ON public.%I', r.polname, r.relname);
+  END LOOP;
+END $$;
+
+DROP POLICY IF EXISTS "Public read products bucket" ON storage.objects;
+DROP POLICY IF EXISTS "Public insert products bucket" ON storage.objects;
+DROP POLICY IF EXISTS "Public update products bucket" ON storage.objects;
+DROP POLICY IF EXISTS "Public delete products bucket" ON storage.objects;
 
 -- 21. Row Level Security
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;

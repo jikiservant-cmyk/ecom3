@@ -1,13 +1,19 @@
 /**
- * Webhook signature verification for the LivePay webhook endpoint.
+ * LivePay webhook signature verification — implemented against the OFFICIAL
+ * documentation (https://docs.livepay.me/webhooks, retrieved 2026-10-05).
  *
- * Scheme (documented in README; verify against LivePay docs before go-live):
- *   x-livepay-signature: hex(HMAC-SHA256(rawRequestBody, LIVEPAY_WEBHOOK_SECRET))
- * A `t=<unix>,v1=<hex>` envelope is also tolerated for gateways that send one.
+ * Wire format:
+ *   Header:  X-Webhook-Signature: t=<unix-timestamp>,v=<hex hmac>
+ *   String:  webhook_url + timestamp + sorted_params
+ *   where sorted_params = the keys {customer_reference, internal_reference,
+ *   status} sorted alphabetically, each rendered as key+value concatenated
+ *   directly (no separators).
+ *   HMAC:    hex(HMAC-SHA256(string, LIVEPAY_WEBHOOK_SECRET))
  *
- * UNVERIFIED: LivePay's exact scheme could not be confirmed from this environment.
- * If their docs differ, only this file needs to change — the route fails closed
- * either way (no secret configured => reject).
+ * Verified payload shape (no event wrapper):
+ *   { status, message, customer_reference, internal_reference,
+ *     provider_transaction_id, msisdn, amount, currency, provider, charge,
+ *     completed_at }
  */
 import { createHmac, timingSafeEqual } from 'crypto';
 
@@ -17,8 +23,49 @@ export function getWebhookSecret(): string | null {
   return secret;
 }
 
-function computeSignature(rawBody: string, secret: string): string {
-  return createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex');
+export interface ParsedSignature {
+  timestamp: string;
+  signature: string; // hex
+}
+
+/** Parse "t=...,v=..." — returns null when malformed. */
+export function parseSignatureHeader(header: string | null): ParsedSignature | null {
+  if (!header) return null;
+  const parts = header.split(',').map((s) => s.trim());
+  let timestamp = '';
+  let signature = '';
+  for (const part of parts) {
+    if (part.startsWith('t=')) timestamp = part.slice(2);
+    else if (part.startsWith('v=')) signature = part.slice(2);
+  }
+  if (!/^\d{1,20}$/.test(timestamp)) return null;
+  if (!/^[a-fA-F0-9]{64}$/.test(signature)) return null;
+  return { timestamp, signature: signature.toLowerCase() };
+}
+
+/**
+ * Build the exact string-to-sign defined by LivePay's docs.
+ * Missing payload values are treated as empty strings (defensive).
+ */
+export function buildSignatureString(
+  webhookUrl: string,
+  timestamp: string,
+  payload: { customer_reference?: unknown; internal_reference?: unknown; status?: unknown }
+): string {
+  const params: Record<string, string> = {
+    customer_reference: payload.customer_reference == null ? '' : String(payload.customer_reference),
+    internal_reference: payload.internal_reference == null ? '' : String(payload.internal_reference),
+    status: payload.status == null ? '' : String(payload.status),
+  };
+  let out = webhookUrl + timestamp;
+  for (const key of Object.keys(params).sort()) {
+    out += key + params[key];
+  }
+  return out;
+}
+
+export function signString(stringToSign: string, secret: string): string {
+  return createHmac('sha256', secret).update(stringToSign, 'utf8').digest('hex');
 }
 
 function safeEqualHex(a: string, b: string): boolean {
@@ -29,27 +76,56 @@ function safeEqualHex(a: string, b: string): boolean {
 }
 
 /**
- * Verify the webhook signature. Returns true only for a valid signature.
- * Fails closed: missing secret, missing header, or malformed value => false.
+ * Verify a LivePay webhook. Fails closed on any missing input.
+ *
+ * `candidateWebhookUrls` contains every plausible exact URL the gateway may
+ * have used when signing (the signature binds the URL string). We accept a
+ * match against any candidate — candidates are always our own endpoint under
+ * our own host, derived from APP_URL and/or the incoming request.
  */
-export function verifyLivePaySignature(rawBody: string, signatureHeader: string | null, secret: string | null): boolean {
+export function verifyLivePayWebhook(opts: {
+  payload: any;
+  header: string | null;
+  candidateWebhookUrls: string[];
+  secret: string | null;
+}): boolean {
+  const { payload, header, candidateWebhookUrls, secret } = opts;
   if (!secret) return false;
-  if (!signatureHeader) return false;
+  const parsed = parseSignatureHeader(header);
+  if (!parsed) return false;
+  if (!payload || typeof payload !== 'object') return false;
 
-  let provided = signatureHeader.trim();
-  // Tolerate "t=...,v1=..." envelopes.
-  if (provided.includes('v1=')) {
-    const part = provided.split(',').map((s) => s.trim()).find((s) => s.startsWith('v1='));
-    if (!part) return false;
-    provided = part.slice(3);
+  for (const url of candidateWebhookUrls) {
+    if (!url) continue;
+    const stringToSign = buildSignatureString(url, parsed.timestamp, payload);
+    const expected = signString(stringToSign, secret);
+    if (safeEqualHex(expected, parsed.signature)) return true;
   }
-  if (!/^[a-fA-F0-9]{64}$/.test(provided)) return false;
-
-  const expected = computeSignature(rawBody, secret);
-  return safeEqualHex(expected.toLowerCase(), provided.toLowerCase());
+  return false;
 }
 
-/** Test/utility helper for generating signatures (used by tests and operators). */
-export function signLivePayPayload(rawBody: string, secret: string): string {
-  return computeSignature(rawBody, secret);
+/** Test/utility helper mirroring LivePay's docs examples. */
+export function signLivePayWebhook(opts: {
+  webhookUrl: string;
+  timestamp: string;
+  payload: { customer_reference?: unknown; internal_reference?: unknown; status?: unknown };
+  secret: string;
+}): string {
+  return signString(buildSignatureString(opts.webhookUrl, opts.timestamp, opts.payload), opts.secret);
+}
+
+/** Derive the webhook URL candidates from the incoming request + APP_URL. */
+export function webhookUrlCandidates(req: Request): string[] {
+  const candidates = new Set<string>();
+  try {
+    const u = new URL(req.url);
+    const proto = req.headers.get('x-forwarded-proto') || u.protocol.replace(':', '');
+    const host = req.headers.get('host') || u.host;
+    candidates.add(`${proto}://${host}${u.pathname}`);
+  } catch {
+    // ignore
+  }
+  const appUrl = (process.env.APP_URL || '').replace(/\/+$/, '');
+  if (appUrl) candidates.add(`${appUrl}/api/payments/livepay/webhook`);
+  return [...candidates];
 }

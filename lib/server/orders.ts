@@ -17,6 +17,53 @@ import { logger } from './logging';
 
 const ORDER_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'; // no 0/O/1/I/L
 
+/** Flat delivery fee used by the storefront: 25,000 UGX (minor units). */
+export const FLAT_DELIVERY_FEE_MINOR_UNITS = 2_500_000;
+
+export interface OrderTotals {
+  subtotalMinorUnits: number;
+  shippingMinorUnits: number;
+  totalMinorUnits: number;
+}
+
+/**
+ * Authoritative server-side total computation. The client's claimed total must
+ * match this exactly (within a 1-unit rounding tolerance) or the order is
+ * rejected. Shipping rule mirrors the storefront: flat fee whenever the cart
+ * is non-empty.
+ */
+export function computeOrderTotals(lineTotalsMinorUnits: number[]): OrderTotals {
+  const subtotalMinorUnits = lineTotalsMinorUnits.reduce((sum, v) => sum + (Number.isFinite(v) ? Math.round(v) : 0), 0);
+  const shippingMinorUnits = subtotalMinorUnits > 0 ? FLAT_DELIVERY_FEE_MINOR_UNITS : 0;
+  return {
+    subtotalMinorUnits,
+    shippingMinorUnits,
+    totalMinorUnits: subtotalMinorUnits + shippingMinorUnits,
+  };
+}
+
+/** True when the client's claimed total matches the server-computed total. */
+export function totalsMatch(server: OrderTotals, claimedTotalMinorUnits: number, toleranceMinorUnits = 1): boolean {
+  return Number.isFinite(claimedTotalMinorUnits) && Math.abs(server.totalMinorUnits - claimedTotalMinorUnits) <= toleranceMinorUnits;
+}
+
+/**
+ * Return-URL guard for gateway redirects. Only same-origin (as APP_URL) URLs are
+ * accepted — anything else is an open-redirect/phishing vector. Returns the
+ * validated URL or null.
+ */
+export function safeReturnUrl(candidate: string | null | undefined, appUrl: string | undefined): string | null {
+  if (!candidate || !appUrl) return null;
+  try {
+    const target = new URL(candidate);
+    const base = new URL(appUrl);
+    if (target.origin !== base.origin) return null;
+    return target.toString();
+  } catch {
+    return null;
+  }
+}
+
 /** Cryptographically random order number, e.g. DP-8FK3-QM2Z (32^8 ~= 1.1e12 space). */
 export function generateOrderNumber(): string {
   const bytes = randomBytes(8);
@@ -44,6 +91,8 @@ export interface CreateOrderInput {
   customerId?: string | null;
   items: OrderItemInput[];
   total: number; // major units
+  shippingMinorUnits?: number;
+  subtotalMinorUnits?: number;
 }
 
 export interface CreateOrderResult {
@@ -68,6 +117,9 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
   const totalMinorUnits = Math.round(input.total * 100);
   const safeCustomerId = input.customerId && UUID_RE.test(input.customerId) ? input.customerId : null;
 
+  const subtotalMinorUnits = input.subtotalMinorUnits ?? totalMinorUnits;
+  const shippingMinorUnits = input.shippingMinorUnits ?? Math.max(0, totalMinorUnits - subtotalMinorUnits);
+
   // Path 1: atomic Postgres function (transaction + stock decrement).
   try {
     const { data, error } = await (client.rpc as any)('create_order_v2', {
@@ -84,6 +136,8 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
         price: it.price,
         variant: it.variant || 'Standard',
       })),
+      p_subtotal_minor_units: subtotalMinorUnits,
+      p_shipping_minor_units: shippingMinorUnits,
       p_total_minor_units: totalMinorUnits,
       p_created_at: now,
     });
@@ -122,9 +176,9 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       status: 'Pending',
       payment_status: 'Pending',
       currency: 'UGX',
-      subtotal_minor_units: totalMinorUnits,
+      subtotal_minor_units: subtotalMinorUnits,
       discount_minor_units: 0,
-      shipping_minor_units: 0,
+      shipping_minor_units: shippingMinorUnits,
       tax_minor_units: 0,
       total_minor_units: totalMinorUnits,
       total_amount: input.total,

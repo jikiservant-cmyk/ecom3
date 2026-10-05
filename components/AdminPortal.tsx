@@ -77,7 +77,8 @@ import {
   clearSupabaseConfig, 
   testSupabaseConnection, 
   ConnectionDiagnosticResult,
-  DRUM_PALACE_COMPLETE_SCHEMA_SQL 
+  DRUM_PALACE_COMPLETE_SCHEMA_SQL,
+  supabase
 } from "@/lib/supabase";
 import { formatMoney } from "@/lib/utils";
 import { getStoreSettings, saveStoreSettings, StoreSettings, DEFAULT_STORE_SETTINGS, BannerSlide, DEFAULT_BANNER_SLIDES, HotDealItem, DEFAULT_HOT_DEALS } from "@/lib/storeSettings";
@@ -472,6 +473,38 @@ export default function AdminPortal({
     loadData();
   };
 
+  // Manual payment reconciliation escape hatch (admin-only). Used when the gateway
+  // webhook could not confirm a payment. Every change is audit-logged server-side.
+  const handleUpdatePaymentStatus = async (orderId: string, paymentStatus: "Pending" | "Paid" | "Failed" | "Refunded") => {
+    try {
+      let accessToken: string | null = null;
+      try {
+        const { data } = await supabase.auth.getSession();
+        accessToken = data?.session?.access_token || null;
+      } catch {
+        accessToken = null;
+      }
+      if (!accessToken) {
+        showToast("Session expired. Please sign in again to update payment status.");
+        return;
+      }
+      const res = await fetch("/api/orders", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+        body: JSON.stringify({ orderId, paymentStatus }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.success) {
+        showToast(data?.error || "Could not update payment status.");
+        return;
+      }
+      showToast(`Payment marked "${paymentStatus}" for order.`);
+      loadData();
+    } catch (e: any) {
+      showToast("Could not update payment status.");
+    }
+  };
+
   // User Management Handlers
   const handleUpdateUserRole = async (userId: string, newRole: "admin" | "staff" | "customer") => {
     await updateUserRoleInDb(userId, newRole);
@@ -777,16 +810,6 @@ export default function AdminPortal({
     } finally {
       setIsTestingLivepay(false);
     }
-  };
-
-  const handleSaveLivepaySettings = (e: React.FormEvent) => {
-    e.preventDefault();
-    // SECURITY: credentials are configured on the server via environment
-    // variables (LIVEPAY_API_KEY, LIVEPAY_SECRET_KEY, LIVEPAY_MERCHANT_ID,
-    // LIVEPAY_API_URL, LIVEPAY_WEBHOOK_SECRET). This app never stores them
-    // in the browser. We only run a connectivity test here.
-    showToast("LivePay credentials are managed via server environment variables.");
-    handleTestLivepayConnection();
   };
 
   const handleCopyWebhookUrl = () => {
@@ -2464,10 +2487,23 @@ export default function AdminPortal({
                           </div>
                         </div>
 
-                        <div className="flex items-center gap-3">
+                        <div className="flex items-center gap-2 flex-wrap">
                           <span className="font-bold text-sm text-slate-900 dark:text-white">
                             {formatMoney(order.total, currency)}
                           </span>
+                          <select
+                            value={order.paymentStatus === "Paid" ? "Paid" : "Pending"}
+                            onChange={(e) => handleUpdatePaymentStatus(order.id, e.target.value as any)}
+                            title="Payment reconciliation (admin)"
+                            className={`py-1 px-2.5 text-xs rounded-lg border font-bold focus:outline-none ${
+                              order.paymentStatus === "Paid"
+                                ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:border-emerald-900 dark:text-emerald-300"
+                                : "border-amber-200 bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:border-amber-900 dark:text-amber-300"
+                            }`}
+                          >
+                            <option value="Pending">Payment: Pending</option>
+                            <option value="Paid">Payment: Paid</option>
+                          </select>
                           <select
                             value={order.status}
                             onChange={(e) => handleUpdateOrderStatus(order.id, e.target.value as any)}
@@ -2756,86 +2792,36 @@ export default function AdminPortal({
                   </span>
                 </div>
 
-                <form onSubmit={handleSaveLivepaySettings} className="space-y-4 text-xs">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div className="space-y-1.5">
-                      <label className="font-semibold text-slate-700 dark:text-slate-300">
-                        LivePay Merchant ID
-                      </label>
-                      <input
-                        type="text"
-                        value={livepayMerchantId}
-                        onChange={(e) => setLivepayMerchantId(e.target.value)}
-                        placeholder="e.g. MERCH_DP_UG_88192"
-                        className="w-full p-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:border-teal-500 dark:bg-slate-800 dark:border-slate-700 dark:text-white font-mono text-xs"
-                      />
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <label className="font-semibold text-slate-700 dark:text-slate-300">
-                        LivePay API Gateway URL
-                      </label>
-                      <input
-                        type="text"
-                        value={livepayApiUrl}
-                        onChange={(e) => setLivepayApiUrl(e.target.value)}
-                        placeholder="https://api.livepay.me/v1"
-                        className="w-full p-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:border-teal-500 dark:bg-slate-800 dark:border-slate-700 dark:text-white font-mono text-xs"
-                      />
-                    </div>
+                <div className="space-y-3 text-xs">
+                  <p className="text-slate-600 dark:text-slate-300 leading-relaxed">
+                    LivePay credentials are intentionally <strong>not entered here</strong>. Per
+                    docs.livepay.me the gateway is configured exclusively through server-side
+                    environment variables so no key ever reaches the browser. Set these on the
+                    hosting environment and restart:
+                  </p>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 font-mono text-[11px] leading-relaxed text-slate-700 dark:text-slate-300 space-y-1">
+                    <div>LIVEPAY_API_KEY=<span className="text-slate-400">Bearer API key from the LivePay dashboard (sole credential)</span></div>
+                    <div>LIVEPAY_MERCHANT_ID=<span className="text-slate-400">your LivePay account number, e.g. LP2305443309</span></div>
+                    <div>LIVEPAY_SECRET_KEY=<span className="text-slate-400">not used by the documented API (webhook HMAC uses LIVEPAY_WEBHOOK_SECRET)</span></div>
+                    <div>LIVEPAY_WEBHOOK_SECRET=<span className="text-slate-400">required for webhook acceptance (fail closed)</span></div>
+                    <div>LIVEPAY_API_URL=<span className="text-slate-400">default https://livepay.me/api (docs base URL)</span></div>
                   </div>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div className="space-y-1.5">
-                      <label className="font-semibold text-slate-700 dark:text-slate-300">
-                        LivePay API Key (Public / Client Identifier)
-                      </label>
-                      <input
-                        type="password"
-                        value={livepayApiKey}
-                        onChange={(e) => setLivepayApiKey(e.target.value)}
-                        placeholder="lp_live_..."
-                        className="w-full p-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:border-teal-500 dark:bg-slate-800 dark:border-slate-700 dark:text-white font-mono text-xs"
-                      />
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <label className="font-semibold text-slate-700 dark:text-slate-300">
-                        LivePay Secret Key (Private API Secret)
-                      </label>
-                      <input
-                        type="password"
-                        value={livepaySecretKey}
-                        onChange={(e) => setLivepaySecretKey(e.target.value)}
-                        placeholder="lp_sec_..."
-                        className="w-full p-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:border-teal-500 dark:bg-slate-800 dark:border-slate-700 dark:text-white font-mono text-xs"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <label className="font-semibold text-slate-700 dark:text-slate-300">
-                      LivePay Webhook Secret (IPN Signature Verification)
-                    </label>
-                    <input
-                      type="password"
-                      value={livepayWebhookSecret}
-                      onChange={(e) => setLivepayWebhookSecret(e.target.value)}
-                      placeholder="whsec_..."
-                      className="w-full p-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:border-teal-500 dark:bg-slate-800 dark:border-slate-700 dark:text-white font-mono text-xs"
-                    />
-                  </div>
-
-                  <div className="pt-3 flex justify-end gap-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[10px] text-slate-400">
+                      Reference: docs.livepay.me &mdash; auth, /collect-money, /check-balance,
+                      /transaction-status, /webhooks
+                    </p>
                     <button
-                      type="submit"
-                      className="px-5 py-2.5 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-bold transition shadow-sm cursor-pointer flex items-center gap-2"
+                      type="button"
+                      onClick={handleTestLivepayConnection}
+                      disabled={isTestingLivepay}
+                      className="px-5 py-2.5 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-bold transition shadow-sm cursor-pointer flex items-center gap-2 shrink-0"
                     >
-                      <Save size={14} />
-                      <span>Save LivePay Configuration</span>
+                      <Activity size={14} className={isTestingLivepay ? "animate-spin" : ""} />
+                      <span>{isTestingLivepay ? "Testing Gateway..." : "Test Live Connection"}</span>
                     </button>
                   </div>
-                </form>
+                </div>
               </div>
 
               {/* Webhook & IPN Setup Instructions */}
@@ -2849,7 +2835,7 @@ export default function AdminPortal({
                 </div>
 
                 <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                  Enter this callback URL into your LivePay Merchant Dashboard under Webhook / IPN Settings. When a customer completes a Mobile Money or Card payment, LivePay automatically notifies this endpoint to mark the order as &ldquo;Paid&rdquo; and transition it to &ldquo;Processing&rdquo;.
+                  Register this callback URL in your LivePay Merchant Dashboard under Webhook / IPN Settings. When a customer completes a Mobile Money payment, LivePay POSTs here with an HMAC-SHA256 signature (X-Webhook-Signature) which the server verifies before marking the order as &ldquo;Paid&rdquo; and transitioning it to &ldquo;Processing&rdquo;. The endpoint acknowledges within the documented 10-second window and is idempotent under LivePay&rsquo;s 3 retry attempts.
                 </p>
 
                 <div className="p-3 bg-slate-50 dark:bg-slate-800/60 rounded-xl border border-slate-200/80 dark:border-slate-700 flex items-center justify-between gap-3">

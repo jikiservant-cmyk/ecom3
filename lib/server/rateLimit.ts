@@ -61,7 +61,13 @@ export function rateLimitHeaders(res: Headers, result: RateLimitResult) {
 }
 
 export function clientIp(req: Request): string {
+  // The RIGHTMOST X-Forwarded-For entry is the one appended by the last trusted
+  // proxy (the actual client IP). The leftmost entries are attacker-controlled
+  // and must never be trusted for rate limiting.
   const xf = req.headers.get('x-forwarded-for');
-  if (xf) return xf.split(',')[0].trim();
+  if (xf) {
+    const parts = xf.split(',').map((s) => s.trim()).filter(Boolean);
+    if (parts.length > 0) return parts[parts.length - 1];
+  }
   return req.headers.get('x-real-ip') || 'unknown';
 }

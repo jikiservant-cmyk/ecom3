@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { authenticateAdmin, authenticateRequest, getServerAdminClient } from '@/lib/server/supabaseServer';
-import { createOrderServer } from '@/lib/server/orders';
+import { authenticateAdmin, authenticateRequest, getServerAdminClient, getServerAnonClient, isServerSupabaseConfigured } from '@/lib/server/supabaseServer';
+import { createOrderServer, computeOrderTotals, totalsMatch } from '@/lib/server/orders';
 import { logger, newRequestId } from '@/lib/server/logging';
 import { readJsonBody, isNonEmptyString, isEmail, isFiniteNumber, isIntInRange, sanitizeText, jsonError } from '@/lib/server/validation';
 
@@ -8,8 +8,8 @@ export const dynamic = 'force-dynamic';
 
 const MAX_ITEMS = 50;
 const MAX_QUANTITY = 20;
-const MAX_UNIT_PRICE = 500_000_000; // sanity cap, UGX
 const ALLOWED_STATUSES = ['Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled'];
+const ALLOWED_PAYMENT_STATUSES = ['Pending', 'Paid', 'Failed', 'Refunded'];
 
 /** Redact PII for the public order-tracking lookup. */
 function publicOrderView(order: any, items: any[]) {
@@ -129,23 +129,64 @@ export async function POST(req: NextRequest) {
     if (!raw || typeof raw !== 'object') return jsonError('Invalid order item', 400);
     if (!isNonEmptyString(raw.productName, 300)) return jsonError('Each item needs a valid product name', 400);
     if (!isIntInRange(raw.quantity, 1, MAX_QUANTITY)) return jsonError('Item quantity must be between 1 and 20', 400);
-    if (!isFiniteNumber(raw.price) || raw.price <= 0 || raw.price > MAX_UNIT_PRICE) {
-      return jsonError('Each item needs a valid positive price', 400);
-    }
     items.push({
       productName: sanitizeText(raw.productName, 300),
       quantity: raw.quantity,
-      price: Math.round(raw.price * 100) / 100,
+      price: 0, // filled from the catalog below — client prices are never trusted
       variant: isNonEmptyString(raw.variant, 100) ? sanitizeText(raw.variant, 100) : undefined,
     });
   }
 
-  // Server recomputes the total from the submitted lines; the client's total is
-  // cross-checked but never trusted. (Full catalog-side price verification happens
-  // in the payment step, which reads the order from the database.)
-  const computedTotal = items.reduce((sum, it) => sum + Math.round(it.price * 100) * it.quantity, 0) / 100;
-  if (!isFiniteNumber(body.total) || Math.abs(body.total - computedTotal) > 1) {
-    return jsonError('Order total does not match line items', 400);
+  // SECURITY: re-price every line from the product catalog in the database.
+  // Prices submitted by the client are ignored entirely.
+  if (!isServerSupabaseConfigured) return jsonError('Checkout is not configured', 503);
+  const catalogClient = getServerAdminClient() || getServerAnonClient();
+  const uniqueNames = [...new Set(items.map((it) => it.productName))];
+
+  let catalogProducts: any[] = [];
+  try {
+    const { data, error } = await (catalogClient.from('products') as any)
+      .select('id, name, status, product_variants ( price_minor_units, position, status )')
+      .in('name', uniqueNames);
+    if (error) {
+      logger.error('order_pricing_lookup_error', { error: error.message });
+      return jsonError('Checkout is temporarily unavailable. Please try again.', 500);
+    }
+    catalogProducts = data || [];
+  } catch (e: any) {
+    logger.error('order_pricing_lookup_exception', { error: e?.message });
+    return jsonError('Checkout is temporarily unavailable. Please try again.', 500);
+  }
+
+  const priceByName = new Map<string, number>(); // minor units
+  for (const p of catalogProducts) {
+    if (p.status !== 'active') continue;
+    const variants = Array.isArray(p.product_variants) ? p.product_variants : [];
+    const active = variants
+      .filter((v: any) => v.status === 'active')
+      .sort((a: any, b: any) => (a.position || 0) - (b.position || 0));
+    const primary = active[0] || variants[0];
+    if (primary && Number.isFinite(Number(primary.price_minor_units))) {
+      priceByName.set(p.name, Number(primary.price_minor_units));
+    }
+  }
+
+  const lineTotalsMinor: number[] = [];
+  for (const item of items) {
+    const priceMinor = priceByName.get(item.productName);
+    if (priceMinor === undefined || priceMinor <= 0) {
+      logger.warn('order_unknown_product', { productName: item.productName });
+      return jsonError(`"${item.productName}" is not available for purchase right now`, 400);
+    }
+    item.price = priceMinor / 100;
+    lineTotalsMinor.push(priceMinor * item.quantity);
+  }
+
+  const totals = computeOrderTotals(lineTotalsMinor);
+  const claimedTotalMinor = isFiniteNumber(body.total) ? Math.round(body.total * 100) : NaN;
+  if (!totalsMatch(totals, claimedTotalMinor)) {
+    logger.warn('order_total_mismatch', { server: totals.totalMinorUnits, claimed: claimedTotalMinor });
+    return jsonError('Order total does not match current catalog prices. Please refresh and try again.', 400);
   }
 
   const result = await createOrderServer({
@@ -155,20 +196,32 @@ export async function POST(req: NextRequest) {
     shippingAddress: shippingAddress || undefined,
     customerId: auth?.userId || null,
     items,
-    total: computedTotal,
+    total: totals.totalMinorUnits / 100,
+    subtotalMinorUnits: totals.subtotalMinorUnits,
+    shippingMinorUnits: totals.shippingMinorUnits,
   });
 
   if (!result.success) {
     return jsonError(result.error || 'Failed to create order', 500);
   }
-  logger.info('order_created', { orderId: result.orderId, orderNumber: result.orderNumber, items: items.length });
+  logger.info('order_created', {
+    orderId: result.orderId,
+    orderNumber: result.orderNumber,
+    items: items.length,
+    totalMinorUnits: totals.totalMinorUnits,
+  });
   return NextResponse.json(
     { success: true, orderId: result.orderId, orderNumber: result.orderNumber, status: 'Pending' },
     { status: 201 }
   );
 }
 
-/** Update order status — admin only, allowlisted statuses. */
+/**
+ * Update order fulfillment and/or payment status — admin only, allowlisted
+ * values. The paymentStatus field is the manual escape hatch for reconciliation
+ * (e.g. if the gateway webhook is misconfigured); every change is audit-logged
+ * with the admin's user id.
+ */
 export async function PATCH(req: NextRequest) {
   const admin = await authenticateAdmin(req);
   if (!admin) return jsonError('Authentication required', 401);
@@ -176,23 +229,40 @@ export async function PATCH(req: NextRequest) {
   const body = await readJsonBody(req);
   if (!body) return jsonError('Invalid JSON body', 400);
 
-  const { orderId, status } = body;
+  const { orderId, status, paymentStatus } = body;
   if (!isNonEmptyString(orderId, 64)) return jsonError('Missing or invalid orderId', 400);
-  if (!ALLOWED_STATUSES.includes(status)) {
-    return jsonError(`Status must be one of: ${ALLOWED_STATUSES.join(', ')}`, 400);
+
+  const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  if (status !== undefined) {
+    if (!ALLOWED_STATUSES.includes(status)) {
+      return jsonError(`Status must be one of: ${ALLOWED_STATUSES.join(', ')}`, 400);
+    }
+    update.status = status;
+  }
+  if (paymentStatus !== undefined) {
+    // Normalize legacy lowercase values ('paid' -> 'Paid').
+    const normalized = String(paymentStatus).charAt(0).toUpperCase() + String(paymentStatus).slice(1).toLowerCase();
+    if (!ALLOWED_PAYMENT_STATUSES.includes(normalized)) {
+      return jsonError(`paymentStatus must be one of: ${ALLOWED_PAYMENT_STATUSES.join(', ')}`, 400);
+    }
+    update.payment_status = normalized;
+    if (normalized === 'Paid' && status === undefined) {
+      update.status = 'Processing'; // paying an order moves it into the pipeline
+    }
+  }
+  if (Object.keys(update).length === 1) {
+    return jsonError('Provide status and/or paymentStatus', 400);
   }
 
   try {
     const client = getServerAdminClient();
     if (!client) return jsonError('Server database access is not configured', 503);
-    const { error } = await (client.from('orders') as any)
-      .update({ status, updated_at: new Date().toISOString() })
-      .eq('id', orderId);
+    const { error } = await (client.from('orders') as any).update(update).eq('id', orderId);
     if (error) {
       logger.error('order_status_update_error', { error: error.message });
       return jsonError('Failed to update order', 500);
     }
-    logger.info('order_status_updated', { orderId, status, admin: admin.userId });
+    logger.info('order_status_updated', { orderId, status, paymentStatus, admin: admin.userId });
     return NextResponse.json({ success: true });
   } catch (e: any) {
     logger.error('order_status_update_exception', { error: e?.message });

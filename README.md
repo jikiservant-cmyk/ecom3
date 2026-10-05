@@ -10,7 +10,7 @@ E-commerce storefront for musical instruments & pro audio (Uganda, UGX), built w
 
 - Next.js 16 (React 19, TypeScript), Tailwind CSS 4
 - Supabase: Postgres (PostgREST), Auth, Storage
-- LivePay (https://docs.livepay.me/) for mobile money / card collection
+- LivePay (https://docs.livepay.me/) for Mobile Money collection (MTN/Airtel, UGX only — the documented API has no card endpoint)
 
 ## Run locally
 
@@ -27,7 +27,9 @@ Required environment variables (see `.env.example` for details):
 | `APP_URL` | Public base URL (gateway callbacks/redirects) |
 | `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Browser-safe Supabase config |
 | `SUPABASE_SERVICE_ROLE_KEY` | **Server-only.** Order writes, webhook processing, admin reads. Without it, checkout/webhooks fail closed (503). |
-| `LIVEPAY_API_KEY`, `LIVEPAY_SECRET_KEY`, `LIVEPAY_MERCHANT_ID` | LivePay gateway credentials (server-only) |
+| `LIVEPAY_API_KEY` | LivePay API key — the sole gateway credential (`Bearer`). Server-only. |
+| `LIVEPAY_MERCHANT_ID` | Your LivePay account number (e.g. `LP2305443309`) sent as `accountNumber` |
+| `LIVEPAY_SECRET_KEY` | Optional/legacy — not used by the documented LivePay API |
 | `LIVEPAY_WEBHOOK_SECRET` | HMAC secret for webhook verification. **Webhook rejects all traffic without it.** |
 | `LIVEPAY_API_URL` | Gateway base URL (default `https://livepay.me/api`; must be `*.livepay.me`) |
 
@@ -53,9 +55,10 @@ A production-readiness audit (see `AUDIT_REPORT.md`) found the app NOT READY.
 The following is now enforced:
 
 - **Payments fail closed.** Orders are created `Pending`. Nothing is ever marked
-  `Paid` except by a webhook whose `x-livepay-signature`
-  (`hex(HMAC-SHA256(rawBody, LIVEPAY_WEBHOOK_SECRET))`) verifies. There is no
-  simulated/test-mode success fallback; unconfigured gateway ⇒ HTTP 503.
+  `Paid` except by a webhook whose `X-Webhook-Signature` verifies (see scheme
+  below). There is no simulated/test-mode success fallback; unconfigured
+  gateway ⇒ HTTP 503. Item prices are re-read from the catalog server-side —
+  client-submitted prices are ignored.
 - **Amounts come from the database.** The pay endpoint reads the order's
   `total_minor_units`; client-supplied amounts are ignored.
 - **All privileged routes require auth.** Admin routes verify the Supabase JWT
@@ -75,14 +78,46 @@ The following is now enforced:
   PII-redacted view; no wildcards, no listing.
 - **No secrets in the browser.** LivePay credentials are server env vars only.
 
-## Webhook signature scheme
+## Webhook integration (verified against docs.livepay.me, 2026-10-05)
 
-`x-livepay-signature: hex(HMAC-SHA256(rawRequestBody, LIVEPAY_WEBHOOK_SECRET))`
-(a `t=...,v1=<hex>` envelope is also accepted).
-
-**UNVERIFIED:** LivePay's own documentation could not be reached from the audit
-environment. If their scheme differs, only `lib/server/webhook.ts` needs to
-change — verification is fail-closed either way.
+- LivePay POSTs the terminal transaction state to `/api/payments/livepay/webhook`
+  (register that URL in your LivePay dashboard). Must answer 200 within 10s;
+  LivePay retries 3× at 30s intervals.
+- Payload (no wrapper): `{ status, message, customer_reference,
+  internal_reference, provider_transaction_id, msisdn, amount, currency,
+  provider, charge, completed_at }` with `status` like `"Success"`.
+- Signature: `X-Webhook-Signature: t=<unix-ts>,v=<hex>` where
+  `v = hex(HMAC-SHA256(webhook_url + t + sorted_params, LIVEPAY_WEBHOOK_SECRET))`
+  and `sorted_params` = the keys `customer_reference`, `internal_reference`,
+  `status` sorted alphabetically, each rendered as key+value concatenated.
+  Because the signed string includes the exact webhook URL, `APP_URL` must
+  match the public URL you register with LivePay (the route also accepts a
+  signature computed against the incoming request's own URL as a fallback).
+- Order correlation: we send `reference = "ORD" + order_number`; the webhook
+  echoes it as `customer_reference`.
+- Defenses: amount/currency reconciled against the order before marking Paid
+  (mismatch ⇒ not marked Paid, error logged); idempotent per
+  `(internal_reference, status)`; retries of failed processing are not lost;
+  fails closed (503) when `LIVEPAY_WEBHOOK_SECRET` or the service role key
+  is missing.
+- Gateway notes: authentication is `Authorization: Bearer <LIVEPAY_API_KEY>`
+  only; `accountNumber` = your LivePay merchant account number
+  (`LIVEPAY_MERCHANT_ID`); mobile money only (no documented card endpoint);
+  references are unique per account — retries with a live duplicate reference
+  are recovered via `/transaction-status`.
+- Payment initiation payload (`POST {LIVEPAY_API_URL}/collect-money`, spec at
+  docs.livepay.me/request-money):
+  `{ accountNumber, phoneNumber, amount (integer UGX), currency: "UGX",
+  reference, description }` — `reference` is `"ORD" + order_number`
+  (≤ 30 chars, no spaces), amounts come from the DB order, never the client.
+  Success response: `{ success, message, reference, internal_reference }`.
+- Ancillary documented endpoints used: `GET /check-balance?accountNumber=&currency=UGX`
+  (both params required — powers the admin "Test Live Connection") and
+  `GET /transaction-status?accountNumber=&currency=&reference=`
+  (duplicate-reference recovery). `GET /transaction-history` is available for
+  reconciliation if needed. LivePay rate-limits collect-money and query APIs at
+  50 req / 15 min per merchant account; the pay route enforces a global
+  45 req / 15 min bucket to stay under it.
 
 ## Scripts
 
