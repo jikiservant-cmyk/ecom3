@@ -47,6 +47,54 @@ export function totalsMatch(server: OrderTotals, claimedTotalMinorUnits: number,
   return Number.isFinite(claimedTotalMinorUnits) && Math.abs(server.totalMinorUnits - claimedTotalMinorUnits) <= toleranceMinorUnits;
 }
 
+export interface Reconciliation {
+  amountOk: boolean;
+  currencyOk: boolean;
+  expectedMinor: number;
+  paidMinor: number;
+}
+
+/**
+ * Reconcile a gateway payment notification against the stored order.
+ *
+ * This is the ONLY amount defence we have: LivePay's documented signature
+ * covers just customer_reference, internal_reference and status — `amount` is
+ * NOT signed, so a notification with a valid signature can still carry a
+ * tampered amount. Anything that is not exactly right (including a missing or
+ * non-numeric amount) fails closed.
+ *
+ * LivePay sends `amount` in major units (integer UGX), so it is scaled by 100.
+ */
+export function reconcilePaymentAmount(opts: {
+  orderTotalAmount?: number | string | null;
+  orderTotalMinorUnits?: number | string | null;
+  orderCurrency?: string | null;
+  payloadAmount?: unknown;
+  payloadCurrency?: unknown;
+}): Reconciliation {
+  const totalAmount = opts.orderTotalAmount == null ? NaN : Number(opts.orderTotalAmount);
+  const totalMinor = opts.orderTotalMinorUnits == null ? NaN : Number(opts.orderTotalMinorUnits);
+  const expectedMinor = Number.isFinite(totalAmount) && totalAmount > 0
+    ? Math.round(totalAmount * 100)
+    : (Number.isFinite(totalMinor) ? Math.round(totalMinor) : NaN);
+
+  const paidMinor = typeof opts.payloadAmount === 'number' || typeof opts.payloadAmount === 'string'
+    ? Math.round(Number(opts.payloadAmount) * 100)
+    : NaN;
+
+  const payloadCurrency = opts.payloadCurrency == null ? '' : String(opts.payloadCurrency).trim().toUpperCase();
+  const orderCurrency = (opts.orderCurrency || 'UGX').trim().toUpperCase();
+
+  return {
+    expectedMinor,
+    paidMinor,
+    amountOk: Number.isFinite(expectedMinor) && Number.isFinite(paidMinor) && paidMinor === expectedMinor,
+    // A missing currency on the notification is tolerated (documented payloads
+    // always carry one); a mismatching one is not.
+    currencyOk: payloadCurrency === '' || payloadCurrency === orderCurrency,
+  };
+}
+
 /**
  * Return-URL guard for gateway redirects. Only same-origin (as APP_URL) URLs are
  * accepted — anything else is an open-redirect/phishing vector. Returns the

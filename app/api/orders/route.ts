@@ -124,12 +124,18 @@ export async function POST(req: NextRequest) {
     return jsonError(`Order must contain between 1 and ${MAX_ITEMS} items`, 400);
   }
 
-  const items: { productName: string; quantity: number; price: number; variant?: string }[] = [];
+  const items: { productId?: string; productName: string; quantity: number; price: number; variant?: string }[] = [];
   for (const raw of body.items) {
     if (!raw || typeof raw !== 'object') return jsonError('Invalid order item', 400);
     if (!isNonEmptyString(raw.productName, 300)) return jsonError('Each item needs a valid product name', 400);
     if (!isIntInRange(raw.quantity, 1, MAX_QUANTITY)) return jsonError('Item quantity must be between 1 and 20', 400);
+    // Optional stable identifier. Strict charset so it is safe inside a
+    // PostgREST .in() filter.
+    const productId = isNonEmptyString(raw.productId, 64) && /^[A-Za-z0-9_-]{1,64}$/.test(raw.productId)
+      ? raw.productId
+      : undefined;
     items.push({
+      productId,
       productName: sanitizeText(raw.productName, 300),
       quantity: raw.quantity,
       price: 0, // filled from the catalog below — client prices are never trusted
@@ -141,24 +147,48 @@ export async function POST(req: NextRequest) {
   // Prices submitted by the client are ignored entirely.
   if (!isServerSupabaseConfigured) return jsonError('Checkout is not configured', 503);
   const catalogClient = getServerAdminClient() || getServerAnonClient();
+  const uniqueIds = [...new Set(items.map((it) => it.productId).filter((v): v is string => Boolean(v)))];
   const uniqueNames = [...new Set(items.map((it) => it.productName))];
 
   let catalogProducts: any[] = [];
   try {
-    const { data, error } = await (catalogClient.from('products') as any)
-      .select('id, name, status, product_variants ( price_minor_units, position, status )')
-      .in('name', uniqueNames);
-    if (error) {
-      logger.error('order_pricing_lookup_error', { error: error.message });
+    // Prefer ids (immutable); names are the fallback for older clients. Matching
+    // on name alone is ambiguous when two products share a name, and breaks for
+    // any cart built before a rename.
+    //
+    // Two separate .in() lookups rather than a hand-built .or() filter string:
+    // supabase-js escapes array values for us, whereas interpolating product
+    // names into a filter would break (or worse) on names containing commas,
+    // parentheses or quotes.
+    const select = 'id, name, status, product_variants ( price_minor_units, position, status )';
+    const byId = uniqueIds.length > 0
+      ? await (catalogClient.from('products') as any).select(select).in('id', uniqueIds)
+      : { data: [], error: null };
+    if (byId.error) {
+      logger.error('order_pricing_lookup_error', { error: byId.error.message });
       return jsonError('Checkout is temporarily unavailable. Please try again.', 500);
     }
-    catalogProducts = data || [];
+    const byName = await (catalogClient.from('products') as any).select(select).in('name', uniqueNames);
+    if (byName.error) {
+      logger.error('order_pricing_lookup_error', { error: byName.error.message });
+      return jsonError('Checkout is temporarily unavailable. Please try again.', 500);
+    }
+    // De-duplicate on id — a product matched by both queries appears twice.
+    const seen = new Set<string>();
+    for (const p of [...(byId.data || []), ...(byName.data || [])]) {
+      const key = String(p?.id);
+      if (!p || seen.has(key)) continue;
+      seen.add(key);
+      catalogProducts.push(p);
+    }
   } catch (e: any) {
     logger.error('order_pricing_lookup_exception', { error: e?.message });
     return jsonError('Checkout is temporarily unavailable. Please try again.', 500);
   }
 
-  const priceByName = new Map<string, number>(); // minor units
+  const priceById = new Map<string, number>(); // minor units
+  const priceByName = new Map<string, number>();
+  const nameById = new Map<string, string>();
   for (const p of catalogProducts) {
     if (p.status !== 'active') continue;
     const variants = Array.isArray(p.product_variants) ? p.product_variants : [];
@@ -167,18 +197,26 @@ export async function POST(req: NextRequest) {
       .sort((a: any, b: any) => (a.position || 0) - (b.position || 0));
     const primary = active[0] || variants[0];
     if (primary && Number.isFinite(Number(primary.price_minor_units))) {
-      priceByName.set(p.name, Number(primary.price_minor_units));
+      priceById.set(String(p.id), Number(primary.price_minor_units));
+      // Only the first product wins a given name, so a duplicate name can never
+      // silently re-price a line to a different product.
+      if (!priceByName.has(p.name)) priceByName.set(p.name, Number(primary.price_minor_units));
+      nameById.set(String(p.id), p.name);
     }
   }
 
   const lineTotalsMinor: number[] = [];
   for (const item of items) {
-    const priceMinor = priceByName.get(item.productName);
+    const byId = item.productId ? priceById.get(item.productId) : undefined;
+    const priceMinor = byId !== undefined ? byId : priceByName.get(item.productName);
     if (priceMinor === undefined || priceMinor <= 0) {
-      logger.warn('order_unknown_product', { productName: item.productName });
+      logger.warn('order_unknown_product', { productId: item.productId, productName: item.productName });
       return jsonError(`"${item.productName}" is not available for purchase right now`, 400);
     }
     item.price = priceMinor / 100;
+    // Use the catalog's authoritative name so order_items and the stock
+    // decrement inside create_order_v2 cannot be steered by a client string.
+    if (item.productId && nameById.has(item.productId)) item.productName = nameById.get(item.productId)!;
     lineTotalsMinor.push(priceMinor * item.quantity);
   }
 
@@ -257,6 +295,20 @@ export async function PATCH(req: NextRequest) {
   try {
     const client = getServerAdminClient();
     if (!client) return jsonError('Server database access is not configured', 503);
+
+    // Confirm the order exists before reporting success — an update matching
+    // zero rows previously returned { success: true }, which silently lied to
+    // the admin portal during reconciliation.
+    const { data: existing, error: findErr } = await (client.from('orders') as any)
+      .select('id')
+      .eq('id', orderId)
+      .maybeSingle();
+    if (findErr) {
+      logger.error('order_status_lookup_error', { error: findErr.message });
+      return jsonError('Failed to update order', 500);
+    }
+    if (!existing) return jsonError('Order not found', 404);
+
     const { error } = await (client.from('orders') as any).update(update).eq('id', orderId);
     if (error) {
       logger.error('order_status_update_error', { error: error.message });

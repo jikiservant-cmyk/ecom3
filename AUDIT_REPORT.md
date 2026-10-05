@@ -30,9 +30,9 @@
 
 **Date:** 2026-09-30 · **Branch:** `arena/01a0f40a-ecom3` @ `35ab887`
 **Project:** "Drum Palace" e-commerce storefront (Uganda, UGX)
-**Stack:** Next.js 15.5.23 (App Router, React 19, TypeScript) + Supabase (Postgres/PostgREST, Auth, Storage) + LivePay payment gateway (Mobile Money only — MTN/Airtel, UGX; per docs.livepay.me)
+**Stack:** Next.js 16.3.8 (App Router, React 19, TypeScript) + Supabase (Postgres/PostgREST, Auth, Storage) + LivePay payment gateway (Mobile Money only — MTN/Airtel, UGX; per docs.livepay.me)
 **Assumed load:** ~10k DAU (from audit template; no load target is documented anywhere in the repo)
-**AI-agent addendum:** Not applicable. `@google/genai` is declared in `package.json` but never imported anywhere; the app contains no LLM/agent functionality.
+**AI-agent addendum:** Not applicable. The app contains no LLM/agent functionality. (The dead `@google/genai` dependency originally noted in N-11 has since been removed from `package.json`; N-11 is retained below as a historical record of that finding.)
 
 ---
 

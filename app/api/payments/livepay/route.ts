@@ -3,6 +3,7 @@ import { getServerAdminClient } from '@/lib/server/supabaseServer';
 import { logger } from '@/lib/server/logging';
 import { readJsonBody, isNonEmptyString, jsonError } from '@/lib/server/validation';
 import { consumeRateLimit } from '@/lib/server/rateLimit';
+import { safeReturnUrl } from '@/lib/server/orders';
 
 export const dynamic = 'force-dynamic';
 
@@ -54,6 +55,14 @@ export async function POST(req: NextRequest) {
     // LivePay's documented API (docs.livepay.me) covers mobile money only.
     return jsonError('Only Mobile Money payments are supported by the gateway. Please choose Mobile Money at checkout.', 400);
   }
+
+  // Optional post-payment landing URL. Validated against APP_URL so a client
+  // cannot use us to bounce a victim to a phishing origin; anything off-origin
+  // is dropped rather than echoed back.
+  const safeReturn = safeReturnUrl(
+    isNonEmptyString(body.returnUrl, 500) ? body.returnUrl.trim() : null,
+    process.env.APP_URL
+  );
 
   const phoneNumber = isNonEmptyString(body.phoneNumber, 32) ? body.phoneNumber.replace(/[^\d+]/g, '') : '';
 
@@ -163,6 +172,7 @@ export async function POST(req: NextRequest) {
         reference: data.reference || transactionReference,
         status: 'pending',
         message: data.message || 'Payment initiated. Please approve the Mobile Money prompt on your phone.',
+        returnUrl: safeReturn,
       });
     }
 
@@ -187,6 +197,7 @@ export async function POST(req: NextRequest) {
             status: 'pending',
             message: 'A payment for this order is already in progress. Please approve the Mobile Money prompt on your phone.',
             gatewayStatus: stData.status,
+            returnUrl: safeReturn,
           });
         }
       } catch (e: any) {

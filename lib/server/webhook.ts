@@ -76,24 +76,49 @@ function safeEqualHex(a: string, b: string): boolean {
 }
 
 /**
+ * Default tolerance for the signature timestamp. LivePay documents 3 retries at
+ * 30s intervals, so 5 minutes covers normal redelivery while still making a
+ * captured signature unusable after it expires.
+ */
+export const DEFAULT_SIGNATURE_MAX_AGE_SECONDS = 300;
+
+/**
  * Verify a LivePay webhook. Fails closed on any missing input.
  *
  * `candidateWebhookUrls` contains every plausible exact URL the gateway may
  * have used when signing (the signature binds the URL string). We accept a
  * match against any candidate — candidates are always our own endpoint under
  * our own host, derived from APP_URL and/or the incoming request.
+ *
+ * `maxAgeSeconds` enforces a replay window on the header's `t` value; it
+ * defaults to DEFAULT_SIGNATURE_MAX_AGE_SECONDS and must be explicitly set to
+ * null to disable (only appropriate in tests of the signing scheme itself).
+ * `nowSeconds` is injectable so freshness is testable without waiting.
  */
 export function verifyLivePayWebhook(opts: {
   payload: any;
   header: string | null;
   candidateWebhookUrls: string[];
   secret: string | null;
+  maxAgeSeconds?: number | null;
+  nowSeconds?: number;
 }): boolean {
   const { payload, header, candidateWebhookUrls, secret } = opts;
+  const maxAgeSeconds = opts.maxAgeSeconds === undefined ? DEFAULT_SIGNATURE_MAX_AGE_SECONDS : opts.maxAgeSeconds;
   if (!secret) return false;
   const parsed = parseSignatureHeader(header);
   if (!parsed) return false;
   if (!payload || typeof payload !== 'object') return false;
+
+  // Replay protection: the header timestamp must be recent. Without this a
+  // captured signature stays valid forever (the (provider, event_id) unique
+  // constraint only de-duplicates, it does not authenticate freshness).
+  if (maxAgeSeconds !== null) {
+    const timestampSeconds = Number(parsed.timestamp);
+    if (!Number.isFinite(timestampSeconds)) return false;
+    const nowSeconds = opts.nowSeconds ?? Math.floor(Date.now() / 1000);
+    if (Math.abs(nowSeconds - timestampSeconds) > maxAgeSeconds) return false;
+  }
 
   for (const url of candidateWebhookUrls) {
     if (!url) continue;

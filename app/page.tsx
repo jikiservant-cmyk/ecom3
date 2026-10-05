@@ -687,6 +687,9 @@ export default function DrumPalaceApp() {
       const orderItems = cart.map((item) => {
         const prod = products.find((p) => p.id === item.id);
         return {
+          // productId lets the server price the line by immutable id; price is
+          // sent for display/debug only and is ignored server-side.
+          productId: prod?.id,
           productName: prod?.name || 'Instrument',
           quantity: item.qty,
           price: prod?.price || 0,

@@ -32,6 +32,7 @@ Required environment variables (see `.env.example` for details):
 | `LIVEPAY_SECRET_KEY` | Optional/legacy — not used by the documented LivePay API |
 | `LIVEPAY_WEBHOOK_SECRET` | HMAC secret for webhook verification. **Webhook rejects all traffic without it.** |
 | `LIVEPAY_API_URL` | Gateway base URL (default `https://livepay.me/api`; must be `*.livepay.me`) |
+| `TRUSTED_PROXY_HOPS` | Number of trusted reverse proxies in front of the app (default `1`). Selects which `X-Forwarded-For` entry is used as the client IP for rate limiting. |
 
 ## Database setup
 
@@ -96,10 +97,13 @@ The following is now enforced:
 - Order correlation: we send `reference = "ORD" + order_number`; the webhook
   echoes it as `customer_reference`.
 - Defenses: amount/currency reconciled against the order before marking Paid
-  (mismatch ⇒ not marked Paid, error logged); idempotent per
-  `(internal_reference, status)`; retries of failed processing are not lost;
-  fails closed (503) when `LIVEPAY_WEBHOOK_SECRET` or the service role key
-  is missing.
+  (mismatch ⇒ not marked Paid, error logged) — this matters because LivePay's
+  signature does **not** cover `amount`, so reconciliation is the only defence
+  against a validly-signed notification carrying a tampered amount; replay
+  window of 5 minutes on the `t` timestamp (a captured signature expires);
+  idempotent per `(internal_reference, customer_reference, status)`; retries of
+  failed processing are not lost; fails closed (503) when
+  `LIVEPAY_WEBHOOK_SECRET` or the service role key is missing.
 - Gateway notes: authentication is `Authorization: Bearer <LIVEPAY_API_KEY>`
   only; `accountNumber` = your LivePay merchant account number
   (`LIVEPAY_MERCHANT_ID`); mobile money only (no documented card endpoint);

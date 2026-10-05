@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerAdminClient } from '@/lib/server/supabaseServer';
-import { getWebhookSecret, verifyLivePayWebhook, webhookUrlCandidates } from '@/lib/server/webhook';
+import { getWebhookSecret, verifyLivePayWebhook, webhookUrlCandidates, DEFAULT_SIGNATURE_MAX_AGE_SECONDS } from '@/lib/server/webhook';
+import { reconcilePaymentAmount } from '@/lib/server/orders';
 import { logger } from '@/lib/server/logging';
 
 export const dynamic = 'force-dynamic';
@@ -54,8 +55,17 @@ export async function POST(req: NextRequest) {
 
   // 3. Signature verification (mandatory). Docs define exactly one header:
   //    X-Webhook-Signature: t=<unix-ts>,v=<hex hmac>.
+  //    A replay window is enforced on `t` so a captured signature expires.
   const header = req.headers.get('x-webhook-signature');
-  if (!verifyLivePayWebhook({ payload, header, candidateWebhookUrls: webhookUrlCandidates(req), secret })) {
+  if (
+    !verifyLivePayWebhook({
+      payload,
+      header,
+      candidateWebhookUrls: webhookUrlCandidates(req),
+      secret,
+      maxAgeSeconds: DEFAULT_SIGNATURE_MAX_AGE_SECONDS,
+    })
+  ) {
     logger.warn('webhook_rejected_bad_signature');
     return NextResponse.json({ error: 'Invalid signature' }, { status: 401 });
   }
@@ -67,9 +77,12 @@ export async function POST(req: NextRequest) {
   }
 
   const outcome = normalizeStatus(payload.status);
-  const customerReference = typeof payload.customer_reference === 'string' ? payload.customer_reference : '';
-  const internalReference = typeof payload.internal_reference === 'string' ? payload.internal_reference : '';
-  const eventId = `${internalReference || 'noref'}:${outcome}`;
+  const customerReference = typeof payload.customer_reference === 'string' ? payload.customer_reference.trim() : '';
+  const internalReference = typeof payload.internal_reference === 'string' ? payload.internal_reference.trim() : '';
+  // Idempotency key must identify THIS notification. Keying on internal_reference
+  // alone collapsed every reference-less event onto one row, so the second real
+  // payment was acked as a duplicate and its order was never marked Paid.
+  const eventId = `${internalReference || 'noref'}|${customerReference || 'noref'}|${outcome}`;
 
   // 4. Idempotency — insert AFTER verification, BEFORE state change. If this is
   //    a duplicate we ack and stop. (Insert-before-processing would swallow
@@ -101,9 +114,11 @@ export async function POST(req: NextRequest) {
   }
 
   // 6. Resolve the order from customer_reference ("ORD" + order_number).
+  //    Order numbers are generated uppercase; the gateway may normalise case,
+  //    so compare case-insensitively rather than trusting the echoed string.
   let orderNumberGuess = '';
   if (customerReference.toUpperCase().startsWith('ORD')) {
-    orderNumberGuess = customerReference.slice(3).trim();
+    orderNumberGuess = customerReference.slice(3).trim().toUpperCase();
   }
   let order: any = null;
   if (orderNumberGuess) {
@@ -124,13 +139,15 @@ export async function POST(req: NextRequest) {
   }
 
   // 7. Amount & currency reconciliation — never mark Paid on a mismatch.
-  const expectedMinor = order.total_amount
-    ? Math.round(Number(order.total_amount) * 100)
-    : Number(order.total_minor_units || 0);
-  const paidMinor = Math.round(Number(payload.amount || 0) * 100);
-  const currencyOk =
-    !payload.currency || String(payload.currency).toUpperCase() === String(order.currency || 'UGX').toUpperCase();
-  const amountOk = paidMinor === expectedMinor;
+  //    LivePay's signature does NOT cover `amount`, so this is the only defence
+  //    against a validly-signed notification carrying a tampered amount.
+  const { amountOk, currencyOk, expectedMinor, paidMinor } = reconcilePaymentAmount({
+    orderTotalAmount: order.total_amount,
+    orderTotalMinorUnits: order.total_minor_units,
+    orderCurrency: order.currency,
+    payloadAmount: payload.amount,
+    payloadCurrency: payload.currency,
+  });
 
   if (outcome === 'paid' && (!amountOk || !currencyOk)) {
     logger.error('webhook_amount_mismatch', {
@@ -147,14 +164,22 @@ export async function POST(req: NextRequest) {
   // 8. Apply the terminal state.
   const now = new Date().toISOString();
   try {
-    await (client.from('payments') as any)
+    // Scope the write to the LivePay attempt this notification refers to. An
+    // unscoped update rewrote every payment row on the order, including rows
+    // from earlier or unrelated attempts.
+    let paymentsQuery = (client.from('payments') as any)
       .update({
         status: outcome === 'paid' ? 'success' : 'failed',
         provider_reference: customerReference || undefined,
         raw_payload: payload,
         updated_at: now,
       })
-      .eq('order_id', order.id);
+      .eq('order_id', order.id)
+      .eq('provider', 'livepay');
+    if (customerReference) {
+      paymentsQuery = paymentsQuery.eq('provider_reference', customerReference);
+    }
+    await paymentsQuery;
 
     const orderUpdate: Record<string, unknown> = { updated_at: now };
     if (outcome === 'paid') {

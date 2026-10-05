@@ -388,7 +388,86 @@ $$;
 
 GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) TO anon, authenticated;
 
--- 20b. Remove LEGACY permissive policies from the pre-audit schema (if present).
+-- 20b. CRITICAL — order state may never be supplied by a client.
+-- public.orders is INSERTable by anon/authenticated (guest checkout) and
+-- payment_status is a plain settable column whose CHECK constraint permits
+-- 'Paid'. Without a trigger, any browser holding the public anon key could
+-- PostgREST-insert an order already marked Paid for 1 UGX, defeating the
+-- server-side catalog re-pricing and the webhook-only Paid transition.
+-- Force EVERY insert to Pending regardless of caller: the server's order
+-- creation path (create_order_v2 and the fallback insert) always writes
+-- Pending anyway, so this costs nothing and closes the hole at the database.
+CREATE OR REPLACE FUNCTION public.orders_force_pending()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  NEW.status := 'Pending';
+  NEW.payment_status := 'Pending';
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS orders_force_pending ON public.orders;
+CREATE TRIGGER orders_force_pending
+  BEFORE INSERT ON public.orders
+  FOR EACH ROW EXECUTE PROCEDURE public.orders_force_pending();
+
+-- Payment state advances only via the verified gateway webhook (service role)
+-- or an explicit admin reconciliation. Blocks direct PostgREST writes.
+CREATE OR REPLACE FUNCTION public.orders_protect_payment_status()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF NEW.payment_status IS DISTINCT FROM OLD.payment_status
+     AND COALESCE(auth.role(), '') <> 'service_role'
+     AND NOT public.is_admin() THEN
+    RAISE EXCEPTION 'payment_status changes require the payment service role' USING ERRCODE = '42501';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS orders_protect_payment_status ON public.orders;
+CREATE TRIGGER orders_protect_payment_status
+  BEFORE UPDATE ON public.orders
+  FOR EACH ROW EXECUTE PROCEDURE public.orders_protect_payment_status();
+
+-- Line items may only be attached to an order that is still Pending, so an
+-- attacker cannot grow an already-paid order after the fact.
+CREATE OR REPLACE FUNCTION public.order_items_require_pending_order()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_payment_status TEXT;
+BEGIN
+  IF COALESCE(auth.role(), '') = 'service_role' THEN
+    RETURN NEW;
+  END IF;
+  SELECT o.payment_status INTO v_payment_status
+    FROM public.orders o
+   WHERE o.id = NEW.order_id;
+  IF v_payment_status IS NULL OR v_payment_status <> 'Pending' THEN
+    RAISE EXCEPTION 'cannot modify line items on a paid or missing order' USING ERRCODE = '42501';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS order_items_require_pending_order ON public.order_items;
+CREATE TRIGGER order_items_require_pending_order
+  BEFORE INSERT ON public.order_items
+  FOR EACH ROW EXECUTE PROCEDURE public.order_items_require_pending_order();
+
+-- 20c. Remove LEGACY permissive policies from the pre-audit schema (if present).
 -- The grants were already revoked above, but the policies themselves must go.
 DO $$
 DECLARE

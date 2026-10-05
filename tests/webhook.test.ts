@@ -5,6 +5,7 @@ import {
   signLivePayWebhook,
   verifyLivePayWebhook,
   getWebhookSecret,
+  DEFAULT_SIGNATURE_MAX_AGE_SECONDS,
 } from '@/lib/server/webhook';
 
 const URL = 'https://your-domain.com/webhook';
@@ -67,11 +68,12 @@ describe('end-to-end verification', () => {
     completed_at: '2024-01-15 10:35:00',
   };
   const ts = '1705314900';
+  const now = Number(ts); // pin "now" to the signature timestamp
   const goodHeader = `t=${ts},v=${signLivePayWebhook({ webhookUrl: URL, timestamp: ts, payload, secret: SECRET })}`;
 
   it('accepts a valid signature', () => {
     expect(
-      verifyLivePayWebhook({ payload, header: goodHeader, candidateWebhookUrls: [URL], secret: SECRET })
+      verifyLivePayWebhook({ payload, header: goodHeader, candidateWebhookUrls: [URL], secret: SECRET, nowSeconds: now })
     ).toBe(true);
   });
 
@@ -82,49 +84,84 @@ describe('end-to-end verification', () => {
         header: goodHeader,
         candidateWebhookUrls: ['https://other.example/hook', URL],
         secret: SECRET,
+        nowSeconds: now,
       })
     ).toBe(true);
   });
 
   it('NOTE: amount is NOT covered by LivePay\'s signature (docs: only customer_reference, internal_reference, status are signed)', () => {
     // Signature verification passes even for a tampered amount — this is by
-    // LivePay's design. Tamper protection for amounts lives in the route,
-    // which reconciles payload.amount/currency against the order total and
-    // refuses to mark the order Paid on any mismatch.
+    // LivePay's design. Tamper protection for amounts lives in
+    // reconcilePaymentAmount (covered in tests/totals.test.ts), which the route
+    // consults before marking an order Paid.
     const tampered = { ...payload, amount: 1 };
     expect(
-      verifyLivePayWebhook({ payload: tampered, header: goodHeader, candidateWebhookUrls: [URL], secret: SECRET })
+      verifyLivePayWebhook({ payload: tampered, header: goodHeader, candidateWebhookUrls: [URL], secret: SECRET, nowSeconds: now })
     ).toBe(true);
   });
 
   it('rejects tampered status (forge success)', () => {
     const tampered = { ...payload, status: 'Failed' };
     expect(
-      verifyLivePayWebhook({ payload: tampered, header: goodHeader, candidateWebhookUrls: [URL], secret: SECRET })
+      verifyLivePayWebhook({ payload: tampered, header: goodHeader, candidateWebhookUrls: [URL], secret: SECRET, nowSeconds: now })
     ).toBe(false);
   });
 
   it('rejects tampered customer_reference (order swap)', () => {
     const tampered = { ...payload, customer_reference: 'ORDOTHER-ORDER' };
     expect(
-      verifyLivePayWebhook({ payload: tampered, header: goodHeader, candidateWebhookUrls: [URL], secret: SECRET })
+      verifyLivePayWebhook({ payload: tampered, header: goodHeader, candidateWebhookUrls: [URL], secret: SECRET, nowSeconds: now })
     ).toBe(false);
   });
 
   it('rejects wrong secret / missing header / no secret configured', () => {
     const wrongSig = `t=${ts},v=${signLivePayWebhook({ webhookUrl: URL, timestamp: ts, payload, secret: 'other' })}`;
-    expect(verifyLivePayWebhook({ payload, header: wrongSig, candidateWebhookUrls: [URL], secret: SECRET })).toBe(false);
-    expect(verifyLivePayWebhook({ payload, header: null, candidateWebhookUrls: [URL], secret: SECRET })).toBe(false);
-    expect(verifyLivePayWebhook({ payload, header: goodHeader, candidateWebhookUrls: [URL], secret: null })).toBe(false);
+    expect(verifyLivePayWebhook({ payload, header: wrongSig, candidateWebhookUrls: [URL], secret: SECRET, nowSeconds: now })).toBe(false);
+    expect(verifyLivePayWebhook({ payload, header: null, candidateWebhookUrls: [URL], secret: SECRET, nowSeconds: now })).toBe(false);
+    expect(verifyLivePayWebhook({ payload, header: goodHeader, candidateWebhookUrls: [URL], secret: null, nowSeconds: now })).toBe(false);
   });
 
   it('rejects when no candidate URL matches the signed URL', () => {
     expect(
-      verifyLivePayWebhook({ payload, header: goodHeader, candidateWebhookUrls: ['https://wrong.example/hook'], secret: SECRET })
+      verifyLivePayWebhook({ payload, header: goodHeader, candidateWebhookUrls: ['https://wrong.example/hook'], secret: SECRET, nowSeconds: now })
     ).toBe(false);
   });
 
   it('getWebhookSecret fails closed on placeholder/unset', () => {
     expect(getWebhookSecret()).toBe(null);
+  });
+});
+
+describe('replay window', () => {
+  const payload = { status: 'Success', customer_reference: 'ORDDP-1', internal_reference: 'int-1' };
+  const ts = '1705314900';
+  const header = `t=${ts},v=${signLivePayWebhook({ webhookUrl: URL, timestamp: ts, payload, secret: SECRET })}`;
+  const base = { payload, header, candidateWebhookUrls: [URL], secret: SECRET };
+
+  it('accepts a signature inside the default tolerance', () => {
+    expect(verifyLivePayWebhook({ ...base, nowSeconds: Number(ts) + 299 })).toBe(true);
+  });
+
+  it('rejects a signature older than the tolerance (captured replay)', () => {
+    expect(verifyLivePayWebhook({ ...base, nowSeconds: Number(ts) + DEFAULT_SIGNATURE_MAX_AGE_SECONDS + 1 })).toBe(false);
+  });
+
+  it('rejects a signature from the far past even with a valid HMAC', () => {
+    // This is the exact case that used to be accepted: a validly signed
+    // notification replayed years later.
+    expect(verifyLivePayWebhook({ ...base, nowSeconds: 1_900_000_000 })).toBe(false);
+  });
+
+  it('rejects a timestamp too far in the future (clock-skew abuse)', () => {
+    expect(verifyLivePayWebhook({ ...base, nowSeconds: Number(ts) - DEFAULT_SIGNATURE_MAX_AGE_SECONDS - 1 })).toBe(false);
+  });
+
+  it('honours an explicit maxAgeSeconds override', () => {
+    expect(verifyLivePayWebhook({ ...base, nowSeconds: Number(ts) + 100, maxAgeSeconds: 60 })).toBe(false);
+    expect(verifyLivePayWebhook({ ...base, nowSeconds: Number(ts) + 100, maxAgeSeconds: 600 })).toBe(true);
+  });
+
+  it('maxAgeSeconds: null disables the window (scheme-only testing)', () => {
+    expect(verifyLivePayWebhook({ ...base, nowSeconds: 1_900_000_000, maxAgeSeconds: null })).toBe(true);
   });
 });
