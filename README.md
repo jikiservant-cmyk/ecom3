@@ -151,12 +151,21 @@ These need action outside this repository. They are listed here so they are not
 silently forgotten.
 
 - **Consider enabling Supabase's own auth rate limiting and/or hCaptcha.**
-  Password sign-in now goes through `POST /api/auth/login`, which is throttled
-  server-side per account (10 / 15 min) and per IP (30 / 15 min) before any
-  upstream call — so the hole is closed in this repository. Defence in depth
-  still helps: anyone holding the `NEXT_PUBLIC` anon key could call Supabase
-  Auth directly and bypass our throttle. Dashboard-level limits or a captcha on
-  the sign-in form would close that too.
+  Every credential-bearing auth call now goes through this app and is throttled
+  server-side before any upstream request (see `lib/server/authThrottle.ts`):
+
+  | Endpoint | Per account | Per IP |
+  | --- | --- | --- |
+  | `POST /api/auth/login` | 10 / 15 min | 30 / 15 min |
+  | `POST /api/auth/password-reset` | 3 / 15 min | 5 / 15 min |
+  | `POST /api/auth/register` | 1 / hour | 5 / hour |
+
+  The browser no longer calls Supabase Auth with credentials at all, and the
+  direct `signInWithPassword` / magic-link / confirmation-resend helpers have
+  been deleted so the unthrottled path cannot be re-imported by accident.
+  Defence in depth still helps: anyone holding the `NEXT_PUBLIC` anon key could
+  call Supabase Auth directly and bypass these limits. Dashboard-level rate
+  limiting or a captcha on the sign-in form would close that too.
 - **Apply `lib/schemaSql.ts` to Supabase.** The RLS policies and the
   `orders_force_pending` / `orders_protect_payment_status` /
   `order_items_require_pending_order` triggers exist only as text until run.
