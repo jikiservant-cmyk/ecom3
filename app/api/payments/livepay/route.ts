@@ -159,6 +159,18 @@ export async function POST(req: NextRequest) {
     return jsonError('A mobile money phone number is required for this order.', 400);
   }
 
+  // Per-order cap. Without it a single actor can burn the shared merchant quota
+  // — and spam a victim's phone with Mobile Money prompts — by hammering one
+  // order, which denies payment to every other customer for the whole window.
+  const perOrder = consumeRateLimit(`livepay-order:${order.id}`, 15 * 60_000, 3);
+  if (!perOrder.allowed) {
+    logger.warn('livepay_per_order_attempts_exhausted', { orderId });
+    return NextResponse.json(
+      { success: false, error: 'Too many payment attempts for this order. Please try again in a few minutes.' },
+      { status: 429, headers: { 'Retry-After': String(Math.ceil(perOrder.resetMs / 1000)) } }
+    );
+  }
+
   // Merchant-level quota guard: LivePay rate-limits per merchant account
   // (documented: 50 req / 15 min on query APIs). Protect the shared quota
   // regardless of how many client IPs are hitting us.

@@ -491,10 +491,25 @@ export default function AdminPortal({
         showToast("Session expired. Please sign in again to update payment status.");
         return;
       }
+
+      // Paid/Refunded bypass the payment gateway, so the API requires a reason.
+      let note: string | undefined;
+      if (paymentStatus === "Paid" || paymentStatus === "Refunded") {
+        const entered = window.prompt(
+          `Reason for manually marking this order "${paymentStatus}" (required, recorded in the audit log):`
+        );
+        if (entered === null) return; // cancelled
+        note = entered.trim();
+        if (note.length < 3) {
+          showToast("Please enter a reason of at least 3 characters.");
+          return;
+        }
+      }
+
       const res = await fetch("/api/orders", {
         method: "PATCH",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
-        body: JSON.stringify({ orderId, paymentStatus }),
+        body: JSON.stringify({ orderId, paymentStatus, note }),
       });
       const data = await res.json().catch(() => null);
       if (!res.ok || !data?.success) {

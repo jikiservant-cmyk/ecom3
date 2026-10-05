@@ -84,6 +84,25 @@ export async function POST(req: NextRequest) {
   // payment was acked as a duplicate and its order was never marked Paid.
   const eventId = `${internalReference || 'noref'}|${customerReference || 'noref'}|${outcome}`;
 
+  /**
+   * Release the idempotency marker so the gateway can retry this notification.
+   *
+   * The marker is written before we know whether the payment is acceptable. If
+   * we then REFUSE it (amount mismatch, unverifiable value) and leave the marker
+   * in place, every later retry is swallowed as a duplicate and the order is
+   * never marked Paid — the customer paid and never gets their goods.
+   */
+  const releaseEventMarker = async () => {
+    try {
+      await (client.from('payment_webhook_events') as any)
+        .delete()
+        .eq('event_id', eventId)
+        .eq('provider', 'livepay');
+    } catch (e: any) {
+      logger.warn('webhook_event_marker_release_failed', { eventId, error: e?.message });
+    }
+  };
+
   // 4. Idempotency — insert AFTER verification, BEFORE state change. If this is
   //    a duplicate we ack and stop. (Insert-before-processing would swallow
   //    gateway retries of a failed first attempt.)
@@ -157,7 +176,9 @@ export async function POST(req: NextRequest) {
       orderCurrency: order.currency,
       payloadCurrency: payload.currency,
     });
-    // Record but do NOT mark paid — admin reconciles via the portal.
+    // Record but do NOT mark paid — admin reconciles via the portal. Release the
+    // marker so a corrected payment can still be processed on retry.
+    await releaseEventMarker();
     return NextResponse.json({ received: true, verified: false, reason: 'amount mismatch' });
   }
 
@@ -194,11 +215,13 @@ export async function POST(req: NextRequest) {
           catalogTotalMinor: valuation.catalogTotalMinor,
           unknownItems: valuation.unknownItems,
         });
+        await releaseEventMarker();
         return NextResponse.json({ received: true, verified: false, reason: 'amount below catalog value' });
       }
     } catch (e: any) {
       // Fail closed: never mark an order Paid when its value cannot be verified.
       logger.error('webhook_catalog_valuation_error', { orderId: order.id, error: e?.message });
+      await releaseEventMarker();
       return NextResponse.json({ received: true, verified: false, reason: 'valuation unavailable' });
     }
   }
@@ -236,7 +259,7 @@ export async function POST(req: NextRequest) {
       // 500 => LivePay retries (up to 3x); event row already recorded, so the
       // retry will hit the duplicate path and be acked. To avoid that black
       // hole we delete the event marker on failure and surface 500.
-      await (client.from('payment_webhook_events') as any).delete().eq('event_id', eventId).eq('provider', 'livepay');
+      await releaseEventMarker();
       return NextResponse.json({ error: 'Order update failed' }, { status: 500 });
     }
 
@@ -249,7 +272,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ received: true });
   } catch (e: any) {
     logger.error('webhook_processing_exception', { error: e?.message });
-    await (client.from('payment_webhook_events') as any).delete().eq('event_id', eventId).eq('provider', 'livepay').catch(() => {});
+    await releaseEventMarker();
     return NextResponse.json({ error: 'Webhook processing failed' }, { status: 500 });
   }
 }

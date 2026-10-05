@@ -283,6 +283,17 @@ export async function PATCH(req: NextRequest) {
     if (!ALLOWED_PAYMENT_STATUSES.includes(normalized)) {
       return jsonError(`paymentStatus must be one of: ${ALLOWED_PAYMENT_STATUSES.join(', ')}`, 400);
     }
+    // FINANCIAL CONTROL: marking an order Paid or Refunded by hand bypasses the
+    // gateway entirely, so it must leave a reason behind. Without one there is
+    // no way to tell a legitimate reconciliation from an unexplained write to
+    // the books.
+    if (normalized === 'Paid' || normalized === 'Refunded') {
+      const note = isNonEmptyString(body.note, 500) ? sanitizeText(body.note, 500) : '';
+      if (note.length < 3) {
+        return jsonError('A reason is required to manually mark an order as Paid or Refunded.', 400);
+      }
+      update.payment_note = note;
+    }
     update.payment_status = normalized;
     if (normalized === 'Paid' && status === undefined) {
       update.status = 'Processing'; // paying an order moves it into the pipeline
@@ -314,7 +325,15 @@ export async function PATCH(req: NextRequest) {
       logger.error('order_status_update_error', { error: error.message });
       return jsonError('Failed to update order', 500);
     }
-    logger.info('order_status_updated', { orderId, status, paymentStatus, admin: admin.userId });
+    logger.info('order_status_updated', {
+      orderId,
+      status,
+      paymentStatus,
+      // Manual Paid/Refunded writes bypass the gateway; the reason is the audit
+      // trail that distinguishes reconciliation from an unexplained write.
+      note: typeof update.payment_note === 'string' ? update.payment_note : undefined,
+      admin: admin.userId,
+    });
     return NextResponse.json({ success: true });
   } catch (e: any) {
     logger.error('order_status_update_exception', { error: e?.message });

@@ -107,9 +107,16 @@ CREATE TABLE IF NOT EXISTS public.orders (
   currency TEXT DEFAULT 'UGX',
   status TEXT DEFAULT 'Pending' CHECK (status IN ('Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled', 'pending', 'processing', 'shipped', 'delivered', 'cancelled')),
   payment_status TEXT DEFAULT 'Pending' CHECK (payment_status IN ('Pending', 'Paid', 'Failed', 'Refunded', 'pending', 'paid', 'failed', 'refunded')),
+  -- Reason recorded whenever an admin moves payment_status by hand. Manual
+  -- Paid/Refunded writes bypass the gateway, so they must leave a trail.
+  payment_note TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- For databases created before payment_note existed (CREATE TABLE IF NOT EXISTS
+-- will not add a column to a table that is already there).
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_note TEXT;
 
 -- 8. Order items
 CREATE TABLE IF NOT EXISTS public.order_items (
