@@ -89,9 +89,27 @@ export async function POST(req: NextRequest) {
       verifiedPurchase = Boolean(count && count > 0);
     }
 
+    // Display name for the public review. NEVER derive it from the email: the
+    // local part of an address is PII, and GET /api/reviews is publicly
+    // readable, so the old `email.split('@')[0]` published "john.smith" for
+    // john.smith@gmail.com to anyone.
+    let displayName = 'Drum Palace Customer';
+    try {
+      const { data: profile } = await (client.from('profiles') as any)
+        .select('full_name')
+        .eq('id', auth.userId)
+        .maybeSingle();
+      const fullName = typeof profile?.full_name === 'string' ? profile.full_name.trim() : '';
+      if (fullName && !fullName.includes('@')) {
+        displayName = sanitizeText(fullName, 80) || displayName;
+      }
+    } catch {
+      // Keep the generic label rather than failing the review.
+    }
+
     const { error } = await (client.from('reviews') as any).insert({
       product_id: body.productId,
-      user_name: auth.email ? auth.email.split('@')[0] : 'Member',
+      user_name: displayName,
       user_email: null, // do not persist reviewer email
       rating: body.rating,
       comment: sanitizeText(body.comment, 2000),

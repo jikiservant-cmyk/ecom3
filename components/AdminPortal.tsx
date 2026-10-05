@@ -258,9 +258,12 @@ export default function AdminPortal({
         const userRole = profile?.role || "customer";
 
         if (userRole !== "admin") {
-          // Strictly reject non-admin users and invalidate session
+          // Strictly reject non-admin users and invalidate the session.
+          // Deliberately generic: "this account exists but is not an admin"
+          // confirms to a prober that the credentials they just tried are valid.
           await signOutUser();
-          setAuthError(`Access Denied: Account "${user.email}" does not have verified Administrator privileges in the database. Only authorized Drum Palace management may access this control center.`);
+          console.warn("Admin sign-in rejected: authenticated account lacks the admin role.", { userId: user.id });
+          setAuthError("Authentication failed: Invalid administrator credentials or unauthorized user account.");
           setIsAuthenticating(false);
           return;
         }

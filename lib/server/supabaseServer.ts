@@ -14,23 +14,38 @@ const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+/** True for values that are still .env.example placeholders. */
+function isPlaceholder(value: string | undefined): boolean {
+  if (!value) return true;
+  return value.includes('placeholder') || value.includes('YOUR_');
+}
+
+// Fails closed AND fails loud: a verbatim copy of .env.example must not produce
+// a half-configured server that silently rejects every login.
 export const isServerSupabaseConfigured = Boolean(
   SUPABASE_URL &&
     SUPABASE_ANON_KEY &&
     SUPABASE_URL.startsWith('https://') &&
-    !SUPABASE_URL.includes('placeholder') &&
-    !SUPABASE_ANON_KEY.includes('placeholder')
+    !isPlaceholder(SUPABASE_URL) &&
+    !isPlaceholder(SUPABASE_ANON_KEY)
 );
 
-export const hasServiceRoleKey = Boolean(
-  SUPABASE_SERVICE_ROLE_KEY && !SUPABASE_SERVICE_ROLE_KEY.includes('YOUR_')
-);
+export const hasServiceRoleKey = Boolean(SUPABASE_SERVICE_ROLE_KEY && !isPlaceholder(SUPABASE_SERVICE_ROLE_KEY));
+
+// Clients are stateless (persistSession/autoRefreshToken are off), so they are
+// safe to build once and reuse. Constructing one per request is pure overhead
+// on an authentication path that runs on every privileged call.
+let anonClient: SupabaseClient | null = null;
+let adminClient: SupabaseClient | null = null;
 
 /** Anon client for unprivileged server reads (RLS applies). */
 export function getServerAnonClient(): SupabaseClient {
-  return createClient(SUPABASE_URL || 'https://placeholder.supabase.co', SUPABASE_ANON_KEY || 'placeholder', {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
+  if (!anonClient) {
+    anonClient = createClient(SUPABASE_URL || 'https://placeholder.supabase.co', SUPABASE_ANON_KEY || 'placeholder', {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+  }
+  return anonClient;
 }
 
 /**
@@ -39,9 +54,12 @@ export function getServerAnonClient(): SupabaseClient {
  */
 export function getServerAdminClient(): SupabaseClient | null {
   if (!hasServiceRoleKey) return null;
-  return createClient(SUPABASE_URL as string, SUPABASE_SERVICE_ROLE_KEY as string, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
+  if (!adminClient) {
+    adminClient = createClient(SUPABASE_URL as string, SUPABASE_SERVICE_ROLE_KEY as string, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+  }
+  return adminClient;
 }
 
 /** Client acting as the requesting user (their JWT, RLS applies to them). */
@@ -77,8 +95,9 @@ export async function authenticateRequest(req: Request): Promise<AuthenticatedRe
   const token = extractBearerToken(req);
   if (!token) return null;
   try {
-    const client = getUserScopedClient(token);
-    const { data, error } = await client.auth.getUser(token);
+    // The token is passed explicitly, so the shared anon client is sufficient —
+    // GoTrue validates the JWT itself. Nothing here trusts the token's claims.
+    const { data, error } = await getServerAnonClient().auth.getUser(token);
     if (error || !data?.user) return null;
     return { userId: data.user.id, email: data.user.email ?? null, accessToken: token };
   } catch {

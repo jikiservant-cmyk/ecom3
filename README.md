@@ -144,3 +144,33 @@ npm test           # vitest (webhook signatures, rate limit, order ids, validati
   `payment_webhook_events` unique constraint).
 - Rollback: redeploy the previous build artifact; schema changes are additive
   and idempotent. Keep `SUPABASE_SERVICE_ROLE_KEY` out of the browser bundle.
+
+## Launch requirements that cannot be fixed in application code
+
+These need action outside this repository. They are listed here so they are not
+silently forgotten.
+
+- **Enable brute-force protection on Supabase Auth.** Sign-in calls
+  `supabase.auth.signInWithPassword` directly from the browser against the
+  Supabase Auth endpoint, so it never passes through this app's rate limiter
+  (`proxy.ts` only covers `/api/*`). A client-side lockout would be trivially
+  bypassed by calling Supabase directly, so it was deliberately not added.
+  Turn on Supabase's built-in auth rate limiting and/or hCaptcha in the
+  dashboard instead.
+- **Apply `lib/schemaSql.ts` to Supabase.** The RLS policies and the
+  `orders_force_pending` / `orders_protect_payment_status` /
+  `order_items_require_pending_order` triggers exist only as text until run.
+  Until they are applied, an anonymous PostgREST client can still insert an
+  order marked `Paid`.
+- **Set `TRUSTED_PROXY_HOPS`** to the number of reverse proxies in front of the
+  app, otherwise `X-Forwarded-For` may be attributed to the wrong client.
+- **Complete the CSP.** `script-src` still needs `'unsafe-inline'` because the
+  Next.js App Router streams its RSC payload through inline `<script>` tags;
+  removing it breaks hydration. Migrating to a nonce-based CSP is the real fix.
+- **Rate limiting is per-process.** For hard global caps put a shared store
+  (Upstash Redis) behind `lib/server/rateLimit.ts` or enforce limits at the
+  CDN/WAF.
+- **Run one real LivePay payment** end to end and confirm the webhook's amount
+  reconciliation against a live payload — LivePay's signature does not cover
+  `amount`, and the expected unit (major vs minor) has not been confirmed
+  against a real gateway response.

@@ -19,7 +19,11 @@ export function getActiveSupabaseConfig(): { url: string; anonKey: string; sourc
     return { url: envUrl.trim(), anonKey: envKey.trim(), source: 'env' };
   }
 
-  if (typeof window !== 'undefined') {
+  // DEVELOPMENT ONLY. In production a build without NEXT_PUBLIC_SUPABASE_* must
+  // fail closed. Falling back to localStorage here would silently route sign-in
+  // credentials and session tokens to whatever Supabase URL happened to be
+  // stored in the browser — an arbitrary-endpoint credential-phishing footgun.
+  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
     try {
       const stored = localStorage.getItem(LOCAL_SUPABASE_CONFIG_KEY);
       if (stored) {
@@ -83,6 +87,9 @@ export const isSupabaseConfigured = Boolean(
 
 export function saveSupabaseConfig(url: string, anonKey: string) {
   if (typeof window === 'undefined') return;
+  // See getActiveSupabaseConfig: browser-supplied endpoints are a dev-only
+  // convenience and are never honoured in a production build.
+  if (process.env.NODE_ENV === 'production') return;
   try {
     localStorage.setItem(
       LOCAL_SUPABASE_CONFIG_KEY,
