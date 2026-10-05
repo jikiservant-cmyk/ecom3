@@ -5,7 +5,7 @@ import Image from 'next/image';
 import AdminPortal from '@/components/AdminPortal';
 import { supabase, isSupabaseConfigured } from '@/lib/supabase';
 import { 
-  signInWithEmail, 
+  signInViaServer, 
   signUpWithEmail, 
   signOutUser, 
   signInWithOAuth, 
@@ -506,23 +506,26 @@ export default function DrumPalaceApp() {
     if (!loginEmail || !loginPassword) return;
 
     if (isSupabaseConfigured) {
-      const { user, error } = await signInWithEmail(loginEmail, loginPassword);
-      if (error) {
-        showToast(error.message || 'Login failed. Please check your credentials.');
+      // Sign in through our own API route so the attempt is throttled
+      // server-side (per IP and per account). A direct browser call to Supabase
+      // Auth would bypass that protection.
+      const result = await signInViaServer(loginEmail, loginPassword);
+      if (result.error) {
+        showToast(result.error || 'Login failed. Please check your credentials.');
         return;
       }
-      if (user) {
-        // Strictly fetch user role from the database profiles table
-        const profile = await fetchUserProfile(user.id);
-        const userRole = profile?.role === 'admin' ? 'admin' : 'customer';
-        const userDisplayName = profile?.name || user.user_metadata?.full_name || loginEmail.split('@')[0];
+      if (result.user) {
+        // Role and display name come from the server, which read public.profiles
+        // under the user's own JWT.
+        const userRole = result.role === 'admin' ? 'admin' : 'customer';
+        const userDisplayName = result.name || result.user.user_metadata?.full_name || loginEmail.split('@')[0];
 
         const userObj = {
-          id: user.id,
-          email: user.email || loginEmail,
+          id: result.user.id,
+          email: result.user.email || loginEmail,
           name: userDisplayName,
           role: userRole,
-          phone: profile?.phone,
+          phone: result.phone,
         };
 
         setCurrentUser(userObj);

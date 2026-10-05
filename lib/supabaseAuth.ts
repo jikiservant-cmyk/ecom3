@@ -10,7 +10,11 @@ export interface UserProfile {
 }
 
 /**
- * Sign in with email and password
+ * Sign in with email and password.
+ *
+ * @deprecated Use {@link signInViaServer}. This calls Supabase Auth directly
+ * from the browser, which bypasses the application's brute-force throttle on
+ * /api/auth/login. Retained only for any remaining non-password callers.
  */
 export async function signInWithEmail(email: string, password: string): Promise<{ user: User | null; session: Session | null; error: AuthError | null }> {
   try {
@@ -21,6 +25,50 @@ export async function signInWithEmail(email: string, password: string): Promise<
     return { user: data.user, session: data.session, error };
   } catch (err: any) {
     return { user: null, session: null, error: err as AuthError };
+  }
+}
+
+/**
+ * Sign in through our own API route so the attempt is throttled server-side
+ * (per IP and per account). The route exchanges the credentials with Supabase
+ * GoTrue, looks up the authoritative role from `profiles`, and returns a
+ * session which we install here — so RLS and the rest of the app behave exactly
+ * as they did with a browser-side sign-in.
+ */
+export async function signInViaServer(
+  email: string,
+  password: string
+): Promise<{ user: User | null; session: Session | null; role: 'admin' | 'customer'; name: string; phone?: string; error: string | null }> {
+  const denied = (error: string) => ({ user: null, session: null, role: 'customer' as const, name: '', error });
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.success || !data?.session?.access_token || !data?.session?.refresh_token) {
+      return denied(data?.error || 'Invalid email or password.');
+    }
+
+    const { data: installed, error } = await supabase.auth.setSession({
+      access_token: data.session.access_token,
+      refresh_token: data.session.refresh_token,
+    });
+    if (error || !installed?.user) {
+      return denied(error?.message || 'Could not start your session. Please try again.');
+    }
+
+    return {
+      user: installed.user,
+      session: installed.session,
+      role: data.role === 'admin' ? 'admin' : 'customer',
+      name: typeof data.user?.name === 'string' ? data.user.name : '',
+      phone: typeof data.user?.phone === 'string' ? data.user.phone : undefined,
+      error: null,
+    };
+  } catch (err: any) {
+    return denied(err?.message || 'Sign-in is currently unavailable. Please try again.');
   }
 }
 

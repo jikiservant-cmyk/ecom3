@@ -70,7 +70,7 @@ import {
   generateUuid,
   ensureValidUuid
 } from "@/lib/supabaseDb";
-import { signInWithEmail, fetchUserProfile, signOutUser } from "@/lib/supabaseAuth";
+import { signInViaServer, signOutUser } from "@/lib/supabaseAuth";
 import { 
   getActiveSupabaseConfig, 
   saveSupabaseConfig, 
@@ -249,29 +249,29 @@ export default function AdminPortal({
     setAuthError(null);
 
     try {
-      // 1. Attempt Supabase Auth login
-      const { user, error } = await signInWithEmail(adminEmail.trim(), adminPassword);
+      // 1. Sign in through our own API route so the attempt is throttled
+      //    server-side (per IP and per account). Calling Supabase Auth directly
+      //    from the browser would bypass that protection entirely.
+      const result = await signInViaServer(adminEmail.trim(), adminPassword);
 
-      if (!error && user) {
-        // Strictly verify user role from the database public.profiles record
-        const profile = await fetchUserProfile(user.id);
-        const userRole = profile?.role || "customer";
-
-        if (userRole !== "admin") {
+      if (!result.error && result.user) {
+        // The role comes from the server, which read public.profiles under the
+        // user's own JWT. The browser never decides who is an admin.
+        if (result.role !== "admin") {
           // Strictly reject non-admin users and invalidate the session.
           // Deliberately generic: "this account exists but is not an admin"
           // confirms to a prober that the credentials they just tried are valid.
           await signOutUser();
-          console.warn("Admin sign-in rejected: authenticated account lacks the admin role.", { userId: user.id });
+          console.warn("Admin sign-in rejected: authenticated account lacks the admin role.", { userId: result.user.id });
           setAuthError("Authentication failed: Invalid administrator credentials or unauthorized user account.");
           setIsAuthenticating(false);
           return;
         }
 
         const adminObj = {
-          id: user.id,
-          name: profile?.name || user.user_metadata?.full_name || "Store Administrator",
-          email: user.email || adminEmail.trim(),
+          id: result.user.id,
+          name: result.name || result.user.user_metadata?.full_name || "Store Administrator",
+          email: result.user.email || adminEmail.trim(),
           role: "admin",
         };
 
@@ -288,7 +288,7 @@ export default function AdminPortal({
       // Removed. Admin access now requires a valid Supabase Auth session whose
       // database profile role is 'admin' (checked above and re-checked server-side
       // by every privileged API route).
-      setAuthError("Authentication failed: Invalid administrator credentials or unauthorized user account.");
+      setAuthError(result.error || "Authentication failed: Invalid administrator credentials or unauthorized user account.");
     } catch (err: any) {
       setAuthError(err?.message || "An unexpected error occurred during administrator authentication.");
     } finally {

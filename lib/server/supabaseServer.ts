@@ -62,6 +62,16 @@ export function getServerAdminClient(): SupabaseClient | null {
   return adminClient;
 }
 
+/**
+ * Supabase Auth (GoTrue) endpoint details, for server-side credential exchange.
+ * Used by /api/auth/login so password sign-in can be throttled here instead of
+ * going straight from the browser to Supabase.
+ */
+export function getSupabaseAuthConfig(): { url: string; anonKey: string } | null {
+  if (!isServerSupabaseConfigured || !SUPABASE_URL || !SUPABASE_ANON_KEY) return null;
+  return { url: SUPABASE_URL.replace(/\/+$/, ''), anonKey: SUPABASE_ANON_KEY };
+}
+
 /** Client acting as the requesting user (their JWT, RLS applies to them). */
 export function getUserScopedClient(accessToken: string): SupabaseClient {
   return createClient(SUPABASE_URL || 'https://placeholder.supabase.co', SUPABASE_ANON_KEY || 'placeholder', {
