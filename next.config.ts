@@ -10,12 +10,18 @@ const securityHeaders = [
     value: 'max-age=63072000; includeSubDomains; preload',
   },
   {
+    // 'unsafe-inline' for script-src is required by the Next.js App Router,
+    // which streams the RSC payload via inline <script>self.__next_f.push(...)
+    // tags; removing it breaks hydration. The correct fix is a nonce-based CSP
+    // (Next.js supports nonces through middleware) — tracked as follow-up.
+    // 'unsafe-eval' is only needed by dev-mode HMR, so it is enabled for
+    // development only and must never ship to production.
     // 'unsafe-inline' for styles is required because the app uses React inline
     // style attributes; tighten alongside a migration to CSS classes.
     key: 'Content-Security-Policy',
     value: [
       "default-src 'self'",
-      "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+      `script-src 'self' 'unsafe-inline'${process.env.NODE_ENV === 'production' ? '' : " 'unsafe-eval'"}`,
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob: https://images.unsplash.com https://plus.unsplash.com https://picsum.photos https://*.supabase.co https://images.pexels.com https://cdn.pixabay.com https://i.imgur.com https://upload.wikimedia.org",
       "font-src 'self' data: https://fonts.gstatic.com",

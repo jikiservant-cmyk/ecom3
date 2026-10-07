@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import Image from "next/image";
 import {
   LayoutDashboard,
@@ -70,14 +70,15 @@ import {
   generateUuid,
   ensureValidUuid
 } from "@/lib/supabaseDb";
-import { signInWithEmail, fetchUserProfile, signOutUser } from "@/lib/supabaseAuth";
+import { signInViaServer, signOutUser } from "@/lib/supabaseAuth";
 import { 
   getActiveSupabaseConfig, 
   saveSupabaseConfig, 
   clearSupabaseConfig, 
   testSupabaseConnection, 
   ConnectionDiagnosticResult,
-  DRUM_PALACE_COMPLETE_SCHEMA_SQL 
+  DRUM_PALACE_COMPLETE_SCHEMA_SQL,
+  supabase
 } from "@/lib/supabase";
 import { formatMoney } from "@/lib/utils";
 import { getStoreSettings, saveStoreSettings, StoreSettings, DEFAULT_STORE_SETTINGS, BannerSlide, DEFAULT_BANNER_SLIDES, HotDealItem, DEFAULT_HOT_DEALS } from "@/lib/storeSettings";
@@ -181,6 +182,11 @@ export default function AdminPortal({
   const [copiedSql, setCopiedSql] = useState(false);
   const [diagnosticResult, setDiagnosticResult] = useState<ConnectionDiagnosticResult | null>(null);
 
+  // New-order awareness: the admin portal is how orders are discovered, so it
+  // polls while open and flags anything newer than the last thing we showed.
+  const [newOrderCount, setNewOrderCount] = useState(0);
+  const newestSeenRef = useRef<string | null>(null);
+
   const showToast = (msg: string) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 3500);
@@ -207,6 +213,45 @@ export default function AdminPortal({
       setLoading(false);
     }
   }, [onProductsUpdated]);
+
+  // Poll for new orders while the portal is open (every 30s).
+  useEffect(() => {
+    if (!effectiveAdmin || effectiveAdmin.role !== "admin") return;
+    let cancelled = false;
+
+    const check = async () => {
+      try {
+        const ords = await getOrdersFromDb();
+        if (cancelled) return;
+        const newest = ords
+          .map((o) => o.createdAt)
+          .filter(Boolean)
+          .sort()
+          .pop() || null;
+
+        if (newestSeenRef.current === null) {
+          // First observation — establish the baseline without shouting about
+          // orders that were already there.
+          newestSeenRef.current = newest;
+        } else if (newest && newest > newestSeenRef.current) {
+          const fresh = ords.filter((o) => o.createdAt > (newestSeenRef.current || ""));
+          newestSeenRef.current = newest;
+          setNewOrderCount((c) => c + fresh.length);
+          setOrders(ords);
+          showToast(`🔔 ${fresh.length} new order${fresh.length === 1 ? "" : "s"} received`);
+        }
+      } catch {
+        // A failed poll is not worth surfacing; the next tick will retry.
+      }
+    };
+
+    const timer = setInterval(check, 30_000);
+    void check();
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [effectiveAdmin]);
 
   useEffect(() => {
     let isSubscribed = true;
@@ -248,26 +293,29 @@ export default function AdminPortal({
     setAuthError(null);
 
     try {
-      // 1. Attempt Supabase Auth login
-      const { user, error } = await signInWithEmail(adminEmail.trim(), adminPassword);
+      // 1. Sign in through our own API route so the attempt is throttled
+      //    server-side (per IP and per account). Calling Supabase Auth directly
+      //    from the browser would bypass that protection entirely.
+      const result = await signInViaServer(adminEmail.trim(), adminPassword);
 
-      if (!error && user) {
-        // Strictly verify user role from the database public.profiles record
-        const profile = await fetchUserProfile(user.id);
-        const userRole = profile?.role || "customer";
-
-        if (userRole !== "admin") {
-          // Strictly reject non-admin users and invalidate session
+      if (!result.error && result.user) {
+        // The role comes from the server, which read public.profiles under the
+        // user's own JWT. The browser never decides who is an admin.
+        if (result.role !== "admin") {
+          // Strictly reject non-admin users and invalidate the session.
+          // Deliberately generic: "this account exists but is not an admin"
+          // confirms to a prober that the credentials they just tried are valid.
           await signOutUser();
-          setAuthError(`Access Denied: Account "${user.email}" does not have verified Administrator privileges in the database. Only authorized Drum Palace management may access this control center.`);
+          console.warn("Admin sign-in rejected: authenticated account lacks the admin role.", { userId: result.user.id });
+          setAuthError("Authentication failed: Invalid administrator credentials or unauthorized user account.");
           setIsAuthenticating(false);
           return;
         }
 
         const adminObj = {
-          id: user.id,
-          name: profile?.name || user.user_metadata?.full_name || "Store Administrator",
-          email: user.email || adminEmail.trim(),
+          id: result.user.id,
+          name: result.name || result.user.user_metadata?.full_name || "Store Administrator",
+          email: result.user.email || adminEmail.trim(),
           role: "admin",
         };
 
@@ -284,7 +332,7 @@ export default function AdminPortal({
       // Removed. Admin access now requires a valid Supabase Auth session whose
       // database profile role is 'admin' (checked above and re-checked server-side
       // by every privileged API route).
-      setAuthError("Authentication failed: Invalid administrator credentials or unauthorized user account.");
+      setAuthError(result.error || "Authentication failed: Invalid administrator credentials or unauthorized user account.");
     } catch (err: any) {
       setAuthError(err?.message || "An unexpected error occurred during administrator authentication.");
     } finally {
@@ -470,6 +518,85 @@ export default function AdminPortal({
     await updateOrderStatusInDb(orderId, status);
     showToast(`Order status updated to "${status}"`);
     loadData();
+  };
+
+  /** Save a carrier tracking reference. Goes through the API so it is audit-logged. */
+  const handleSaveTracking = async (orderId: string, trackingNumber: string) => {
+    try {
+      let accessToken: string | null = null;
+      try {
+        const { data } = await supabase.auth.getSession();
+        accessToken = data?.session?.access_token || null;
+      } catch {
+        accessToken = null;
+      }
+      if (!accessToken) {
+        showToast("Session expired. Please sign in again to save tracking.");
+        return;
+      }
+      const res = await fetch("/api/orders", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+        body: JSON.stringify({ orderId, trackingNumber: trackingNumber || null }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.success) {
+        showToast(data?.error || "Could not save the tracking number.");
+        loadData();
+        return;
+      }
+      showToast(trackingNumber ? `Tracking ${trackingNumber} saved.` : "Tracking number cleared.");
+      loadData();
+    } catch {
+      showToast("Could not save the tracking number.");
+    }
+  };
+
+  // Manual payment reconciliation escape hatch (admin-only). Used when the gateway
+  // webhook could not confirm a payment. Every change is audit-logged server-side.
+  const handleUpdatePaymentStatus = async (orderId: string, paymentStatus: "Pending" | "Paid" | "Failed" | "Refunded") => {
+    try {
+      let accessToken: string | null = null;
+      try {
+        const { data } = await supabase.auth.getSession();
+        accessToken = data?.session?.access_token || null;
+      } catch {
+        accessToken = null;
+      }
+      if (!accessToken) {
+        showToast("Session expired. Please sign in again to update payment status.");
+        return;
+      }
+
+      // Paid/Refunded bypass the payment gateway, so the API requires a reason.
+      let note: string | undefined;
+      if (paymentStatus === "Paid" || paymentStatus === "Refunded") {
+        const entered = window.prompt(
+          `Reason for manually marking this order "${paymentStatus}" (required, recorded in the audit log):`
+        );
+        if (entered === null) return; // cancelled
+        note = entered.trim();
+        if (note.length < 3) {
+          showToast("Please enter a reason of at least 3 characters.");
+          return;
+        }
+      }
+
+      const res = await fetch("/api/orders", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+        body: JSON.stringify({ orderId, paymentStatus, note }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.success) {
+        showToast(data?.error || "Could not update payment status.");
+        return;
+      }
+      showToast(`Payment marked "${paymentStatus}" for order.`);
+      loadData();
+    } catch (e: any) {
+      showToast("Could not update payment status.");
+    }
   };
 
   // User Management Handlers
@@ -777,16 +904,6 @@ export default function AdminPortal({
     } finally {
       setIsTestingLivepay(false);
     }
-  };
-
-  const handleSaveLivepaySettings = (e: React.FormEvent) => {
-    e.preventDefault();
-    // SECURITY: credentials are configured on the server via environment
-    // variables (LIVEPAY_API_KEY, LIVEPAY_SECRET_KEY, LIVEPAY_MERCHANT_ID,
-    // LIVEPAY_API_URL, LIVEPAY_WEBHOOK_SECRET). This app never stores them
-    // in the browser. We only run a connectivity test here.
-    showToast("LivePay credentials are managed via server environment variables.");
-    handleTestLivepayConnection();
   };
 
   const handleCopyWebhookUrl = () => {
@@ -1195,6 +1312,29 @@ export default function AdminPortal({
 
         {/* Tab Body Scrollable Container */}
         <main className="flex-1 overflow-y-auto p-3 sm:p-5 md:p-6">
+          {/* New-order alert. Orders arrive through POST /api/orders; this banner
+              is how the admin learns about them without refreshing. */}
+          {newOrderCount > 0 && (
+            <div className="mb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-3 rounded-xl border border-emerald-200 bg-emerald-50 dark:bg-emerald-950/40 dark:border-emerald-900">
+              <div className="text-sm font-bold text-emerald-800 dark:text-emerald-300">
+                🔔 {newOrderCount} new order{newOrderCount === 1 ? "" : "s"} since you opened the dashboard
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => { setCurrentTab("orders"); setNewOrderCount(0); }}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold whitespace-nowrap"
+                >
+                  View orders
+                </button>
+                <button
+                  onClick={() => setNewOrderCount(0)}
+                  className="px-2 py-1.5 rounded-lg border border-emerald-300 text-emerald-700 dark:text-emerald-300 dark:border-emerald-800 text-xs font-bold"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
           {/* ========================================================= */}
           {/* TAB 1: OVERVIEW & PERFORMANCE */}
           {/* ========================================================= */}
@@ -2456,18 +2596,51 @@ export default function AdminPortal({
                     >
                       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-100 dark:border-slate-800 text-xs">
                         <div>
-                          <div className="font-bold text-slate-900 dark:text-white text-sm">
+                          <div className="font-bold text-slate-900 dark:text-white text-sm flex items-center gap-2 flex-wrap">
                             {order.orderNumber}
+                            {order.paymentMethod === "cod" ? (
+                              <span
+                                title="Cash on Delivery — collect payment at handover, then mark it Paid"
+                                className="text-[10px] font-extrabold uppercase tracking-wide px-2 py-0.5 rounded-md bg-orange-100 text-orange-700 border border-orange-200 dark:bg-orange-950/40 dark:text-orange-300 dark:border-orange-900"
+                              >
+                                💵 Cash on Delivery
+                              </span>
+                            ) : (
+                              <span
+                                title="Mobile Money via LivePay"
+                                className="text-[10px] font-extrabold uppercase tracking-wide px-2 py-0.5 rounded-md bg-sky-100 text-sky-700 border border-sky-200 dark:bg-sky-950/40 dark:text-sky-300 dark:border-sky-900"
+                              >
+                                📱 Mobile Money
+                              </span>
+                            )}
+                            {order.paymentMethod === "cod" && order.paymentStatus !== "Paid" && (
+                              <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-amber-50 text-amber-700 border border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900">
+                                Collect on delivery
+                              </span>
+                            )}
                           </div>
                           <div className="text-slate-400 mt-0.5">
                             Customer: <span className="text-slate-700 dark:text-slate-300 font-semibold">{order.customerName}</span> ({order.customerEmail})
                           </div>
                         </div>
 
-                        <div className="flex items-center gap-3">
+                        <div className="flex items-center gap-2 flex-wrap">
                           <span className="font-bold text-sm text-slate-900 dark:text-white">
                             {formatMoney(order.total, currency)}
                           </span>
+                          <select
+                            value={order.paymentStatus === "Paid" ? "Paid" : "Pending"}
+                            onChange={(e) => handleUpdatePaymentStatus(order.id, e.target.value as any)}
+                            title="Payment reconciliation (admin)"
+                            className={`py-1 px-2.5 text-xs rounded-lg border font-bold focus:outline-none ${
+                              order.paymentStatus === "Paid"
+                                ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:border-emerald-900 dark:text-emerald-300"
+                                : "border-amber-200 bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:border-amber-900 dark:text-amber-300"
+                            }`}
+                          >
+                            <option value="Pending">Payment: Pending</option>
+                            <option value="Paid">Payment: Paid</option>
+                          </select>
                           <select
                             value={order.status}
                             onChange={(e) => handleUpdateOrderStatus(order.id, e.target.value as any)}
@@ -2479,6 +2652,33 @@ export default function AdminPortal({
                             <option value="Cancelled">Cancelled</option>
                           </select>
                         </div>
+                      </div>
+
+                      {/* Dispatch: tracking reference + one-click shipped */}
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                        <input
+                          defaultValue={order.trackingNumber || ""}
+                          onBlur={(e) => {
+                            const next = e.target.value.trim().toUpperCase();
+                            if (next !== (order.trackingNumber || "")) handleSaveTracking(order.id, next);
+                          }}
+                          onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+                          placeholder="Tracking no. (e.g. DHL-1234567)"
+                          className="flex-1 py-1 px-2.5 text-xs rounded-lg border border-slate-200 bg-slate-50 font-semibold focus:outline-none focus:ring-2 focus:ring-[var(--accent)]/40 dark:bg-slate-800 dark:border-slate-700"
+                        />
+                        {order.status !== "Shipped" && order.status !== "Delivered" && order.status !== "Cancelled" && (
+                          <button
+                            onClick={() => handleUpdateOrderStatus(order.id, "Shipped")}
+                            className="py-1 px-3 text-xs font-bold rounded-lg bg-[var(--accent)] text-white hover:opacity-90 whitespace-nowrap"
+                          >
+                            📦 Mark Shipped
+                          </button>
+                        )}
+                        {order.trackingNumber && (
+                          <span className="text-[11px] font-bold text-slate-500 dark:text-slate-400 whitespace-nowrap">
+                            Saved: {order.trackingNumber}
+                          </span>
+                        )}
                       </div>
 
                       {/* Items breakdown */}
@@ -2756,86 +2956,36 @@ export default function AdminPortal({
                   </span>
                 </div>
 
-                <form onSubmit={handleSaveLivepaySettings} className="space-y-4 text-xs">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div className="space-y-1.5">
-                      <label className="font-semibold text-slate-700 dark:text-slate-300">
-                        LivePay Merchant ID
-                      </label>
-                      <input
-                        type="text"
-                        value={livepayMerchantId}
-                        onChange={(e) => setLivepayMerchantId(e.target.value)}
-                        placeholder="e.g. MERCH_DP_UG_88192"
-                        className="w-full p-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:border-teal-500 dark:bg-slate-800 dark:border-slate-700 dark:text-white font-mono text-xs"
-                      />
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <label className="font-semibold text-slate-700 dark:text-slate-300">
-                        LivePay API Gateway URL
-                      </label>
-                      <input
-                        type="text"
-                        value={livepayApiUrl}
-                        onChange={(e) => setLivepayApiUrl(e.target.value)}
-                        placeholder="https://api.livepay.me/v1"
-                        className="w-full p-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:border-teal-500 dark:bg-slate-800 dark:border-slate-700 dark:text-white font-mono text-xs"
-                      />
-                    </div>
+                <div className="space-y-3 text-xs">
+                  <p className="text-slate-600 dark:text-slate-300 leading-relaxed">
+                    LivePay credentials are intentionally <strong>not entered here</strong>. Per
+                    docs.livepay.me the gateway is configured exclusively through server-side
+                    environment variables so no key ever reaches the browser. Set these on the
+                    hosting environment and restart:
+                  </p>
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 font-mono text-[11px] leading-relaxed text-slate-700 dark:text-slate-300 space-y-1">
+                    <div>LIVEPAY_API_KEY=<span className="text-slate-400">Bearer API key from the LivePay dashboard (sole credential)</span></div>
+                    <div>LIVEPAY_MERCHANT_ID=<span className="text-slate-400">your LivePay account number, e.g. LP2305443309</span></div>
+                    <div>LIVEPAY_SECRET_KEY=<span className="text-slate-400">not used by the documented API (webhook HMAC uses LIVEPAY_WEBHOOK_SECRET)</span></div>
+                    <div>LIVEPAY_WEBHOOK_SECRET=<span className="text-slate-400">required for webhook acceptance (fail closed)</span></div>
+                    <div>LIVEPAY_API_URL=<span className="text-slate-400">default https://livepay.me/api (docs base URL)</span></div>
                   </div>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div className="space-y-1.5">
-                      <label className="font-semibold text-slate-700 dark:text-slate-300">
-                        LivePay API Key (Public / Client Identifier)
-                      </label>
-                      <input
-                        type="password"
-                        value={livepayApiKey}
-                        onChange={(e) => setLivepayApiKey(e.target.value)}
-                        placeholder="lp_live_..."
-                        className="w-full p-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:border-teal-500 dark:bg-slate-800 dark:border-slate-700 dark:text-white font-mono text-xs"
-                      />
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <label className="font-semibold text-slate-700 dark:text-slate-300">
-                        LivePay Secret Key (Private API Secret)
-                      </label>
-                      <input
-                        type="password"
-                        value={livepaySecretKey}
-                        onChange={(e) => setLivepaySecretKey(e.target.value)}
-                        placeholder="lp_sec_..."
-                        className="w-full p-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:border-teal-500 dark:bg-slate-800 dark:border-slate-700 dark:text-white font-mono text-xs"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <label className="font-semibold text-slate-700 dark:text-slate-300">
-                      LivePay Webhook Secret (IPN Signature Verification)
-                    </label>
-                    <input
-                      type="password"
-                      value={livepayWebhookSecret}
-                      onChange={(e) => setLivepayWebhookSecret(e.target.value)}
-                      placeholder="whsec_..."
-                      className="w-full p-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:border-teal-500 dark:bg-slate-800 dark:border-slate-700 dark:text-white font-mono text-xs"
-                    />
-                  </div>
-
-                  <div className="pt-3 flex justify-end gap-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[10px] text-slate-400">
+                      Reference: docs.livepay.me &mdash; auth, /collect-money, /check-balance,
+                      /transaction-status, /webhooks
+                    </p>
                     <button
-                      type="submit"
-                      className="px-5 py-2.5 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-bold transition shadow-sm cursor-pointer flex items-center gap-2"
+                      type="button"
+                      onClick={handleTestLivepayConnection}
+                      disabled={isTestingLivepay}
+                      className="px-5 py-2.5 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-bold transition shadow-sm cursor-pointer flex items-center gap-2 shrink-0"
                     >
-                      <Save size={14} />
-                      <span>Save LivePay Configuration</span>
+                      <Activity size={14} className={isTestingLivepay ? "animate-spin" : ""} />
+                      <span>{isTestingLivepay ? "Testing Gateway..." : "Test Live Connection"}</span>
                     </button>
                   </div>
-                </form>
+                </div>
               </div>
 
               {/* Webhook & IPN Setup Instructions */}
@@ -2849,7 +2999,7 @@ export default function AdminPortal({
                 </div>
 
                 <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                  Enter this callback URL into your LivePay Merchant Dashboard under Webhook / IPN Settings. When a customer completes a Mobile Money or Card payment, LivePay automatically notifies this endpoint to mark the order as &ldquo;Paid&rdquo; and transition it to &ldquo;Processing&rdquo;.
+                  Register this callback URL in your LivePay Merchant Dashboard under Webhook / IPN Settings. When a customer completes a Mobile Money payment, LivePay POSTs here with an HMAC-SHA256 signature (X-Webhook-Signature) which the server verifies before marking the order as &ldquo;Paid&rdquo; and transitioning it to &ldquo;Processing&rdquo;. The endpoint acknowledges within the documented 10-second window and is idempotent under LivePay&rsquo;s 3 retry attempts.
                 </p>
 
                 <div className="p-3 bg-slate-50 dark:bg-slate-800/60 rounded-xl border border-slate-200/80 dark:border-slate-700 flex items-center justify-between gap-3">

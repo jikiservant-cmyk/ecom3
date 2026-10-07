@@ -61,7 +61,19 @@ export function rateLimitHeaders(res: Headers, result: RateLimitResult) {
 }
 
 export function clientIp(req: Request): string {
+  // Everything to the LEFT of the trusted proxy chain in X-Forwarded-For is
+  // attacker-controlled. With N trusted proxies in front of the app the real
+  // client IP is the Nth entry from the right, so set TRUSTED_PROXY_HOPS to
+  // match the deployment (default 1: the rightmost entry, correct for a single
+  // platform proxy that appends the client address).
+  const hops = Math.max(1, Number.parseInt(process.env.TRUSTED_PROXY_HOPS || '1', 10) || 1);
   const xf = req.headers.get('x-forwarded-for');
-  if (xf) return xf.split(',')[0].trim();
+  if (xf) {
+    const parts = xf.split(',').map((s) => s.trim()).filter(Boolean);
+    // A chain shorter than the configured hop count means the header did not
+    // arrive through the expected infrastructure. Refuse it rather than
+    // falling back to an attacker-chosen value.
+    if (parts.length >= hops) return parts[parts.length - hops];
+  }
   return req.headers.get('x-real-ip') || 'unknown';
 }

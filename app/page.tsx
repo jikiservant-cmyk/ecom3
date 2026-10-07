@@ -3,9 +3,10 @@
 import React, { useState, useEffect, useSyncExternalStore, useRef, useMemo } from 'react';
 import Image from 'next/image';
 import AdminPortal from '@/components/AdminPortal';
+import StoreRating from '@/components/StoreRating';
 import { supabase, isSupabaseConfigured } from '@/lib/supabase';
 import { 
-  signInWithEmail, 
+  signInViaServer, 
   signUpWithEmail, 
   signOutUser, 
   signInWithOAuth, 
@@ -131,7 +132,9 @@ export default function DrumPalaceApp() {
   const [activeProductId, setActiveProductId] = useState<string>('');
   const [selectedImageIndex, setSelectedImageIndex] = useState<number>(0);
   const [detailQty, setDetailQty] = useState<number>(1);
-  const [paymentMethod, setPaymentMethod] = useState<'momo' | 'card' | 'cod'>('momo');
+  // LivePay's documented API (docs.livepay.me) supports Mobile Money only —
+  // there is no card option to offer.
+  const [paymentMethod, setPaymentMethod] = useState<'momo' | 'cod'>('momo');
   const [momoPhone, setMomoPhone] = useState<string>('');
   const [isProcessingPayment, setIsProcessingPayment] = useState<boolean>(false);
   const isDarkMode = useSyncExternalStore(subscribeTheme, getThemeSnapshot, getThemeServerSnapshot);
@@ -504,23 +507,26 @@ export default function DrumPalaceApp() {
     if (!loginEmail || !loginPassword) return;
 
     if (isSupabaseConfigured) {
-      const { user, error } = await signInWithEmail(loginEmail, loginPassword);
-      if (error) {
-        showToast(error.message || 'Login failed. Please check your credentials.');
+      // Sign in through our own API route so the attempt is throttled
+      // server-side (per IP and per account). A direct browser call to Supabase
+      // Auth would bypass that protection.
+      const result = await signInViaServer(loginEmail, loginPassword);
+      if (result.error) {
+        showToast(result.error || 'Login failed. Please check your credentials.');
         return;
       }
-      if (user) {
-        // Strictly fetch user role from the database profiles table
-        const profile = await fetchUserProfile(user.id);
-        const userRole = profile?.role === 'admin' ? 'admin' : 'customer';
-        const userDisplayName = profile?.name || user.user_metadata?.full_name || loginEmail.split('@')[0];
+      if (result.user) {
+        // Role and display name come from the server, which read public.profiles
+        // under the user's own JWT.
+        const userRole = result.role === 'admin' ? 'admin' : 'customer';
+        const userDisplayName = result.name || result.user.user_metadata?.full_name || loginEmail.split('@')[0];
 
         const userObj = {
-          id: user.id,
-          email: user.email || loginEmail,
+          id: result.user.id,
+          email: result.user.email || loginEmail,
           name: userDisplayName,
           role: userRole,
-          phone: profile?.phone,
+          phone: result.phone,
         };
 
         setCurrentUser(userObj);
@@ -679,12 +685,15 @@ export default function DrumPalaceApp() {
     const customerShipping = checkoutAddress.trim();
 
     setIsProcessingPayment(true);
-    showToast(paymentMethod === 'momo' ? 'Initiating LivePay mobile prompt…' : 'Processing order via LivePay Uganda…');
+    showToast(paymentMethod === 'momo' ? 'Initiating LivePay mobile prompt…' : 'Placing your order…');
 
     try {
       const orderItems = cart.map((item) => {
         const prod = products.find((p) => p.id === item.id);
         return {
+          // productId lets the server price the line by immutable id; price is
+          // sent for display/debug only and is ignored server-side.
+          productId: prod?.id,
           productName: prod?.name || 'Instrument',
           quantity: item.qty,
           price: prod?.price || 0,
@@ -716,6 +725,7 @@ export default function DrumPalaceApp() {
           total: grandTotal,
           phone: effectivePhone,
           shippingAddress: customerShipping,
+          paymentMethod,
         }),
       });
       const orderData = await orderRes.json().catch(() => null);
@@ -724,24 +734,30 @@ export default function DrumPalaceApp() {
         return;
       }
 
-      // 2. Initiate the LivePay payment. The server reads the amount from the
-      //    database order — the client never controls the charged amount.
-      const payRes = await fetch('/api/payments/livepay', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          orderId: orderData.orderId,
-          phoneNumber: effectivePhone,
-          paymentMethod,
-        }),
-      });
-      const payData = await payRes.json().catch(() => null);
-      if (!payRes.ok || !payData?.success) {
-        showToast(payData?.error || 'Payment could not be started. Your order is saved as pending.');
-        return;
+      // 2. For Mobile Money, initiate the LivePay payment. The server reads the
+      //    amount from the database order — the client never controls the
+      //    charged amount. Cash on Delivery needs no gateway call.
+      if (paymentMethod === 'momo') {
+        const payRes = await fetch('/api/payments/livepay', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            orderId: orderData.orderId,
+            phoneNumber: effectivePhone,
+            paymentMethod: 'momo',
+          }),
+        });
+        const payData = await payRes.json().catch(() => null);
+        if (!payRes.ok || !payData?.success) {
+          showToast(
+            `${payData?.error || 'Payment could not be started.'} Your order #${orderData.orderNumber} is saved as pending — try again from checkout or contact support with this order number.`
+          );
+          return;
+        }
+        showToast(`Order #${orderData.orderNumber} created. Complete the LivePay prompt to pay. Total: ${formatMoney(grandTotal)}`);
+      } else {
+        showToast(`Order #${orderData.orderNumber} received. You will pay ${formatMoney(grandTotal)} on delivery.`);
       }
-
-      showToast(`Order #${orderData.orderNumber} created. Complete the LivePay prompt to pay. Total: ${formatMoney(grandTotal)}`);
       setCart([]);
       setMomoPhone('');
       setCheckoutName('');
@@ -1886,19 +1902,6 @@ export default function DrumPalaceApp() {
                       </button>
 
                       <button
-                        onClick={() => setPaymentMethod('card')}
-                        disabled={isProcessingPayment}
-                        className={`w-full text-left p-3.5 sm:p-4 rounded-xl border transition flex items-center justify-between cursor-pointer text-xs sm:text-sm ${
-                          paymentMethod === 'card'
-                            ? 'border-[var(--accent)] bg-[var(--surface)] ring-1 ring-[var(--accent)] font-bold text-[var(--ink)]'
-                            : 'border-[var(--line)] bg-[var(--surface)] text-[var(--ink)] hover:border-[var(--accent)]'
-                        }`}
-                      >
-                        <span>💳 &nbsp; Visa / Mastercard / Debit (LivePay)</span>
-                        {paymentMethod === 'card' && <span className="text-[var(--accent)] font-bold">✓</span>}
-                      </button>
-
-                      <button
                         onClick={() => setPaymentMethod('cod')}
                         disabled={isProcessingPayment}
                         className={`w-full text-left p-3.5 sm:p-4 rounded-xl border transition flex items-center justify-between cursor-pointer text-xs sm:text-sm ${
@@ -1993,10 +1996,10 @@ export default function DrumPalaceApp() {
                     {isProcessingPayment ? (
                       <>
                         <span className="animate-spin inline-block">◌</span>
-                        <span>Connecting to LivePay…</span>
+                        <span>{paymentMethod === 'cod' ? 'Placing your order…' : 'Connecting to LivePay…'}</span>
                       </>
                     ) : (
-                      <span>Confirm Payment with LivePay</span>
+                      <span>{paymentMethod === 'cod' ? 'Place Order — Pay on Delivery' : 'Confirm Payment with LivePay'}</span>
                     )}
                   </button>
                 </div>
@@ -2654,6 +2657,9 @@ export default function DrumPalaceApp() {
       {/* ========================================================= */}
       {/* FOOTER */}
       {/* ========================================================= */}
+      {/* Customers who have paid can rate the shop */}
+      <StoreRating />
+
       <footer className="border-t border-[var(--line)] py-8 px-4 text-xs text-[var(--muted)] bg-[var(--surface)] pb-24 md:pb-8">
         <div className="shell flex flex-col md:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2.5">

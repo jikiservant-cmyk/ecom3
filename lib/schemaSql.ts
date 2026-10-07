@@ -57,6 +57,9 @@ CREATE TABLE IF NOT EXISTS public.products (
   sound_profile TEXT,
   variants JSONB DEFAULT '["Standard"]'::jsonb,
   free_shipping BOOLEAN DEFAULT TRUE,
+  -- 'imported' items ship from abroad and take longer; the admin flags them so
+  -- customers and dispatch see the difference.
+  origin TEXT DEFAULT 'local' CHECK (origin IN ('local', 'imported')),
   status TEXT DEFAULT 'active' CHECK (status IN ('draft', 'active', 'archived')),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -107,9 +110,24 @@ CREATE TABLE IF NOT EXISTS public.orders (
   currency TEXT DEFAULT 'UGX',
   status TEXT DEFAULT 'Pending' CHECK (status IN ('Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled', 'pending', 'processing', 'shipped', 'delivered', 'cancelled')),
   payment_status TEXT DEFAULT 'Pending' CHECK (payment_status IN ('Pending', 'Paid', 'Failed', 'Refunded', 'pending', 'paid', 'failed', 'refunded')),
+  -- Reason recorded whenever an admin moves payment_status by hand. Manual
+  -- Paid/Refunded writes bypass the gateway, so they must leave a trail.
+  payment_note TEXT,
+  -- How the customer intends to pay. Without this, a Cash-on-Delivery order is
+  -- indistinguishable from an unpaid Mobile Money order, so COD orders sit in
+  -- Pending forever looking like abandoned payments.
+  payment_method TEXT DEFAULT 'momo' CHECK (payment_method IN ('momo', 'cod')),
+  tracking_number TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- For databases created before payment_note existed (CREATE TABLE IF NOT EXISTS
+-- will not add a column to a table that is already there).
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_note TEXT;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_method TEXT DEFAULT 'momo';
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS tracking_number TEXT;
+ALTER TABLE public.products ADD COLUMN IF NOT EXISTS origin TEXT DEFAULT 'local';
 
 -- 8. Order items
 CREATE TABLE IF NOT EXISTS public.order_items (
@@ -170,6 +188,51 @@ CREATE TABLE IF NOT EXISTS public.reviews (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- 12b. Store ratings. Unlike product reviews these rate the shop itself, and
+-- only a customer with at least one PAID order may leave one. The gate is
+-- enforced here as well as in the API so the rule survives a direct
+-- PostgREST insert.
+CREATE TABLE IF NOT EXISTS public.store_ratings (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
+  user_name TEXT NOT NULL,
+  rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+  comment TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  -- One rating per customer: they can change their mind, not spam the score.
+  CONSTRAINT store_ratings_one_per_user UNIQUE (user_id)
+);
+
+-- Refuse a store rating from anyone who has not actually paid for something.
+CREATE OR REPLACE FUNCTION public.store_rating_requires_paid_order()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF COALESCE(auth.role(), '') = 'service_role' THEN
+    RETURN NEW;
+  END IF
+  IF NEW.user_id IS NULL OR NEW.user_id <> auth.uid() THEN
+    RAISE EXCEPTION 'a store rating must belong to the signed-in user' USING ERRCODE = '42501';
+  END IF
+  IF NOT EXISTS (
+    SELECT 1 FROM public.orders o
+     WHERE o.customer_id = NEW.user_id
+       AND o.payment_status = 'Paid'
+  ) THEN
+    RAISE EXCEPTION 'only customers with a completed paid order can rate the store' USING ERRCODE = '42501';
+  END IF
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS store_rating_requires_paid_order ON public.store_ratings;
+CREATE TRIGGER store_rating_requires_paid_order
+  BEFORE INSERT OR UPDATE ON public.store_ratings
+  FOR EACH ROW EXECUTE PROCEDURE public.store_rating_requires_paid_order();
+
 -- 12. Store settings (single row)
 CREATE TABLE IF NOT EXISTS public.store_settings (
   id TEXT PRIMARY KEY DEFAULT 'default_settings',
@@ -227,12 +290,19 @@ GRANT SELECT ON public.categories, public.products, public.product_variants,
   public.product_images, public.reviews, public.store_settings TO anon, authenticated;
 
 -- Checkout writes (RLS narrows these further)
-GRANT SELECT, INSERT ON public.orders TO anon, authenticated;
+-- anon may NOT insert orders: order rows are written only by the server under
+-- the service role. Granting anon INSERT let a caller forge an order with an
+-- arbitrary total (e.g. 1 UGX for a 5,000 UGX cart) and then pay it.
+GRANT SELECT ON public.orders TO anon;
+GRANT SELECT, INSERT ON public.orders TO authenticated;
 GRANT UPDATE, DELETE ON public.orders TO authenticated;
-GRANT SELECT, INSERT ON public.order_items TO anon, authenticated;
+GRANT SELECT ON public.order_items TO anon;
+GRANT SELECT, INSERT ON public.order_items TO authenticated;
 GRANT INSERT ON public.contact_messages TO anon, authenticated;
 GRANT SELECT, UPDATE ON public.contact_messages TO authenticated;
 GRANT INSERT ON public.reviews TO authenticated;
+GRANT SELECT ON public.store_ratings TO anon, authenticated;
+GRANT INSERT, UPDATE ON public.store_ratings TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.wishlists TO authenticated;
 GRANT SELECT, UPDATE ON public.profiles TO authenticated;
 GRANT UPDATE ON public.store_settings TO authenticated;
@@ -311,6 +381,8 @@ CREATE TRIGGER profiles_protect_role
   FOR EACH ROW EXECUTE PROCEDURE public.protect_profile_role();
 
 -- 20. Atomic order creation with stock decrement (used by the API server).
+-- Drop any older signature first so CREATE OR REPLACE can change the argument list.
+DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, TIMESTAMPTZ);
 CREATE OR REPLACE FUNCTION public.create_order_v2(
   p_order_id TEXT,
   p_order_number TEXT,
@@ -320,6 +392,8 @@ CREATE OR REPLACE FUNCTION public.create_order_v2(
   p_customer_phone TEXT,
   p_shipping_address TEXT,
   p_items JSONB,
+  p_subtotal_minor_units BIGINT,
+  p_shipping_minor_units BIGINT,
   p_total_minor_units BIGINT,
   p_created_at TIMESTAMPTZ
 )
@@ -341,7 +415,7 @@ BEGIN
   ) VALUES (
     p_order_id, p_order_number, p_customer_id, p_customer_name, p_customer_email, p_customer_phone,
     jsonb_build_object('address', COALESCE(p_shipping_address, '')), p_items, 'Pending', 'Pending', 'UGX',
-    p_total_minor_units, 0, 0, 0,
+    p_subtotal_minor_units, 0, p_shipping_minor_units, 0,
     p_total_minor_units, ROUND(p_total_minor_units / 100.0, 2), p_created_at, p_created_at
   );
 
@@ -382,7 +456,122 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, TIMESTAMPTZ) TO anon, authenticated;
+-- Revoked from anon: calling the RPC directly writes orders with caller-chosen
+-- totals, bypassing the catalog re-pricing in app/api/orders/route.ts.
+GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) TO authenticated;
+
+-- 20b. CRITICAL — order state may never be supplied by a client.
+-- public.orders is INSERTable by anon/authenticated (guest checkout) and
+-- payment_status is a plain settable column whose CHECK constraint permits
+-- 'Paid'. Without a trigger, any browser holding the public anon key could
+-- PostgREST-insert an order already marked Paid for 1 UGX, defeating the
+-- server-side catalog re-pricing and the webhook-only Paid transition.
+-- Force EVERY insert to Pending regardless of caller: the server's order
+-- creation path (create_order_v2 and the fallback insert) always writes
+-- Pending anyway, so this costs nothing and closes the hole at the database.
+CREATE OR REPLACE FUNCTION public.orders_force_pending()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  NEW.status := 'Pending';
+  NEW.payment_status := 'Pending';
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS orders_force_pending ON public.orders;
+CREATE TRIGGER orders_force_pending
+  BEFORE INSERT ON public.orders
+  FOR EACH ROW EXECUTE PROCEDURE public.orders_force_pending();
+
+-- Payment state advances only via the verified gateway webhook (service role)
+-- or an explicit admin reconciliation. Blocks direct PostgREST writes.
+CREATE OR REPLACE FUNCTION public.orders_protect_payment_status()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF NEW.payment_status IS DISTINCT FROM OLD.payment_status
+     AND COALESCE(auth.role(), '') <> 'service_role'
+     AND NOT public.is_admin() THEN
+    RAISE EXCEPTION 'payment_status changes require the payment service role' USING ERRCODE = '42501';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS orders_protect_payment_status ON public.orders;
+CREATE TRIGGER orders_protect_payment_status
+  BEFORE UPDATE ON public.orders
+  FOR EACH ROW EXECUTE PROCEDURE public.orders_protect_payment_status();
+
+-- Line items may only be attached to an order that is still Pending, so an
+-- attacker cannot grow an already-paid order after the fact.
+CREATE OR REPLACE FUNCTION public.order_items_require_pending_order()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_payment_status TEXT;
+BEGIN
+  IF COALESCE(auth.role(), '') = 'service_role' THEN
+    RETURN NEW;
+  END IF;
+  SELECT o.payment_status INTO v_payment_status
+    FROM public.orders o
+   WHERE o.id = NEW.order_id;
+  IF v_payment_status IS NULL OR v_payment_status <> 'Pending' THEN
+    RAISE EXCEPTION 'cannot modify line items on a paid or missing order' USING ERRCODE = '42501';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS order_items_require_pending_order ON public.order_items;
+CREATE TRIGGER order_items_require_pending_order
+  BEFORE INSERT ON public.order_items
+  FOR EACH ROW EXECUTE PROCEDURE public.order_items_require_pending_order();
+
+-- 20c. Remove LEGACY permissive policies from the pre-audit schema (if present).
+-- The grants were already revoked above, but the policies themselves must go.
+DO $$
+DECLARE
+  r RECORD;
+BEGIN
+  FOR r IN
+    SELECT pol.polname, cls.relname
+    FROM pg_policy pol
+    JOIN pg_class cls ON cls.oid = pol.polrelid
+    JOIN pg_namespace nsp ON nsp.oid = cls.relnamespace
+    WHERE nsp.nspname = 'public'
+      AND pol.polname IN (
+        'Public read categories','Admin manage categories',
+        'Public read products','Admin manage products',
+        'Public read variants','Admin manage variants',
+        'Public read images','Admin manage images',
+        'Public read profiles','Users manage profiles',
+        'Public read orders','Public insert orders','Admin update orders',
+        'Public insert order_items','Public insert payments',
+        'Public insert contact_messages',
+        'Public read/write reviews','Public read/write wishlists',
+        'Public read/write store_settings'
+      )
+  LOOP
+    EXECUTE format('DROP POLICY %I ON public.%I', r.polname, r.relname);
+  END LOOP;
+END $$;
+
+DROP POLICY IF EXISTS "Public read products bucket" ON storage.objects;
+DROP POLICY IF EXISTS "Public insert products bucket" ON storage.objects;
+DROP POLICY IF EXISTS "Public update products bucket" ON storage.objects;
+DROP POLICY IF EXISTS "Public delete products bucket" ON storage.objects;
 
 -- 21. Row Level Security
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
@@ -399,6 +588,7 @@ ALTER TABLE public.reviews ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.store_settings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.carts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.cart_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.store_ratings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.payment_webhook_events ENABLE ROW LEVEL SECURITY;
 
 -- Catalog: public read, admin write
@@ -430,7 +620,7 @@ CREATE POLICY "Profiles self update" ON public.profiles FOR UPDATE TO authentica
 
 -- Orders: server/guest insert allowed (API validates), owner+admin read, admin update/delete
 DROP POLICY IF EXISTS "Orders insert" ON public.orders;
-CREATE POLICY "Orders insert" ON public.orders FOR INSERT WITH CHECK (true);
+CREATE POLICY "Orders insert" ON public.orders FOR INSERT TO authenticated WITH CHECK (public.is_admin());
 DROP POLICY IF EXISTS "Orders owner or admin read" ON public.orders;
 CREATE POLICY "Orders owner or admin read" ON public.orders FOR SELECT TO authenticated USING (customer_id = auth.uid() OR public.is_admin());
 DROP POLICY IF EXISTS "Orders admin update" ON public.orders;
@@ -439,6 +629,11 @@ DROP POLICY IF EXISTS "Orders admin delete" ON public.orders;
 CREATE POLICY "Orders admin delete" ON public.orders FOR DELETE TO authenticated USING (public.is_admin());
 
 -- Order items: only for orders that exist; owner+admin read
+DROP POLICY IF EXISTS "Store ratings public read" ON public.store_ratings;
+CREATE POLICY "Store ratings public read" ON public.store_ratings FOR SELECT USING (true);
+DROP POLICY IF EXISTS "Store ratings own write" ON public.store_ratings;
+CREATE POLICY "Store ratings own write" ON public.store_ratings FOR ALL TO authenticated USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
+
 DROP POLICY IF EXISTS "Order items insert" ON public.order_items;
 CREATE POLICY "Order items insert" ON public.order_items FOR INSERT WITH CHECK (
   EXISTS (SELECT 1 FROM public.orders o WHERE o.id = order_id)

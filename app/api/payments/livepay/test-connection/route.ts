@@ -22,9 +22,19 @@ export async function POST(req: NextRequest) {
   if (!admin) return jsonError('Authentication required', 401);
 
   const apiKey = process.env.LIVEPAY_API_KEY;
-  const secretKey = process.env.LIVEPAY_SECRET_KEY;
   const merchantId = process.env.LIVEPAY_MERCHANT_ID || '';
   let baseUrl = (process.env.LIVEPAY_API_URL || 'https://livepay.me/api').replace(/\/+$/, '');
+
+  if (!merchantId) {
+    return NextResponse.json({
+      success: false,
+      mode: 'live_gateway',
+      status: 'Missing merchant account number',
+      message: 'Set LIVEPAY_MERCHANT_ID (your LivePay account number, e.g. LP2305443309) on the server, then test again.',
+      credentialsDetected: true,
+      documentation: 'https://docs.livepay.me/',
+    });
+  }
 
   let host = '';
   try {
@@ -53,12 +63,14 @@ export async function POST(req: NextRequest) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    const pingRes = await fetch(`${baseUrl}/merchant/status`, {
+    // Per docs.livepay.me: Bearer <API key> only; /check-balance requires BOTH
+    // accountNumber and currency query params.
+    const qs = `?accountNumber=${encodeURIComponent(merchantId)}&currency=UGX`;
+    const pingRes = await fetch(`${baseUrl}/check-balance${qs}`, {
       method: 'GET',
       headers: {
-        Authorization: `Bearer ${secretKey || apiKey}`,
-        'X-API-KEY': apiKey as string,
-        'X-Merchant-ID': merchantId,
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
       },
       signal: controller.signal,
     });

@@ -63,30 +63,53 @@ export async function POST(req: NextRequest) {
     const client = getServerAdminClient();
     if (!client) return jsonError('Reviews are not configured', 503);
 
-    // Verify the reviewer actually purchased this product (any non-cancelled order
-    // containing an item whose name matches the product). Best-effort match on
-    // product name via order_items.
-    let verifiedPurchase = false;
+    // The reviewed product must exist — previously a review could be attached
+    // to any arbitrary productId string.
     const { data: product } = await (client.from('products') as any)
       .select('id, name')
       .eq('id', body.productId)
       .maybeSingle();
-    if (product) {
+    if (!product) return jsonError('Product not found', 404);
+
+    // Verified = THIS reviewer has a non-cancelled order containing THIS
+    // product. The old check passed if the user had any order at all and anyone
+    // anywhere had bought the product, which made the badge trivially inflatable.
+    let verifiedPurchase = false;
+    const { data: ownOrders } = await (client.from('orders') as any)
+      .select('id')
+      .eq('customer_id', auth.userId)
+      .neq('status', 'Cancelled')
+      .limit(500);
+    const ownOrderIds = (ownOrders || []).map((o: any) => o?.id).filter(Boolean);
+    if (ownOrderIds.length > 0) {
       const { count } = await (client.from('order_items') as any)
         .select('id', { count: 'exact', head: true })
+        .in('order_id', ownOrderIds)
         .ilike('product_name', `%${product.name.replace(/[%,_]/g, '')}%`);
-      // We cannot tie anonymous orders to a user reliably without customer_id;
-      // only mark verified when the signed-in user has a matching order.
-      const { count: ownCount } = await (client.from('orders') as any)
-        .select('id', { count: 'exact', head: true })
-        .eq('customer_id', auth.userId)
-        .neq('status', 'Cancelled');
-      verifiedPurchase = Boolean(count && ownCount && count > 0 && ownCount > 0);
+      verifiedPurchase = Boolean(count && count > 0);
+    }
+
+    // Display name for the public review. NEVER derive it from the email: the
+    // local part of an address is PII, and GET /api/reviews is publicly
+    // readable, so the old `email.split('@')[0]` published "john.smith" for
+    // john.smith@gmail.com to anyone.
+    let displayName = 'Drum Palace Customer';
+    try {
+      const { data: profile } = await (client.from('profiles') as any)
+        .select('full_name')
+        .eq('id', auth.userId)
+        .maybeSingle();
+      const fullName = typeof profile?.full_name === 'string' ? profile.full_name.trim() : '';
+      if (fullName && !fullName.includes('@')) {
+        displayName = sanitizeText(fullName, 80) || displayName;
+      }
+    } catch {
+      // Keep the generic label rather than failing the review.
     }
 
     const { error } = await (client.from('reviews') as any).insert({
       product_id: body.productId,
-      user_name: auth.email ? auth.email.split('@')[0] : 'Member',
+      user_name: displayName,
       user_email: null, // do not persist reviewer email
       rating: body.rating,
       comment: sanitizeText(body.comment, 2000),

@@ -8,9 +8,17 @@ type Level = 'debug' | 'info' | 'warn' | 'error';
 function maskPii(value: unknown): unknown {
   if (typeof value !== 'string') return value;
   return value
-    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[email-redacted]')
+    // Deliberately permissive about the local part. A narrow character class
+    // (e.g. [A-Za-z0-9._%+-]) silently lets through legal addresses containing
+    // an apostrophe or other RFC-5322 characters — "o'brien@x.com" would then
+    // be written to the log in full. Anything shaped like x@y.z is masked.
+    // `=`, `,`, `;` and `:` are excluded from the local part so a log field
+    // label such as "email=" is preserved rather than swallowed.
+    .replace(/[^\s@,;:=]+@[^\s@,;:]+\.[^\s@,;:]+/g, '[email-redacted]')
     .replace(/\+?\d[\d\s-]{7,}\d/g, '[phone-redacted]');
 }
+
+export { maskPii };
 
 function emit(level: Level, event: string, fields?: Record<string, unknown>) {
   const line: Record<string, unknown> = {

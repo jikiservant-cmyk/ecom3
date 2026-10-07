@@ -24,6 +24,11 @@ interface RouteLimit {
 // Ordered; first match wins.
 const LIMITS: RouteLimit[] = [
   { match: /^\/api\/health$/, windowMs: MINUTE, max: 120, bucket: 'health' },
+  // Coarse per-IP caps in front of the finer per-IP + per-account throttles the
+  // routes apply themselves (see lib/server/authThrottle.ts).
+  { match: /^\/api\/auth\/login$/, methods: ['POST'], windowMs: MINUTE, max: 15, bucket: 'auth-login' },
+  { match: /^\/api\/auth\/password-reset$/, methods: ['POST'], windowMs: MINUTE, max: 6, bucket: 'auth-reset' },
+  { match: /^\/api\/auth\/register$/, methods: ['POST'], windowMs: MINUTE, max: 6, bucket: 'auth-register' },
   { match: /^\/api\/payments\/livepay\/webhook$/, methods: ['POST'], windowMs: MINUTE, max: 60, bucket: 'webhook' },
   { match: /^\/api\/payments\/livepay\/test-connection$/, methods: ['POST'], windowMs: MINUTE, max: 5, bucket: 'pay-test' },
   { match: /^\/api\/payments\/livepay$/, methods: ['POST'], windowMs: MINUTE, max: 10, bucket: 'pay' },

@@ -2,7 +2,17 @@
 
 > ## Remediation status (2026-09-30, same branch)
 > **All Critical blockers and the High items below have been fixed and
-> re-verified live** (see commit history on `arena/01a0f40a-ecom3`):
+> re-verified live** (see commit history on `arena/01a0f40a-ecom3`), including
+> two follow-up rounds: (a) launch-blocker fixes (server-side catalog
+> re-pricing, checkout shipping-total fix, open-redirect guard, XFF spoofing
+> fix, legacy RLS cleanup, admin payment reconciliation), and (b) a full
+> LivePay re-integration implemented against the OFFICIAL docs
+> (docs.livepay.me, retrieved 2026-10-05): real `X-Webhook-Signature`
+> t=…,v=… scheme with URL-bound signing string, real payload shape
+> (customer_reference/internal_reference/amount), amount reconciliation,
+> retry-safe idempotency, momo-only (no undocumented card endpoint),
+> `/check-balance` connection test, duplicate-reference recovery via
+> `/transaction-status`.
 > SSRF/secret exfiltration removed; authn/authz on every route; hardened RLS
 > schema (`lib/schemaSql.ts`); payments fail closed with DB-sourced amounts;
 > mandatory HMAC webhook verification + idempotency; orders created Pending;
@@ -20,9 +30,9 @@
 
 **Date:** 2026-09-30 · **Branch:** `arena/01a0f40a-ecom3` @ `35ab887`
 **Project:** "Drum Palace" e-commerce storefront (Uganda, UGX)
-**Stack:** Next.js 15.5.23 (App Router, React 19, TypeScript) + Supabase (Postgres/PostgREST, Auth, Storage) + LivePay payment gateway (momo/card)
+**Stack:** Next.js 16.3.8 (App Router, React 19, TypeScript) + Supabase (Postgres/PostgREST, Auth, Storage) + LivePay payment gateway (Mobile Money only — MTN/Airtel, UGX; per docs.livepay.me)
 **Assumed load:** ~10k DAU (from audit template; no load target is documented anywhere in the repo)
-**AI-agent addendum:** Not applicable. `@google/genai` is declared in `package.json` but never imported anywhere; the app contains no LLM/agent functionality.
+**AI-agent addendum:** Not applicable. The app contains no LLM/agent functionality. (The dead `@google/genai` dependency originally noted in N-11 has since been removed from `package.json`; N-11 is retained below as a historical record of that finding.)
 
 ---
 
