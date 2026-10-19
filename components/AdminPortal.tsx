@@ -514,8 +514,15 @@ export default function AdminPortal({
   };
 
   // Order Management Handlers
+  // Goes through PATCH /api/orders: admin-authorised, transition-checked and
+  // audit-logged. Never write orders.status from the browser.
   const handleUpdateOrderStatus = async (orderId: string, status: DbOrder["status"]) => {
-    await updateOrderStatusInDb(orderId, status);
+    const ok = await updateOrderStatusInDb(orderId, status);
+    if (!ok) {
+      showToast(`Could not update order status to "${status}".`);
+      loadData();
+      return;
+    }
     showToast(`Order status updated to "${status}"`);
     loadData();
   };

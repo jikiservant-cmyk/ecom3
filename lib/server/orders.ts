@@ -12,6 +12,7 @@
  * - Order numbers use a CSPRNG alphabet (no Math.random, no 6-digit collisions).
  * - Creation is idempotent per `client_request_id`.
  */
+import { ORDER_STATUS, PAYMENT_STATUS } from '@/lib/status';
 import { randomBytes } from 'crypto';
 import { getServerAdminClient } from './supabaseServer';
 import { logger } from './logging';
@@ -80,6 +81,8 @@ export interface CatalogPriceIndex {
   byId: Map<string, number>;
   /** Authoritative price in minor units, keyed by product name (fallback). */
   byName: Map<string, number>;
+  /** Variant id → its product and its OWN price (variants can differ). */
+  byVariantId: Map<string, { productId: string; priceMinorUnits: number }>;
 }
 
 export interface CatalogValuation {
@@ -159,6 +162,10 @@ export function valueOrderAgainstCatalog(opts: {
 export function buildCatalogPriceIndex(products: any[]): CatalogPriceIndex {
   const byId = new Map<string, number>();
   const byName = new Map<string, number>();
+  // variant id → the product it belongs to and its own price. Two variants of
+  // the same product can differ in price, so a line that names a variant must be
+  // priced from THAT variant, never from whichever one happens to be first.
+  const byVariantId = new Map<string, { productId: string; priceMinorUnits: number }>();
 
   for (const p of products || []) {
     if (!p || p.status !== 'active') continue;
@@ -171,9 +178,15 @@ export function buildCatalogPriceIndex(products: any[]): CatalogPriceIndex {
     if (!primary || !Number.isFinite(price) || price <= 0) continue;
     byId.set(String(p.id), price);
     if (!byName.has(p.name)) byName.set(p.name, price);
+
+    for (const v of active) {
+      const vPrice = Number(v?.price_minor_units);
+      if (!v?.id || !Number.isFinite(vPrice) || vPrice <= 0) continue;
+      byVariantId.set(String(v.id), { productId: String(p.id), priceMinorUnits: vPrice });
+    }
   }
 
-  return { byId, byName };
+  return { byId, byName, byVariantId };
 }
 
 /**
@@ -293,6 +306,12 @@ export function generateOrderId(): string {
 
 export interface OrderItemInput {
   productId?: string | null;
+  /**
+   * The exact product variant the customer selected. When present the server
+   * prices and decrements THIS variant; when absent it uses the product's
+   * primary active variant (legacy carts).
+   */
+  variantId?: string | null;
   productName: string;
   quantity: number;
   /** Major units (UGX). Validated upstream against the catalog; stored for display. */
@@ -468,6 +487,7 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       p_items: input.items.map((it) => ({
         productName: it.productName,
         productId: it.productId || null,
+        variantId: it.variantId || null,
         quantity: it.quantity,
         price: it.price,
         variant: it.variant || 'Standard',
@@ -508,27 +528,34 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
   try {
     const names = [...new Set(input.items.map((it) => it.productName))];
     const { data: variants, error: vErr } = await (client.from('product_variants') as any)
-      .select('product_id, inventory_quantity, status, position, products ( id, name, status )')
+      .select('id, product_id, inventory_quantity, status, position, products ( id, name, status )')
       .eq('status', 'active')
       .in('products.name', names);
     if (vErr) {
       logger.warn('order_stock_precheck_skipped', { error: vErr.message });
     } else {
-      const candidates = new Map<string, { position: number; qty: number }>();
+      // Two lookups: by exact variant id (the option the customer chose) and by
+      // the product's primary variant (legacy callers that do not send one).
+      const byVariantId = new Map<string, number>();
+      const primaryByProduct = new Map<string, { position: number; qty: number }>();
       for (const v of variants || []) {
         const product = (v as any)?.products;
         const name = product?.name;
         if (!name || product?.status !== 'active') continue;
         const position = Number((v as any)?.position) || 0;
         const qty = Number((v as any)?.inventory_quantity) || 0;
-        const current = candidates.get(name);
-        if (!current || position < current.position) candidates.set(name, { position, qty });
+        if ((v as any)?.id) byVariantId.set(String((v as any).id), qty);
+        const current = primaryByProduct.get(name);
+        if (!current || position < current.position) primaryByProduct.set(name, { position, qty });
       }
       for (const item of input.items) {
-        const available = candidates.get(item.productName)?.qty;
+        const available = item.variantId
+          ? byVariantId.get(item.variantId)
+          : primaryByProduct.get(item.productName)?.qty;
         if (available !== undefined && item.quantity > available) {
           logger.warn('order_insufficient_stock_fallback', {
             productName: item.productName,
+            variantId: item.variantId ?? null,
             requested: item.quantity,
             available,
           });
@@ -551,8 +578,8 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       customer_phone: input.customerPhone || null,
       shipping_address: { address: input.shippingAddress || '' },
       items: input.items,
-      status: 'Pending',
-      payment_status: 'Pending',
+      status: ORDER_STATUS.pending,
+      payment_status: PAYMENT_STATUS.pending,
       payment_method: normalisePaymentMethod(input.paymentMethod),
       currency: 'UGX',
       subtotal_minor_units: subtotalMinorUnits,
@@ -594,6 +621,7 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       const itemsPayload = input.items.map((it) => ({
         order_id: orderId,
         product_id: it.productId || null,
+        variant_id: it.variantId || null,
         product_name: it.productName,
         product_slug: it.productName.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
         variant_sku: it.variant || 'Standard',
@@ -606,7 +634,7 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       let { error: itemsError } = await (client.from('order_items') as any).insert(itemsPayload);
       if (itemsError && isMissingColumnError(itemsError)) {
         const retry = await (client.from('order_items') as any).insert(
-          itemsPayload.map((row: Record<string, any>) => withoutKeys(row, ['product_id']))
+          itemsPayload.map((row: Record<string, any>) => withoutKeys(row, ['product_id', 'variant_id']))
         );
         itemsError = retry.error;
       }

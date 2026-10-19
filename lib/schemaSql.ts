@@ -108,8 +108,10 @@ CREATE TABLE IF NOT EXISTS public.orders (
   total_minor_units BIGINT DEFAULT 0,
   total_amount NUMERIC,
   currency TEXT DEFAULT 'UGX',
-  status TEXT DEFAULT 'Pending' CHECK (status IN ('Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled', 'pending', 'processing', 'shipped', 'delivered', 'cancelled')),
-  payment_status TEXT DEFAULT 'Pending' CHECK (payment_status IN ('Pending', 'Paid', 'Failed', 'Refunded', 'pending', 'paid', 'failed', 'refunded')),
+  -- Lowercase vocabulary, matching the live database and lib/status.ts. Mixed
+  -- case in one column breaks every SQL report and WHERE filter.
+  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'shipped', 'delivered', 'cancelled')),
+  payment_status TEXT DEFAULT 'pending' CHECK (payment_status IN ('pending', 'paid', 'failed', 'refunded')),
   -- Reason recorded whenever an admin moves payment_status by hand. Manual
   -- Paid/Refunded writes bypass the gateway, so they must leave a trail.
   payment_note TEXT,
@@ -138,7 +140,7 @@ ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS items JSONB DEFAULT '[]'::jso
 -- payment_status is what the whole money model hangs on: Pending until a
 -- VERIFIED webhook says otherwise. It must exist on databases created before it
 -- (CREATE TABLE IF NOT EXISTS does not add columns to an existing table).
-ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'Pending';
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending';
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS total_amount NUMERIC;
 ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS email TEXT;
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_note TEXT;
@@ -197,6 +199,9 @@ CREATE TABLE IF NOT EXISTS public.order_items (
   -- Immutable catalog identity. Valuation must never depend on a product NAME,
   -- which is neither unique nor stable.
   product_id UUID,
+  -- The exact variant that was bought. Prices live per variant, so the order
+  -- line must record which one, not just the product.
+  variant_id UUID REFERENCES public.product_variants(id) ON DELETE SET NULL,
   product_name TEXT NOT NULL,
   product_slug TEXT,
   variant_sku TEXT,
@@ -208,6 +213,7 @@ CREATE TABLE IF NOT EXISTS public.order_items (
 );
 
 ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS product_id UUID;
+ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS variant_id UUID;
 
 -- 9. Payments — SERVICE ROLE ONLY (no grants to anon/authenticated below)
 CREATE TABLE IF NOT EXISTS public.payments (
@@ -319,7 +325,7 @@ BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM public.orders o
      WHERE o.customer_id = NEW.user_id
-       AND o.payment_status = 'Paid'
+       AND lower(o.payment_status) = 'paid'
   ) THEN
     RAISE EXCEPTION 'only customers with a completed paid order can rate the store' USING ERRCODE = '42501';
   END IF
@@ -409,18 +415,17 @@ GRANT SELECT ON public.categories, public.products, public.product_variants,
 -- anon may NOT insert orders: order rows are written only by the server under
 -- the service role. Granting anon INSERT let a caller forge an order with an
 -- arbitrary total (e.g. 1 UGX for a 5,000 UGX cart) and then pay it.
-GRANT SELECT ON public.orders TO anon;
-GRANT SELECT, INSERT ON public.orders TO authenticated;
-GRANT UPDATE, DELETE ON public.orders TO authenticated;
+-- Orders are READ-ONLY for the browser: no anon grant at all (guest tracking
+-- goes through the API, which returns a PII-redacted view), and signed-in users
+-- read only what RLS shows them. INSERT/UPDATE/DELETE are server-only.
+GRANT SELECT ON public.orders TO authenticated;
 -- Line items are written only by the server (service role). An anon/authenticated
 -- INSERT here let anyone append lines to any pending order, which desynchronised
 -- the order total from its items and could strand a legitimate payment.
 GRANT SELECT ON public.order_items TO authenticated;
-GRANT INSERT ON public.contact_messages TO anon, authenticated;
-GRANT SELECT, UPDATE ON public.contact_messages TO authenticated;
+GRANT SELECT ON public.contact_messages TO authenticated;
 GRANT INSERT ON public.reviews TO authenticated;
 GRANT SELECT ON public.store_ratings TO anon, authenticated;
-GRANT INSERT, UPDATE ON public.store_ratings TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.wishlists TO authenticated;
 GRANT SELECT, UPDATE ON public.profiles TO authenticated;
 GRANT UPDATE ON public.store_settings TO authenticated;
@@ -568,7 +573,7 @@ BEGIN
     total_minor_units, total_amount, pricing_snapshot, refunded_minor_units, created_at, updated_at
   ) VALUES (
     p_order_id, p_order_number, p_client_request_id, p_customer_id, p_customer_name, p_customer_email, p_customer_phone,
-    jsonb_build_object('address', COALESCE(p_shipping_address, '')), p_items, 'Pending', 'Pending',
+    jsonb_build_object('address', COALESCE(p_shipping_address, '')), p_items, 'pending', 'pending',
     CASE WHEN p_payment_method IN ('cod', 'card') THEN p_payment_method ELSE 'momo' END, 'UGX',
     p_subtotal_minor_units, p_discount_minor_units, p_shipping_minor_units, 0,
     p_total_minor_units, p_total_minor_units / 100.0, p_pricing_snapshot, 0, p_created_at, p_created_at
@@ -576,24 +581,12 @@ BEGIN
 
   FOR item IN
     SELECT * FROM jsonb_to_recordset(p_items)
-      AS x("productName" TEXT, "productId" TEXT, quantity INT, price NUMERIC, variant TEXT)
+      AS x("productName" TEXT, "productId" TEXT, "variantId" TEXT, quantity INT, price NUMERIC, variant TEXT)
   LOOP
-    INSERT INTO public.order_items (
-      order_id, product_id, product_name, product_slug, variant_sku, variant_attributes,
-      unit_price_minor_units, quantity, line_total_minor_units, created_at
-    ) VALUES (
-      p_order_id, NULLIF(item."productId", ''), item."productName",
-      regexp_replace(lower(item."productName"), '[^a-z0-9]+', '-', 'g'),
-      COALESCE(item.variant, 'Standard'), jsonb_build_object('variant', COALESCE(item.variant, 'Standard')),
-      ROUND(COALESCE(item.price, 0) * 100)::BIGINT,
-      item.quantity,
-      ROUND(COALESCE(item.price, 0) * 100 * item.quantity)::BIGINT,
-      p_created_at
-    );
-
-    -- Stock: prefer the immutable product id, fall back to the (unique-ish)
-    -- name for legacy callers.
-    v_product_id := NULLIF(item."productId", '')::uuid;
+    -- Resolve the product first: prefer the immutable id, fall back to name for
+    -- legacy callers.
+    v_product_id := CASE WHEN COALESCE(item."productId", '') ~ '^[0-9a-fA-F-]{36}$'
+                         THEN item."productId"::uuid ELSE NULL END;
     IF v_product_id IS NOT NULL THEN
       SELECT p.id INTO v_product_id FROM public.products p
         WHERE p.id = v_product_id AND p.status = 'active' LIMIT 1;
@@ -603,20 +596,57 @@ BEGIN
         WHERE p.name = item."productName" AND p.status = 'active' LIMIT 1;
     END IF;
 
+    v_variant_id := NULL;
     IF v_product_id IS NOT NULL THEN
-      SELECT pv.id INTO v_variant_id FROM public.product_variants pv
-        WHERE pv.product_id = v_product_id AND pv.status = 'active'
-        ORDER BY pv.position ASC LIMIT 1;
+      -- The variant the customer actually chose wins; otherwise the first
+      -- active one. It must belong to this product, or the line is refused.
+      v_variant_id := CASE WHEN COALESCE(item."variantId", '') ~ '^[0-9a-fA-F-]{36}$'
+                           THEN item."variantId"::uuid ELSE NULL END;
       IF v_variant_id IS NOT NULL THEN
-        UPDATE public.product_variants
-           SET inventory_quantity = inventory_quantity - item.quantity,
-               updated_at = NOW()
-         WHERE id = v_variant_id AND inventory_quantity >= item.quantity;
+        PERFORM 1 FROM public.product_variants pv
+          WHERE pv.id = v_variant_id AND pv.product_id = v_product_id AND pv.status = 'active';
         IF NOT FOUND THEN
-          RAISE EXCEPTION 'Insufficient stock for product: %', item."productName" USING ERRCODE = 'P0001';
+          RAISE EXCEPTION 'Selected option is not available for product: %', item."productName" USING ERRCODE = 'P0001';
         END IF;
+      ELSE
+        SELECT pv.id INTO v_variant_id FROM public.product_variants pv
+          WHERE pv.product_id = v_product_id AND pv.status = 'active'
+          ORDER BY pv.position ASC LIMIT 1;
       END IF;
     END IF;
+
+    -- Stock is held against the VARIANT that was bought. The conditional
+    -- UPDATE is the concurrency guard: if another checkout took the last unit
+    -- between our read and this write, zero rows match and we abort the whole
+    -- order rather than overselling.
+    IF v_variant_id IS NOT NULL THEN
+      UPDATE public.product_variants
+         SET inventory_quantity = inventory_quantity - item.quantity,
+             updated_at = NOW()
+       WHERE id = v_variant_id AND inventory_quantity >= item.quantity;
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'Insufficient stock for product: %', item."productName" USING ERRCODE = 'P0001';
+      END IF;
+    END IF;
+
+    -- The order line records exactly which variant was bought, so a later
+    -- price/stock lookup does not have to guess.
+    INSERT INTO public.order_items (
+      order_id, product_id, variant_id, product_name, product_slug, variant_sku, variant_attributes,
+      unit_price_minor_units, quantity, line_total_minor_units, created_at
+    ) VALUES (
+      p_order_id,
+      v_product_id,
+      v_variant_id,
+      item."productName",
+      regexp_replace(lower(item."productName"), '[^a-z0-9]+', '-', 'g'),
+      COALESCE(item.variant, 'Standard'),
+      jsonb_build_object('variant', COALESCE(item.variant, 'Standard')),
+      ROUND(COALESCE(item.price, 0) * 100)::BIGINT,
+      item.quantity,
+      ROUND(COALESCE(item.price, 0) * 100 * item.quantity)::BIGINT,
+      p_created_at
+    );
   END LOOP;
 END;
 $$;
@@ -697,8 +727,8 @@ BEGIN
   UPDATE public.orders
      SET refunded_minor_units = v_new_refunded,
          payment_note = p_reason,
-         payment_status = CASE WHEN v_full THEN 'Refunded' ELSE payment_status END,
-         status = CASE WHEN v_full THEN 'Cancelled' ELSE status END,
+         payment_status = CASE WHEN v_full THEN 'refunded' ELSE payment_status END,
+         status = CASE WHEN v_full THEN 'cancelled' ELSE status END,
          updated_at = p_created_at
    WHERE id = p_order_id;
 
@@ -721,8 +751,8 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
-  NEW.status := 'Pending';
-  NEW.payment_status := 'Pending';
+  NEW.status := 'pending';
+  NEW.payment_status := 'pending';
   NEW.refunded_minor_units := 0;
   RETURN NEW;
 END;
@@ -914,17 +944,18 @@ CREATE POLICY "Profiles self read" ON public.profiles FOR SELECT TO authenticate
 DROP POLICY IF EXISTS "Profiles self update" ON public.profiles;
 CREATE POLICY "Profiles self update" ON public.profiles FOR UPDATE TO authenticated USING (id = auth.uid() OR public.is_admin()) WITH CHECK (id = auth.uid() OR public.is_admin());
 
--- Orders: server/guest insert allowed (API validates), owner+admin read, admin update/delete
+-- Orders: READ-ONLY for the browser. Every write (create, status, settlement,
+-- refund) goes through the API server with the service_role key, so there is
+-- deliberately no INSERT/UPDATE/DELETE policy here and the matching table
+-- grants are revoked. Keeping the owner/admin SELECT policy is what lets a
+-- customer see their own orders and an admin see all of them.
 DROP POLICY IF EXISTS "Orders insert" ON public.orders;
-CREATE POLICY "Orders insert" ON public.orders FOR INSERT TO authenticated WITH CHECK (public.is_admin());
-DROP POLICY IF EXISTS "Orders owner or admin read" ON public.orders;
-CREATE POLICY "Orders owner or admin read" ON public.orders FOR SELECT TO authenticated USING (customer_id = auth.uid() OR public.is_admin());
 DROP POLICY IF EXISTS "Orders admin update" ON public.orders;
-CREATE POLICY "Orders admin update" ON public.orders FOR UPDATE TO authenticated USING (public.is_admin()) WITH CHECK (public.is_admin());
 DROP POLICY IF EXISTS "Orders admin delete" ON public.orders;
-CREATE POLICY "Orders admin delete" ON public.orders FOR DELETE TO authenticated USING (public.is_admin());
+DROP POLICY IF EXISTS "Orders owner or admin read" ON public.orders;
+CREATE POLICY "Orders owner or admin read" ON public.orders FOR SELECT TO authenticated USING (customer_id = auth.uid() OR (SELECT public.is_admin()));
 
--- Order items: only for orders that exist; owner+admin read
+-- Order items: owner+admin read; writes are service_role only.
 DROP POLICY IF EXISTS "Store ratings public read" ON public.store_ratings;
 CREATE POLICY "Store ratings public read" ON public.store_ratings FOR SELECT USING (true);
 DROP POLICY IF EXISTS "Store ratings own write" ON public.store_ratings;
@@ -942,11 +973,12 @@ CREATE POLICY "Order items owner read" ON public.order_items FOR SELECT TO authe
 
 -- Payments: no policies for anon/authenticated (service role only).
 
--- Contact messages: anyone can submit, only admins read/manage
+-- Contact messages: submitted through the rate-limited API (service_role), read
+-- by admins. No anonymous INSERT: a public grant here would let anyone POST
+-- junk straight to PostgREST and skip the spam checks entirely.
 DROP POLICY IF EXISTS "Contact submit" ON public.contact_messages;
-CREATE POLICY "Contact submit" ON public.contact_messages FOR INSERT WITH CHECK (true);
 DROP POLICY IF EXISTS "Contact admin manage" ON public.contact_messages;
-CREATE POLICY "Contact admin manage" ON public.contact_messages FOR ALL TO authenticated USING (public.is_admin()) WITH CHECK (public.is_admin());
+CREATE POLICY "Contact admin read" ON public.contact_messages FOR SELECT TO authenticated USING ((SELECT public.is_admin()));
 
 -- Reviews: public read, signed-in users insert, admin manages
 DROP POLICY IF EXISTS "Reviews public read" ON public.reviews;

@@ -213,6 +213,17 @@ export async function getProductsFromDb(): Promise<ProductItem[]> {
         const reviewsCount = attributes.reviewsCount ? Number(attributes.reviewsCount) : 0;
         const soldCount = attributes.soldCount || 'In Stock';
 
+        const variantOptions = sortedVariants
+          .filter((v: any) => v && v.id && (!v.status || v.status === 'active'))
+          .map((v: any) => ({
+            id: String(v.id),
+            label: String(v.sku || v.attributes?.variant || 'Standard'),
+            price: v.price_minor_units ? Number(v.price_minor_units) / 100 : 0,
+            inStock: v.inventory_quantity === null || v.inventory_quantity === undefined
+              ? true
+              : Number(v.inventory_quantity) > 0,
+          }));
+
         return {
           id: p.id,
           name: p.name || 'Instrument',
@@ -230,6 +241,7 @@ export async function getProductsFromDb(): Promise<ProductItem[]> {
           specs: parsedSpecs,
           soundProfile,
           variants: parsedVariants,
+          variantOptions,
           freeShipping,
         };
       });
@@ -279,6 +291,17 @@ export async function getProductsFromDb(): Promise<ProductItem[]> {
           specs: attributes.specs || {},
           soundProfile: attributes.soundProfile || 'High Definition Audio',
           variants: attributes.variants || ['Standard'],
+          variantOptions: variants
+            .filter((v: any) => v && v.id && (!v.status || v.status === 'active'))
+            .sort((a: any, b: any) => (a.position || 0) - (b.position || 0))
+            .map((v: any) => ({
+              id: String(v.id),
+              label: String(v.sku || v.attributes?.variant || 'Standard'),
+              price: v.price_minor_units ? Number(v.price_minor_units) / 100 : 0,
+              inStock: v.inventory_quantity === null || v.inventory_quantity === undefined
+                ? true
+                : Number(v.inventory_quantity) > 0,
+            })),
           freeShipping: attributes.freeShipping === true,
         };
       });
@@ -610,145 +633,6 @@ export async function deleteProductFromDb(productId: string): Promise<{ success:
 }
 
 /**
- * Create a new order directly in the database (orders, order_items, payments tables)
- */
-export async function createOrderInDb(orderData: {
-  customerName: string;
-  customerEmail: string;
-  items: { productName: string; quantity: number; price: number; variant?: string }[];
-  total: number;
-  paymentMethod?: 'momo' | 'cod' | 'card';
-  shippingAddress?: string;
-  phone?: string;
-  customerId?: string;
-}): Promise<{ success: boolean; orderId?: string; orderNumber?: string; error?: string }> {
-  const orderNumber = generateSecureOrderNumber();
-  const orderId = generateUuid();
-  const createdAt = new Date().toISOString();
-  const totalMinorUnits = Math.round(orderData.total * 100);
-
-  // Strictly check if customerId is a valid UUID to prevent PostgreSQL type 22P02 error
-  const safeCustomerId = isValidUuid(orderData.customerId) ? orderData.customerId : null;
-
-  try {
-    // 1. Insert into database orders table with safe payload.
-    // SECURITY: orders are ALWAYS created Pending. Only a verified payment
-    // webhook may advance payment_status to Paid.
-    const orderPayload: any = {
-      id: orderId,
-      order_number: orderNumber,
-      customer_id: safeCustomerId,
-      customer_email: orderData.customerEmail || 'customer@drumpalace.ug',
-      customer_name: orderData.customerName || 'Valued Musician',
-      customer_phone: orderData.phone || null,
-      shipping_address: { address: orderData.shippingAddress || 'Standard Delivery, Uganda', phone: orderData.phone || null },
-      status: 'Pending',
-      currency: 'UGX',
-      subtotal_minor_units: totalMinorUnits,
-      discount_minor_units: 0,
-      shipping_minor_units: 0,
-      tax_minor_units: 0,
-      total_minor_units: totalMinorUnits,
-      total_amount: orderData.total,
-      payment_status: 'Pending',
-      payment_method: orderData.paymentMethod || 'momo',
-      created_at: createdAt,
-      updated_at: createdAt,
-    };
-
-    let { error: orderError } = await (supabase.from('orders') as any).insert(orderPayload);
-
-    // If initial insert fails (e.g. FK constraint on customer_id or status case check), retry with sanitized fields
-    if (orderError) {
-      console.warn('Orders initial insert notice, retrying with normalized payload:', orderError.message);
-      
-      const retryPayload: any = {
-        id: orderId,
-        order_number: orderNumber,
-        customer_id: null, // Nullify to prevent foreign key errors
-        customer_email: orderData.customerEmail || 'customer@drumpalace.ug',
-        customer_name: orderData.customerName || 'Valued Musician',
-        customer_phone: orderData.phone || null,
-        shipping_address: { address: orderData.shippingAddress || 'Standard Delivery, Uganda', phone: orderData.phone || null },
-        status: 'pending',
-        currency: 'UGX',
-        subtotal_minor_units: totalMinorUnits,
-        total_minor_units: totalMinorUnits,
-        total_amount: orderData.total,
-        payment_status: 'Pending',
-        payment_method: orderData.paymentMethod || 'momo',
-        created_at: createdAt,
-        updated_at: createdAt,
-      };
-
-      const retryRes = await (supabase.from('orders') as any).insert(retryPayload);
-      if (retryRes.error) {
-        console.error('Orders insert fallback error:', retryRes.error);
-        orderError = retryRes.error;
-      } else {
-        orderError = null;
-      }
-    }
-
-    // 2. Insert line items into database order_items table
-    if (orderData.items && orderData.items.length > 0) {
-      const itemsPayload = orderData.items.map((it) => {
-        const itemPriceMinor = Math.round(it.price * 100);
-        return {
-          id: generateUuid(),
-          order_id: orderId,
-          product_name: it.productName,
-          product_slug: it.productName.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
-          variant_sku: it.variant || 'STANDARD',
-          variant_attributes: it.variant ? { variant: it.variant } : {},
-          unit_price_minor_units: itemPriceMinor,
-          quantity: it.quantity,
-          line_total_minor_units: itemPriceMinor * it.quantity,
-          created_at: createdAt,
-        };
-      });
-
-      try {
-        const { error: itemsErr } = await (supabase.from('order_items') as any).insert(itemsPayload);
-        if (itemsErr) {
-          console.warn('Order items insert notice:', itemsErr.message);
-        }
-      } catch (err: any) {
-        console.error('Order items insert exception:', err);
-      }
-    }
-
-    // 3. Insert payment record into database payments table
-    const paymentReference = `LP-UG-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
-    try {
-      await (supabase.from('payments') as any).insert({
-        id: generateUuid(),
-        order_id: orderId,
-        provider: orderData.paymentMethod || 'livepay',
-        provider_reference: paymentReference,
-        status: 'pending',
-        amount_minor_units: totalMinorUnits,
-        currency: 'UGX',
-        raw_payload: {
-          method: orderData.paymentMethod || 'momo',
-          phone: orderData.phone,
-          customer: orderData.customerName,
-        },
-        created_at: createdAt,
-        updated_at: createdAt,
-      });
-    } catch (err: any) {
-      console.warn('Payment insert notice:', err);
-    }
-
-    return { success: true, orderId, orderNumber };
-  } catch (err: any) {
-    console.error('Database createOrderInDb error:', err);
-    return { success: false, error: err?.message || 'Failed to record order in database' };
-  }
-}
-
-/**
  * Save contact inquiry directly into database contact_messages table
  */
 export async function saveContactMessageToDb(data: {
@@ -912,27 +796,43 @@ export async function getOrdersFromDb(): Promise<DbOrder[]> {
 }
 
 /**
- * Update order status directly in database orders table
+ * Update an order's fulfilment status.
+ *
+ * The browser used to write `orders.status` directly with the anon key. That
+ * bypassed every server-side check (admin authorisation, transition rules,
+ * audit trail) and it also wrote Title Case into a lowercase column. The write
+ * now goes through PATCH /api/orders, which is the same audited path the
+ * tracking-number editor already uses.
+ *
+ * `status` accepts any casing so existing callers keep working; the server
+ * normalises it and stores lowercase.
  */
-const ALLOWED_ORDER_STATUSES: DbOrder['status'][] = ['Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled'];
-
-export async function updateOrderStatusInDb(orderId: string, newStatus: DbOrder['status']): Promise<boolean> {
+export async function updateOrderStatusInDb(orderId: string, newStatus: DbOrder['status'] | string): Promise<boolean> {
   try {
-    if (!ALLOWED_ORDER_STATUSES.includes(newStatus)) {
-      console.error('Rejected order status update with disallowed status:', newStatus);
+    let accessToken: string | null = null;
+    try {
+      const { data } = await supabase.auth.getSession();
+      accessToken = data?.session?.access_token || null;
+    } catch {
+      accessToken = null;
+    }
+    if (!accessToken) {
+      console.error('Order status update needs an authenticated admin session.');
       return false;
     }
-    const { error } = await (supabase.from('orders') as any)
-      .update({ status: newStatus, updated_at: new Date().toISOString() })
-      .eq('id', orderId);
-
-    if (error) {
-      console.error('Supabase order update error:', error);
+    const res = await fetch('/api/orders', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify({ orderId, status: String(newStatus).toLowerCase() }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.success) {
+      console.error('Order status update failed:', data?.error || res.status);
       return false;
     }
     return true;
   } catch (err) {
-    console.error('Supabase order update exception:', err);
+    console.error('Order status update exception:', err);
     return false;
   }
 }

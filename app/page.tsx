@@ -55,11 +55,15 @@ interface Product {
   desc: string;
   image: string;
   images?: string[];
+  /** Purchasable options from public.product_variants; price differs per row. */
+  variantOptions?: { id: string; label: string; price: number; inStock: boolean }[];
 }
 
 interface CartItem {
   id: string;
   qty: number;
+  /** The product_variants row the customer chose. Sent to checkout as variantId. */
+  variantId?: string;
 }
 
 interface CategoryInfo {
@@ -133,6 +137,7 @@ export default function DrumPalaceApp() {
   const [activeProductId, setActiveProductId] = useState<string>('');
   const [selectedImageIndex, setSelectedImageIndex] = useState<number>(0);
   const [detailQty, setDetailQty] = useState<number>(1);
+  const [detailVariantId, setDetailVariantId] = useState<string>('');
   // LivePay documents two products: collect-money (MoMo prompt) and
   // card-collection (hosted USD checkout). Cash on Delivery is handled locally.
   const [paymentMethod, setPaymentMethod] = useState<'momo' | 'cod' | 'card'>('momo');
@@ -218,6 +223,7 @@ export default function DrumPalaceApp() {
             desc: p.description || p.subtitle || '',
             image: p.image || PHOTOS.drums,
             images: p.images,
+            variantOptions: p.variantOptions,
           };
         });
         setProducts(mapped);
@@ -476,26 +482,38 @@ export default function DrumPalaceApp() {
     });
   };
 
-  const addToCart = (id: string, qtyToAdd: number = 1) => {
+  /**
+   * The variant is part of the cart identity: the same drum in two different
+   * sizes is two lines with two different prices, and the exact variant id is
+   * what the server prices and decrements.
+   */
+  const defaultVariantId = (prod?: Product): string | undefined => {
+    if (!prod?.variantOptions || prod.variantOptions.length === 0) return undefined;
+    const inStock = prod.variantOptions.find((v) => v.inStock !== false);
+    return (inStock || prod.variantOptions[0]).id;
+  };
+
+  const addToCart = (id: string, qtyToAdd: number = 1, variantId?: string) => {
+    const prod = products.find((p) => p.id === id);
+    const chosenVariant = variantId || defaultVariantId(prod);
     setCart((prev) => {
-      const index = prev.findIndex((item) => item.id === id);
+      const index = prev.findIndex((item) => item.id === id && (item.variantId || undefined) === chosenVariant);
       if (index > -1) {
         const next = [...prev];
         next[index].qty += qtyToAdd;
         return next;
-      } else {
-        return [...prev, { id, qty: qtyToAdd }];
       }
+      return [...prev, { id, qty: qtyToAdd, variantId: chosenVariant }];
     });
-    const prod = products.find((p) => p.id === id);
-    showToast(`Added ${prod?.name || 'item'} to Cart`);
+    const label = prod?.variantOptions?.find((v) => v.id === chosenVariant)?.label;
+    showToast(`Added ${prod?.name || 'item'}${label ? ` (${label})` : ''} to Cart`);
   };
 
-  const updateCartQty = (id: string, delta: number) => {
+  const updateCartQty = (id: string, delta: number, variantId?: string) => {
     setCart((prev) => {
       return prev
         .map((item) => {
-          if (item.id === id) {
+          if (item.id === id && (item.variantId || undefined) === (variantId || undefined)) {
             return { ...item, qty: item.qty + delta };
           }
           return item;
@@ -514,6 +532,12 @@ export default function DrumPalaceApp() {
     ? toMinorUnits(Number(storeSettings.freeShippingThreshold))
     : 0;
 
+  /** Catalog price for one unit of a CART LINE (variant price when one is chosen). */
+  const lineCatalogPrice = (item: CartItem, p: Product): number => {
+    const chosen = item.variantId ? p.variantOptions?.find((v) => v.id === item.variantId) : undefined;
+    return chosen ? chosen.price : p.price;
+  };
+
   const cartPricing = priceOrder({
     lines: cart.flatMap((item) => {
       const p = products.find((prod) => prod.id === item.id);
@@ -522,7 +546,7 @@ export default function DrumPalaceApp() {
         productId: p.id,
         productName: p.name,
         quantity: item.qty,
-        catalogUnitMinorUnits: toMinorUnits(p.price),
+        catalogUnitMinorUnits: toMinorUnits(lineCatalogPrice(item, p)),
       }];
     }),
     deals: storeSettings.hotDeals,
@@ -535,11 +559,11 @@ export default function DrumPalaceApp() {
   const grandTotal = cartPricing.totalMinorUnits / 100;
 
   /** Effective price for one unit of a product (catalog or active promotion). */
-  const effectiveUnitPrice = (p: { id: string; name: string; price: number }) =>
+  const effectiveUnitPrice = (p: { id: string; name: string; price: number }, unitPrice?: number) =>
     resolveUnitPriceMinor({
       productId: p.id,
       productName: p.name,
-      catalogUnitMinorUnits: toMinorUnits(p.price),
+      catalogUnitMinorUnits: toMinorUnits(unitPrice ?? p.price),
       deals: storeSettings.hotDeals,
     }).unitMinorUnits / 100;
 
@@ -763,12 +787,13 @@ export default function DrumPalaceApp() {
       const orderItems = cart.map((item) => {
         const prod = products.find((p) => p.id === item.id);
         return {
-          // productId lets the server price the line by immutable id; price is
-          // sent for display/debug only and is ignored server-side.
+          // productId + variantId let the server price the line from the real
+          // catalog rows. `price` is informational and ignored server-side.
           productId: prod?.id,
+          variantId: item.variantId,
           productName: prod?.name || 'Instrument',
           quantity: item.qty,
-          price: prod?.price || 0,
+          price: prod ? lineCatalogPrice(item, prod) : 0,
         };
       });
 
@@ -1713,7 +1738,10 @@ export default function DrumPalaceApp() {
                 </h1>
                 
                 <div className="text-xl sm:text-2xl md:text-[28px] font-bold text-[var(--accent)] mb-2">
-                  {formatMoney(activeProduct.price)}
+                  {formatMoney(
+                    activeProduct.variantOptions?.find((v) => v.id === (detailVariantId || defaultVariantId(activeProduct)))?.price
+                      ?? activeProduct.price
+                  )}
                 </div>
 
                 <div className="flex items-center gap-2 text-amber-500 text-xs sm:text-sm mb-3 sm:mb-4">
@@ -1727,6 +1755,32 @@ export default function DrumPalaceApp() {
                 <p className="text-xs sm:text-sm md:text-base text-[var(--muted)] leading-relaxed mb-5 sm:mb-6">
                   {activeProduct.desc}
                 </p>
+
+                {activeProduct.variantOptions && activeProduct.variantOptions.length > 1 && (
+                  <>
+                    <h3 className="text-xs sm:text-sm font-bold text-[var(--ink)] mb-1.5 sm:mb-2">Option</h3>
+                    <div className="flex flex-wrap gap-2 mb-5 sm:mb-6">
+                      {activeProduct.variantOptions.map((v) => {
+                        const selected = (detailVariantId || defaultVariantId(activeProduct)) === v.id;
+                        return (
+                          <button
+                            key={v.id}
+                            type="button"
+                            disabled={!v.inStock}
+                            onClick={() => setDetailVariantId(v.id)}
+                            className={`rounded-lg border px-3 py-2 text-xs sm:text-sm transition ${
+                              selected
+                                ? 'border-[var(--accent)] bg-[var(--accent)]/10 text-[var(--accent)] font-semibold'
+                                : 'border-[var(--line)] text-[var(--ink)] hover:border-[var(--accent)]'
+                            } ${!v.inStock ? 'opacity-40 cursor-not-allowed line-through' : ''}`}
+                          >
+                            {v.label} · {formatMoney(v.price)}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
 
                 <h3 className="text-xs sm:text-sm font-bold text-[var(--ink)] mb-1.5 sm:mb-2">Quantity</h3>
                 <div className="flex items-center border border-[var(--line)] rounded-lg overflow-hidden w-36 sm:w-44 bg-[var(--surface)] mb-5 sm:mb-7">
@@ -1749,14 +1803,14 @@ export default function DrumPalaceApp() {
 
                 <div className="flex flex-col sm:flex-row gap-2.5 sm:gap-3">
                   <button
-                    onClick={() => addToCart(activeProduct.id, detailQty)}
+                    onClick={() => addToCart(activeProduct.id, detailQty, detailVariantId || defaultVariantId(activeProduct))}
                     className="flex-1 rounded-xl border border-[var(--accent)] text-[var(--accent)] font-semibold py-3 sm:py-3.5 px-4 hover:bg-[var(--accent)]/10 transition cursor-pointer text-center text-xs sm:text-sm"
                   >
                     🛒 Add to Cart
                   </button>
                   <button
                     onClick={() => {
-                      addToCart(activeProduct.id, detailQty);
+                      addToCart(activeProduct.id, detailQty, detailVariantId || defaultVariantId(activeProduct));
                       navigateTo('checkout');
                     }}
                     className="flex-1 rounded-xl bg-[var(--accent)] text-white font-semibold py-3 sm:py-3.5 px-4 hover:opacity-90 transition cursor-pointer text-center text-xs sm:text-sm shadow-sm"
@@ -1805,7 +1859,7 @@ export default function DrumPalaceApp() {
                     if (!prod) return null;
                     return (
                       <article
-                        key={item.id}
+                        key={`${item.id}:${item.variantId || 'default'}`}
                         className="bg-[var(--surface)] border border-[var(--line)] rounded-xl p-3 sm:p-3.5 flex items-center gap-3 sm:gap-4 shadow-sm"
                       >
                         <div className="relative h-14 w-14 sm:h-20 sm:w-20 rounded-lg overflow-hidden bg-[var(--surface-2)] flex-shrink-0">
@@ -1823,13 +1877,18 @@ export default function DrumPalaceApp() {
                             {prod.name}
                           </h3>
                           <p className="text-xs sm:text-sm font-bold text-[var(--accent)]">
-                            {formatMoney(effectiveUnitPrice(prod))}
+                            {formatMoney(effectiveUnitPrice(prod, lineCatalogPrice(item, prod)))}
                           </p>
+                          {item.variantId && prod.variantOptions?.find((v) => v.id === item.variantId)?.label && (
+                            <p className="text-[11px] text-[var(--muted)]">
+                              {prod.variantOptions.find((v) => v.id === item.variantId)!.label}
+                            </p>
+                          )}
                         </div>
 
                         <div className="flex items-center border border-[var(--line)] rounded-lg overflow-hidden bg-[var(--surface)] flex-shrink-0">
                           <button
-                            onClick={() => updateCartQty(item.id, -1)}
+                            onClick={() => updateCartQty(item.id, -1, item.variantId)}
                             className="w-7 h-7 sm:w-9 sm:h-9 bg-[var(--surface-2)] text-[var(--ink)] font-bold hover:bg-[var(--line)] text-xs sm:text-sm"
                           >
                             −
@@ -1838,7 +1897,7 @@ export default function DrumPalaceApp() {
                             {item.qty}
                           </span>
                           <button
-                            onClick={() => updateCartQty(item.id, 1)}
+                            onClick={() => updateCartQty(item.id, 1, item.variantId)}
                             className="w-7 h-7 sm:w-9 sm:h-9 bg-[var(--surface-2)] text-[var(--ink)] font-bold hover:bg-[var(--line)] text-xs sm:text-sm"
                           >
                             +
@@ -2141,7 +2200,7 @@ export default function DrumPalaceApp() {
                       const prod = products.find((p) => p.id === cItem.id);
                       if (!prod) return null;
                       return (
-                        <div key={cItem.id} className="flex items-center gap-3 bg-[var(--surface)] p-2.5 rounded-lg border border-[var(--line)]">
+                        <div key={`${cItem.id}:${cItem.variantId || 'default'}`} className="flex items-center gap-3 bg-[var(--surface)] p-2.5 rounded-lg border border-[var(--line)]">
                           <div className="relative h-11 w-11 rounded-md overflow-hidden bg-[var(--surface-2)] flex-shrink-0">
                             <Image
                               src={prod.image}
@@ -2153,7 +2212,12 @@ export default function DrumPalaceApp() {
                           </div>
                           <div className="flex-1 min-w-0">
                             <p className="text-xs font-bold text-[var(--ink)] truncate">{prod.name}</p>
-                            <p className="text-[11px] text-[var(--muted)]">Qty: {cItem.qty} × {formatMoney(effectiveUnitPrice(prod))}</p>
+                            <p className="text-[11px] text-[var(--muted)]">
+                              Qty: {cItem.qty} × {formatMoney(effectiveUnitPrice(prod, lineCatalogPrice(cItem, prod)))}
+                              {cItem.variantId && prod.variantOptions?.find((v) => v.id === cItem.variantId)?.label
+                                ? ` · ${prod.variantOptions.find((v) => v.id === cItem.variantId)!.label}`
+                                : ''}
+                            </p>
                           </div>
                         </div>
                       );

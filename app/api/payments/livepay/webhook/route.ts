@@ -15,6 +15,7 @@ import {
   usdMinorFromUgxMinor,
 } from '@/lib/server/livepay';
 import { logger } from '@/lib/server/logging';
+import { ORDER_STATUS, PAYMENT_STATUS, PAYMENT_ROW_STATUS, normaliseOrderStatus } from '@/lib/status';
 
 export const dynamic = 'force-dynamic';
 
@@ -420,7 +421,7 @@ export async function POST(req: NextRequest) {
     const settledMinor = outcome === 'paid' ? paidOrderMinor : 0;
 
     let paymentsQuery = (client.from('payments') as any).update({
-      status: outcome === 'paid' ? 'success' : 'failed',
+      status: outcome === 'paid' ? PAYMENT_ROW_STATUS.success : PAYMENT_ROW_STATUS.failed,
       provider_reference: customerReference || undefined,
       provider_transaction_id: typeof payload.provider_transaction_id === 'string' ? payload.provider_transaction_id : null,
       settled_amount_minor_units: settledMinor,
@@ -439,10 +440,14 @@ export async function POST(req: NextRequest) {
 
     const orderUpdate: Record<string, unknown> = { updated_at: now };
     if (outcome === 'paid') {
-      orderUpdate.payment_status = 'Paid';
-      if (String(order.payment_status || '').toLowerCase() !== 'paid') orderUpdate.status = 'Processing';
+      orderUpdate.payment_status = PAYMENT_STATUS.paid;
+      // Never drag an order backwards: a late duplicate settlement must not
+      // move a shipped or delivered order back to `processing`.
+      if (normaliseOrderStatus(order.status) === ORDER_STATUS.pending) {
+        orderUpdate.status = ORDER_STATUS.processing;
+      }
     } else {
-      orderUpdate.payment_status = 'Failed';
+      orderUpdate.payment_status = PAYMENT_STATUS.failed;
     }
     const { error: upErr } = await (client.from('orders') as any).update(orderUpdate).eq('id', order.id);
     if (upErr) {

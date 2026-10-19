@@ -74,7 +74,7 @@ const CATALOG_TOTAL_MAJOR = CATALOG_TOTAL_MINOR / 100;
 const PAID_ORDER = {
   id: 'order-1',
   order_number: 'DP-AAAA-BBBB',
-  payment_status: 'Pending',
+  payment_status: 'pending',
   total_amount: CATALOG_TOTAL_MAJOR,
   total_minor_units: CATALOG_TOTAL_MINOR,
   currency: 'UGX',
@@ -183,7 +183,7 @@ describe('accepted notifications', () => {
     expect(markerReleased(sink)).toBe(false);
 
     // And the order row was actually updated.
-    const orderUpdate = sink.find((calls) => calls.some((c) => c[0] === 'update' && c[1]?.payment_status === 'Paid'));
+    const orderUpdate = sink.find((calls) => calls.some((c) => c[0] === 'update' && c[1]?.payment_status === 'paid'));
     expect(orderUpdate).toBeTruthy();
   });
 
@@ -197,7 +197,7 @@ describe('accepted notifications', () => {
       currency: 'UGX',
     });
     expect(res.status).toBe(200);
-    const paid = sink.find((calls) => calls.some((c) => c[0] === 'update' && c[1]?.payment_status === 'Paid'));
+    const paid = sink.find((calls) => calls.some((c) => c[0] === 'update' && c[1]?.payment_status === 'paid'));
     expect(paid).toBeUndefined();
   });
 });

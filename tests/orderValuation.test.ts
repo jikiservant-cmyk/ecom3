@@ -5,9 +5,12 @@ import {
   FLAT_DELIVERY_FEE_MINOR_UNITS,
 } from '@/lib/server/orders';
 
+// Product ids are UUIDs in the live database; the route rejects anything else.
+const PRODUCT_ID = '11111111-1111-4111-8111-111111111111';
+
 /** One product at 5,000 UGX = 500,000 minor units. */
 const DRUM = {
-  id: 'prod-1',
+  id: PRODUCT_ID,
   name: 'Engoma Drum',
   status: 'active',
   product_variants: [{ price_minor_units: 500_000, position: 0, status: 'active' }],
@@ -80,7 +83,7 @@ describe('valueOrderAgainstCatalog — legitimate orders still pass', () => {
 
   it('matches by product id when supplied, ignoring a mismatched name', () => {
     const v = valueOrderAgainstCatalog({
-      items: [{ productName: 'Cheap Knockoff', quantity: 1, productId: 'prod-1' }],
+      items: [{ productName: 'Cheap Knockoff', quantity: 1, productId: PRODUCT_ID }],
       prices: index(),
       storedTotalMinorUnits: 500_000 + FLAT_DELIVERY_FEE_MINOR_UNITS,
     });

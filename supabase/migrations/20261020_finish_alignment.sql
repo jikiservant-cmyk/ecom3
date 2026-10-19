@@ -10,9 +10,15 @@
 --
 --   1. CHECK constraint on orders.status  → checkout may already be failing.
 --      Your live table was created with status IN ('pending','paid',
---      'processing','shipped','completed','cancelled','refunded'). The app
---      writes 'Pending' / 'Processing' / 'Delivered'. If that old CHECK is still
---      present, every INSERT into orders is rejected.
+--      'processing','shipped','completed','cancelled','refunded').
+--
+--      RESOLVED DIFFERENTLY AFTER YOUR REVIEW: instead of widening the CHECK to
+--      accept Title Case, the APPLICATION now writes lowercase only
+--      (lib/status.ts). The vocabulary is therefore the DB's own, unchanged in
+--      spirit: 'pending','processing','shipped','delivered','cancelled'.
+--      'paid' and 'refunded' move out of `status` and into `payment_status`,
+--      where they belong. If that old CHECK is still present, every INSERT into
+--      orders is rejected.
 --      Verify:  SELECT pg_get_constraintdef(oid), conname FROM pg_constraint
 --                WHERE conrelid = 'public.orders'::regclass AND contype = 'c';
 --
@@ -103,14 +109,12 @@ DO $add_checks$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='orders_status_valid' AND conrelid='public.orders'::regclass) THEN
     ALTER TABLE public.orders ADD CONSTRAINT orders_status_valid
-      CHECK (status IN ('Pending','Processing','Shipped','Delivered','Cancelled',
-                        'pending','processing','shipped','delivered','cancelled')) NOT VALID;
+      CHECK (status IN ('pending','processing','shipped','delivered','cancelled')) NOT VALID;
   END IF;
 
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='orders_payment_status_valid' AND conrelid='public.orders'::regclass) THEN
     ALTER TABLE public.orders ADD CONSTRAINT orders_payment_status_valid
-      CHECK (payment_status IN ('Pending','Paid','Failed','Refunded',
-                                'pending','paid','failed','refunded')) NOT VALID;
+      CHECK (payment_status IN ('pending','paid','failed','refunded')) NOT VALID;
   END IF;
 
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='payments_status_valid' AND conrelid='public.payments'::regclass) THEN
@@ -136,6 +140,61 @@ BEGIN
   END IF;
 END
 $add_checks$;
+
+-- ---------------------------------------------------------------------------
+-- 1b. Normalise the rows the old code already wrote.
+--
+--    The application used to write 'Pending' / 'Paid' / 'Delivered'. Those rows
+--    are still there, and a mixed-case column silently breaks every report and
+--    every `WHERE status = 'delivered'` filter. This rewrites them ONCE, to the
+--    live lowercase vocabulary. It also moves the two values that never belonged
+--    in `orders.status` (`paid`, `refunded`) into `payment_status`.
+--
+--    Idempotent: a second run matches nothing.
+-- ---------------------------------------------------------------------------
+UPDATE public.orders
+   SET status = CASE lower(trim(status))
+                  WHEN 'pending'     THEN 'pending'
+                  WHEN 'processing'  THEN 'processing'
+                  WHEN 'shipped'     THEN 'shipped'
+                  WHEN 'delivered'   THEN 'delivered'
+                  WHEN 'completed'   THEN 'delivered'
+                  WHEN 'cancelled'   THEN 'cancelled'
+                  WHEN 'canceled'    THEN 'cancelled'
+                  WHEN 'refunded'    THEN 'cancelled'
+                  WHEN 'paid'        THEN 'processing'
+                  ELSE lower(trim(status))
+                END,
+       payment_status = CASE
+                  WHEN lower(trim(status)) = 'paid'     THEN 'paid'
+                  WHEN lower(trim(status)) = 'refunded' THEN 'refunded'
+                  WHEN lower(trim(payment_status)) IN ('paid','success','succeeded','completed') THEN 'paid'
+                  WHEN lower(trim(payment_status)) = 'failed'   THEN 'failed'
+                  WHEN lower(trim(payment_status)) = 'refunded' THEN 'refunded'
+                  ELSE 'pending'
+                END,
+       updated_at = NOW()
+ WHERE status <> lower(trim(status))
+    OR payment_status <> lower(trim(payment_status))
+    OR lower(trim(payment_status)) NOT IN ('pending','paid','failed','refunded');
+
+-- The payments ledger has its own vocabulary: a settled attempt is `success`.
+UPDATE public.payments
+   SET status = CASE lower(trim(status))
+                  WHEN 'paid'       THEN 'success'
+                  WHEN 'succeeded'  THEN 'success'
+                  WHEN 'completed'  THEN 'success'
+                  WHEN 'processing' THEN 'pending'
+                  WHEN 'cancelled'  THEN 'failed'
+                  WHEN 'canceled'   THEN 'failed'
+                  WHEN 'pending'    THEN 'pending'
+                  WHEN 'success'    THEN 'success'
+                  WHEN 'failed'     THEN 'failed'
+                  WHEN 'refunded'   THEN 'refunded'
+                  ELSE 'pending'
+                END,
+       updated_at = NOW()
+ WHERE status <> lower(trim(status));
 
 -- ---------------------------------------------------------------------------
 -- 2. Webhook idempotency.
@@ -241,7 +300,7 @@ BEGIN
     total_minor_units, total_amount, pricing_snapshot, refunded_minor_units, created_at, updated_at
   ) VALUES (
     p_order_id, p_order_number, p_client_request_id, p_customer_id, p_customer_name, p_customer_email, p_customer_phone,
-    jsonb_build_object('address', COALESCE(p_shipping_address, '')), p_items, 'Pending', 'Pending',
+    jsonb_build_object('address', COALESCE(p_shipping_address, '')), p_items, 'pending', 'pending',
     CASE WHEN p_payment_method IN ('cod','card') THEN p_payment_method ELSE 'momo' END, 'UGX',
     p_subtotal_minor_units, p_discount_minor_units, p_shipping_minor_units, 0,
     p_total_minor_units, p_total_minor_units / 100.0, p_pricing_snapshot, 0, p_created_at, p_created_at
@@ -249,25 +308,10 @@ BEGIN
 
   FOR item IN
     SELECT * FROM jsonb_to_recordset(p_items)
-      AS x("productName" TEXT, "productId" TEXT, quantity INT, price NUMERIC, variant TEXT)
+      AS x("productName" TEXT, "productId" TEXT, "variantId" TEXT, quantity INT, price NUMERIC, variant TEXT)
   LOOP
-    INSERT INTO public.order_items (
-      order_id, product_id, product_name, product_slug, variant_sku, variant_attributes,
-      unit_price_minor_units, quantity, line_total_minor_units, created_at
-    ) VALUES (
-      p_order_id,
-      CASE WHEN COALESCE(item."productId", '') ~ '^[0-9a-fA-F-]{36}$' THEN item."productId"::uuid ELSE NULL END,
-      item."productName",
-      regexp_replace(lower(item."productName"), '[^a-z0-9]+', '-', 'g'),
-      COALESCE(item.variant, 'Standard'),
-      jsonb_build_object('variant', COALESCE(item.variant, 'Standard')),
-      ROUND(COALESCE(item.price, 0) * 100)::BIGINT,
-      item.quantity,
-      ROUND(COALESCE(item.price, 0) * 100 * item.quantity)::BIGINT,
-      p_created_at
-    );
-
-    -- Stock: prefer the immutable product id, fall back to name for legacy callers.
+    -- Resolve the product first: prefer the immutable id, fall back to name for
+    -- legacy callers.
     v_product_id := CASE WHEN COALESCE(item."productId", '') ~ '^[0-9a-fA-F-]{36}$'
                          THEN item."productId"::uuid ELSE NULL END;
     IF v_product_id IS NOT NULL THEN
@@ -279,20 +323,57 @@ BEGIN
         WHERE p.name = item."productName" AND p.status = 'active' LIMIT 1;
     END IF;
 
+    v_variant_id := NULL;
     IF v_product_id IS NOT NULL THEN
-      SELECT pv.id INTO v_variant_id FROM public.product_variants pv
-        WHERE pv.product_id = v_product_id AND pv.status = 'active'
-        ORDER BY pv.position ASC LIMIT 1;
+      -- The variant the customer actually chose wins; otherwise the first
+      -- active one. It must belong to this product, or the line is refused.
+      v_variant_id := CASE WHEN COALESCE(item."variantId", '') ~ '^[0-9a-fA-F-]{36}$'
+                           THEN item."variantId"::uuid ELSE NULL END;
       IF v_variant_id IS NOT NULL THEN
-        UPDATE public.product_variants
-           SET inventory_quantity = inventory_quantity - item.quantity,
-               updated_at = NOW()
-         WHERE id = v_variant_id AND inventory_quantity >= item.quantity;
+        PERFORM 1 FROM public.product_variants pv
+          WHERE pv.id = v_variant_id AND pv.product_id = v_product_id AND pv.status = 'active';
         IF NOT FOUND THEN
-          RAISE EXCEPTION 'Insufficient stock for product: %', item."productName" USING ERRCODE = 'P0001';
+          RAISE EXCEPTION 'Selected option is not available for product: %', item."productName" USING ERRCODE = 'P0001';
         END IF;
+      ELSE
+        SELECT pv.id INTO v_variant_id FROM public.product_variants pv
+          WHERE pv.product_id = v_product_id AND pv.status = 'active'
+          ORDER BY pv.position ASC LIMIT 1;
       END IF;
     END IF;
+
+    -- Stock is held against the VARIANT that was bought. The conditional
+    -- UPDATE is the concurrency guard: if another checkout took the last unit
+    -- between our read and this write, zero rows match and we abort the whole
+    -- order rather than overselling.
+    IF v_variant_id IS NOT NULL THEN
+      UPDATE public.product_variants
+         SET inventory_quantity = inventory_quantity - item.quantity,
+             updated_at = NOW()
+       WHERE id = v_variant_id AND inventory_quantity >= item.quantity;
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'Insufficient stock for product: %', item."productName" USING ERRCODE = 'P0001';
+      END IF;
+    END IF;
+
+    -- The order line records exactly which variant was bought, so a later
+    -- price/stock lookup does not have to guess.
+    INSERT INTO public.order_items (
+      order_id, product_id, variant_id, product_name, product_slug, variant_sku, variant_attributes,
+      unit_price_minor_units, quantity, line_total_minor_units, created_at
+    ) VALUES (
+      p_order_id,
+      v_product_id,
+      v_variant_id,
+      item."productName",
+      regexp_replace(lower(item."productName"), '[^a-z0-9]+', '-', 'g'),
+      COALESCE(item.variant, 'Standard'),
+      jsonb_build_object('variant', COALESCE(item.variant, 'Standard')),
+      ROUND(COALESCE(item.price, 0) * 100)::BIGINT,
+      item.quantity,
+      ROUND(COALESCE(item.price, 0) * 100 * item.quantity)::BIGINT,
+      p_created_at
+    );
   END LOOP;
 END;
 $fn$;
@@ -377,8 +458,8 @@ BEGIN
   UPDATE public.orders
      SET refunded_minor_units = v_new_refunded,
          payment_note = p_reason,
-         payment_status = CASE WHEN v_full THEN 'Refunded' ELSE payment_status END,
-         status = CASE WHEN v_full THEN 'Cancelled' ELSE status END,
+         payment_status = CASE WHEN v_full THEN 'refunded' ELSE payment_status END,
+         status = CASE WHEN v_full THEN 'cancelled' ELSE status END,
          updated_at = p_created_at
    WHERE id = p_order_id;
 
@@ -427,8 +508,8 @@ GRANT EXECUTE ON FUNCTION public.is_admin() TO authenticated, service_role;
 CREATE OR REPLACE FUNCTION public.orders_force_pending()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $fn$
 BEGIN
-  NEW.status := 'Pending';
-  NEW.payment_status := 'Pending';
+  NEW.status := 'pending';
+  NEW.payment_status := 'pending';
   NEW.refunded_minor_units := 0;
   RETURN NEW;
 END;
@@ -583,32 +664,111 @@ GRANT SELECT ON public.store_ratings TO anon, authenticated;
 GRANT ALL ON public.reviews, public.store_ratings, public.contact_messages TO service_role;
 
 -- ---------------------------------------------------------------------------
--- 9. Storefront read access. The browser reads the catalog with the public anon
---    key, so those four tables need SELECT for anon. They are already
+-- 9. TIGHTEN the money tables (orders, order_items, payments, refunds).
+--
+--    Your live database currently lets the browser INSERT, UPDATE and DELETE
+--    orders — a public anon key can mark an order Paid, edit a total, or erase
+--    a row. Closing that is the single highest-value change in this file.
+--
+--    AFTER THIS SECTION, THE BROWSER CAN NO LONGER WRITE ANY OF THESE TABLES.
+--    Every write must go through the server (service_role):
+--      create order      → POST  /api/orders        → create_order_v2
+--      admin status      → PATCH /api/orders        (audit-logged)
+--      settlement        → POST  /api/payments/livepay/webhook
+--      refund            → POST  /api/orders/refund → record_refund
+--    Browser code has been updated to match: AdminPortal no longer writes
+--    orders.status directly.
+--
+--    Reads are kept for exactly the two legitimate cases: a signed-in customer
+--    reading their OWN orders, and an admin reading any order.
+-- ---------------------------------------------------------------------------
+
+DO $tighten$
+DECLARE
+  t   TEXT;
+  pol RECORD;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['orders','order_items','payments','refunds'] LOOP
+    CONTINUE WHEN to_regclass('public.' || t) IS NULL;
+
+    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
+
+    -- Drop every existing WRITE policy, whatever its name. A permissive policy
+    -- left behind would silently defeat everything below.
+    FOR pol IN
+      SELECT policyname FROM pg_policies
+       WHERE schemaname = 'public' AND tablename = t
+         AND cmd IN ('INSERT','UPDATE','DELETE','ALL')
+    LOOP
+      EXECUTE format('DROP POLICY %I ON public.%I', pol.policyname, t);
+      RAISE NOTICE 'dropped write policy %.% ', t, pol.policyname;
+    END LOOP;
+
+    -- Drop permissive read policies too; the owner/admin policies below replace
+    -- them. Names are predictable so this is safe to re-run.
+    FOR pol IN
+      SELECT policyname FROM pg_policies
+       WHERE schemaname = 'public' AND tablename = t AND cmd = 'SELECT'
+         AND policyname IN (
+           'Enable read access for all users',
+           'Public read access',
+           'Allow public read',
+           'Orders are viewable by everyone',
+           'Order items are viewable by everyone',
+           'Payments are viewable by everyone'
+         )
+    LOOP
+      EXECUTE format('DROP POLICY %I ON public.%I', pol.policyname, t);
+    END LOOP;
+  END LOOP;
+END
+$tighten$;
+
+-- ---- orders: read your own, or read all as an admin. Nothing else. ----------
+DROP POLICY IF EXISTS "Orders: owner or admin read" ON public.orders;
+CREATE POLICY "Orders: owner or admin read" ON public.orders
+  FOR SELECT TO authenticated
+  USING (customer_id = auth.uid() OR (SELECT public.is_admin()));
+
+-- ---- order_items: readable only through an order you can read. --------------
+DROP POLICY IF EXISTS "Order items: via visible order" ON public.order_items;
+CREATE POLICY "Order items: via visible order" ON public.order_items
+  FOR SELECT TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM public.orders o
+       WHERE o.id = order_items.order_id
+         AND (o.customer_id = auth.uid() OR (SELECT public.is_admin()))
+    )
+  );
+
+-- ---- payments / refunds: no browser policies at all. ------------------------
+-- Deliberately empty: with RLS on and no policy, anon and authenticated see
+-- nothing. The server's service_role key bypasses RLS.
+DROP POLICY IF EXISTS "Payments: owner read" ON public.payments;
+DROP POLICY IF EXISTS "Refunds: owner read" ON public.refunds;
+
+-- ---- Belt and braces: privilege-level revocation. ---------------------------
+-- Even if a policy were added later by mistake, these grants are gone.
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
+  ON public.orders, public.order_items FROM anon, authenticated;
+REVOKE ALL ON public.payments FROM anon, authenticated;
+REVOKE ALL ON public.refunds  FROM anon, authenticated;
+
+-- Reads must still be granted (RLS decides which rows).
+GRANT SELECT ON public.orders, public.order_items TO authenticated;
+GRANT ALL ON public.orders, public.order_items, public.payments, public.refunds TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 10. Storefront read access. The browser reads the catalog with the public
+--    anon key, so those four tables need SELECT for anon. They are already
 --    RLS-enabled on your database; these policies are ADDITIVE (permissive
 --    SELECT policies OR together), so if you already have them this is a no-op.
 -- ---------------------------------------------------------------------------
-DO $catalog_policies$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='products' AND cmd='SELECT') THEN
-    CREATE POLICY "Products public read" ON public.products FOR SELECT USING (true);
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='categories' AND cmd='SELECT') THEN
-    CREATE POLICY "Categories public read" ON public.categories FOR SELECT USING (true);
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='product_variants' AND cmd='SELECT') THEN
-    CREATE POLICY "Variants public read" ON public.product_variants FOR SELECT USING (true);
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='product_images' AND cmd='SELECT') THEN
-    CREATE POLICY "Images public read" ON public.product_images FOR SELECT USING (true);
-  END IF;
-END
-$catalog_policies$;
-
 GRANT SELECT ON public.products, public.categories, public.product_variants, public.product_images TO anon, authenticated;
 
 -- ---------------------------------------------------------------------------
--- 10. VERIFY. Every row must be 'OK'.
+-- 11. VERIFY. Every row must be 'OK'.
 -- ---------------------------------------------------------------------------
 WITH checks(kind, name, ok) AS (
   SELECT 'function', 'create_order_v2',
@@ -636,6 +796,10 @@ WITH checks(kind, name, ok) AS (
   UNION ALL
   SELECT 'constraint', 'payment_webhook_events_event_id_key',
          EXISTS (SELECT 1 FROM pg_constraint WHERE conname='payment_webhook_events_event_id_key')
+  UNION ALL
+  SELECT 'column', 'order_items.variant_id',
+         EXISTS (SELECT 1 FROM information_schema.columns
+                  WHERE table_schema='public' AND table_name='order_items' AND column_name='variant_id')
   UNION ALL
   SELECT 'constraint', 'orders_status_valid',
          EXISTS (SELECT 1 FROM pg_constraint WHERE conname='orders_status_valid')

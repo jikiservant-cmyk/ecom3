@@ -191,8 +191,8 @@ do not exist yet.
 | # | Live database | What the app needs | Consequence if unchanged |
 |---|---|---|---|
 | L1 | `orders` has **no `payment_status`**; payment state is folded into `status` (`paid`, `refunded`, `completed`) | a separate `payment_status` (`Pending`/`Paid`/`Failed`/`Refunded`) | every checkout insert fails (unknown column), refunds and the webhook cannot mark anything Paid |
-| L2 | `orders.status` CHECK allows **lowercase** `pending…refunded`, and has `paid`/`completed` but **no `Delivered`** | `Pending`/`Processing`/`Shipped`/`Delivered`/`Cancelled` | inserts rejected; admin status buttons fail |
-| L3 | `payments.status` CHECK allows `pending/processing/paid/failed/cancelled/refunded` | the ledger writes **`success`** for a settled payment | the settlement update is rejected → payments stay `pending` forever |
+| L2 | `orders.status` CHECK allows **lowercase** `pending…refunded`, and has `paid`/`completed` but **no `Delivered`** | the same **lowercase** vocabulary (`pending`,`processing`,`shipped`,`delivered`,`cancelled`) | inserts rejected for `Delivered`; `paid`/`completed` belong in `payment_status` |
+| L3 | `payments.status` CHECK allows `pending/processing/paid/failed/cancelled/refunded` | the ledger writes **`success`** for a settled payment (a different vocabulary from the order's `paid`) | the settlement update is rejected → payments stay `pending` forever |
 | L4 | No `refunds` table; no `(provider, event_id)` uniqueness on `payment_webhook_events` | refund ledger + idempotent webhooks | refunds 500; a redelivered webhook can be processed twice |
 
 Also missing and created by the schema script: `reviews`, `store_ratings`,
@@ -213,17 +213,21 @@ the five `payments` settlement columns, and a `refunds` table (RLS on, `anon`/
 Deliberately **not** applied: the functions, triggers, policies, broad grants, and the
 tables whose definitions looked incomplete.
 
+**Since then you have also applied the `(provider, event_id)` unique key** on
+`payment_webhook_events`, so redelivered webhooks are deduplicated by the database,
+not only by the handler.
+
 Consequences while it stays that way:
 
 | Still missing | Runtime consequence |
 |---|---|
-| `orders.status` CHECK (legacy values) | **checkout insert may fail** — the app writes `Pending`/`Processing`/`Delivered` |
+| `orders.status` CHECK (legacy `paid`/`completed` values, no `delivered`) | **checkout insert still fails for `delivered`** — the app now writes lowercase only, but the legacy check does not list it |
 | `payments.status` CHECK (legacy values) | settlement writes `success`, which the legacy check rejects |
 | `create_order_v2` | checkout uses the non-atomic fallback: **oversell possible** |
 | guest idempotency index | a retried guest checkout creates a **second order and a second money prompt** |
 | `record_refund` | refunds work via the optimistic fallback, but not in one transaction |
-| `payment_webhook_events` unique key | a redelivered webhook is processed twice |
 | triggers + `is_admin()` | nothing stops a direct PostgREST write from flipping `payment_status` |
+| tightened policies | **the browser can still INSERT/UPDATE/DELETE orders and read payments** with the public anon key |
 | `reviews`, `store_ratings`, `contact_messages` | those three features return 500 |
 
 `supabase/migrations/20261020_finish_alignment.sql` supplies **complete, reviewed**
@@ -251,20 +255,24 @@ definitions for exactly these — that is the file that finishes the job.
 
 Step 2 refuses to run (with a clear message) if step 1 has not been applied, and
 every statement in it is guarded, so it is safe to re-run. **Take a backup first**
-— step 2 rewrites existing `orders.status` values:
+— step 1b rewrites the values the old client wrote. Nothing is re-cased: the
+vocabulary is the database's own, lowercase. What changes is which column holds
+what:
 
-| legacy `status` | new `status` | new `payment_status` |
+| before | after `status` | after `payment_status` |
 |---|---|---|
-| `pending` | `Pending` | `Pending` |
-| `paid` | `Processing` | `Paid` |
-| `processing` | `Processing` | unchanged (`Pending`) |
-| `shipped` | `Shipped` | unchanged |
-| `completed` | `Delivered` | `Paid` |
-| `cancelled` | `Cancelled` | unchanged |
-| `refunded` | `Cancelled` | `Refunded` |
+| `Pending` | `pending` | `pending` |
+| `Processing` | `processing` | unchanged |
+| `Shipped` | `shipped` | unchanged |
+| `Delivered` | `delivered` | unchanged |
+| `Cancelled` | `cancelled` | unchanged |
+| `paid` | `processing` | **`paid`** |
+| `completed` | `delivered` | **`paid`** |
+| `refunded` | `cancelled` | **`refunded`** |
 
 `payments.status`: `paid|succeeded|completed → success`, `processing → pending`,
-`cancelled → failed`.
+`cancelled → failed`. Those rows are the ledger's; the order's own payment state
+is `payment_status`.
 
 ### 6.3 Verify
 
@@ -286,3 +294,77 @@ raises *"column is of type uuid but expression is of type text"*, so the atomic
 path would fail and checkout would silently use the non-atomic fallback. The
 schema and both RPCs now use `UUID`, and the JSONB line-item product id is cast
 explicitly (`::uuid`).
+
+---
+
+## 7. Status vocabulary, variant pricing and write ownership
+
+Three questions were open when the partial run stopped. All three are now closed
+in code, and one of them still needs section 1b above.
+
+### 7.1 One vocabulary, and it is the database's
+
+`lib/status.ts` is the single source of status strings:
+
+```ts
+ORDER_STATUS   = { pending, processing, shipped, delivered, cancelled }
+PAYMENT_STATUS = { pending, paid, failed, refunded }        // orders.payment_status
+PAYMENT_ROW_STATUS = { pending, success, failed, refunded } // payments.status (ledger)
+```
+
+`success` is not a typo and `paid` is not a duplicate: they are two different
+tables with two different meanings. An **order** is *paid*; the **payment row**
+that settled it is *success*. Every write site imports these constants, so a
+literal like `'Pending'` cannot creep back in — `tests/variantAndStatus.test.ts`
+fails the build if one appears in the migration.
+
+Incoming requests are still accepted in any casing (`normaliseOrderStatus`), so
+an old browser tab cannot break checkout, but only the lowercase value is stored.
+
+### 7.2 Checkout takes a `variant_id`, and the server prices it
+
+`POST /api/orders` accepts `variantId` per line:
+
+* it must be a UUID — a malformed id is **rejected**, not ignored (ignoring it
+  would silently fall back to the product's primary price);
+* the variant must exist, be `active`, and belong to the `productId` on the same
+  line — otherwise `400`;
+* that variant's `price_minor_units` becomes the line price. The product's
+  primary price is the fallback only when no variant is named;
+* the client's `price` field is still ignored, and the claimed total must match
+  the server's computation.
+
+`create_order_v2` mirrors this: it resolves the variant, decrements **that
+variant's** `inventory_quantity` with a conditional `UPDATE` (so the last unit
+cannot be sold twice), and records `order_items.variant_id`. The non-atomic
+fallback has the same variant-aware stock pre-check.
+
+The storefront now sends it: `product_variants` are surfaced as
+`variantOptions` on each product, the product page shows an option selector, and
+the cart keeps the variant as part of the line identity (same drum, two sizes =
+two lines).
+
+### 7.3 Every money write is server-side
+
+| Operation | Path | Credential |
+|---|---|---|
+| create order | `POST /api/orders` → `create_order_v2` | `service_role` |
+| settlement | `POST /api/payments/livepay/webhook` | `service_role` |
+| refund | `POST /api/orders/refund` → `record_refund` | `service_role` |
+| admin status / tracking | `PATCH /api/orders` | admin JWT, audit-logged |
+
+The one exception was `AdminPortal`'s status dropdown, which wrote
+`orders.status` straight from the browser with the anon key — and in the wrong
+casing. It now calls `PATCH /api/orders`, like the tracking editor already did.
+
+Section 9 of the migration closes the hole underneath it:
+
+* `orders` and `order_items` keep a **SELECT-only** policy (owner or admin);
+  `INSERT`/`UPDATE`/`DELETE` grants are revoked from `anon` and `authenticated`;
+* `payments` and `refunds` have **no** policies at all for those roles;
+* every existing permissive write policy on the four tables is dropped by name
+  discovery, so a policy someone added by hand cannot survive.
+
+**Order matters:** deploy the application before running section 9, or the admin
+dashboard's status buttons will fail with a permission error (which is the
+correct behaviour, but confusing during a deploy).

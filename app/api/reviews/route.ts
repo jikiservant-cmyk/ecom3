@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { authenticateRequest, getServerAdminClient } from '@/lib/server/supabaseServer';
 import { logger } from '@/lib/server/logging';
 import { readJsonBody, isNonEmptyString, isIntInRange, sanitizeText, jsonError } from '@/lib/server/validation';
+import { ORDER_STATUS } from '@/lib/status';
 
 export const dynamic = 'force-dynamic';
 
@@ -78,7 +79,7 @@ export async function POST(req: NextRequest) {
     const { data: ownOrders } = await (client.from('orders') as any)
       .select('id')
       .eq('customer_id', auth.userId)
-      .neq('status', 'Cancelled')
+      .neq('status', ORDER_STATUS.cancelled)
       .limit(500);
     const ownOrderIds = (ownOrders || []).map((o: any) => o?.id).filter(Boolean);
     if (ownOrderIds.length > 0) {

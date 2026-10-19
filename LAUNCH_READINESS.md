@@ -16,7 +16,8 @@ Rule of thumb: **do not open the store until sections 1–3 are all ticked.** Se
 
 | # | Item | Why it blocks | How to check |
 |---|---|---|---|
-| B1 | Apply `lib/schemaSql.ts` **then** `supabase/migrations/20261020_finish_alignment.sql` (the additive part is already applied; this supplies the functions, triggers, constraints and missing tables) | No RLS, no triggers, no `create_order_v2`, no `record_refund`, and the `orders_payment_method_valid` constraint does not exist, so **card orders fail at insert** | `tools/verify-db.sql` → every row `OK`, and the migration's `bad_rows` all 0 |
+| B1 | Apply `lib/schemaSql.ts` **then** `supabase/migrations/20261020_finish_alignment.sql` (the additive part and the webhook unique key are already applied; this supplies the functions, triggers, constraints, missing tables **and the tightened policies**) | No RLS enforcement, no triggers, no `create_order_v2`, no `record_refund`, and the browser can still write `orders` with the public anon key | `tools/verify-db.sql` → every row `OK`, and the migration's `bad_rows` all 0 |
+| B1a | Deploy the application **before** the policy-tightening section runs | That section revokes browser writes on `orders`/`order_items`; the old admin dashboard wrote `orders.status` directly from the browser | Admin status buttons work after the deploy (they call `PATCH /api/orders`) |
 | B2 | `SUPABASE_SERVICE_ROLE_KEY` set in the host | Checkout, webhook, refunds and admin all return 503 without it (fail-closed by design) | `GET /api/health` shows `serviceRoleConfigured: true` |
 | B3 | `LIVEPAY_API_KEY` + `LIVEPAY_MERCHANT_ID` | MoMo checkout cannot start | `/api/payments/livepay` → not 503 |
 | B4 | `LIVEPAY_WEBHOOK_SECRET` | The webhook rejects all traffic, so **no order ever becomes Paid** | A signed test delivery returns 200 |
@@ -41,7 +42,7 @@ not skip because the tests are green: the tests use a fake database and a fake
 gateway. These are the only checks that exercise the real thing.
 
 - [ ] **MoMo**: place a small order → prompt arrives → approve → order becomes
-      `Paid`/`Processing` within a minute. Confirm the webhook delivery in the
+      `paid`/`processing` within a minute. Confirm the webhook delivery in the
       LivePay dashboard.
 - [ ] **Declined MoMo**: cancel the prompt → order goes `Failed`, not `Paid`.
 - [ ] **Card**: place a small order → redirected to LivePay → pay $1 → returned to

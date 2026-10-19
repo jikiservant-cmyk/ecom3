@@ -28,6 +28,9 @@ import {
   CARD_MIN_MINOR,
 } from '@/lib/server/livepay';
 
+// Product ids are UUIDs in the live database; the route rejects anything else.
+const PRODUCT_ID = '11111111-1111-4111-8111-111111111111';
+
 vi.mock('@/lib/server/supabaseServer', () => ({
   getServerAdminClient: () => (globalThis as any).__fakeClient,
   getServerAnonClient: () => (globalThis as any).__fakeClient,
@@ -43,7 +46,7 @@ const RATE = 3800;
 
 // 100,000 UGX of goods (below the free-delivery threshold) + 10,000 UGX delivery.
 const SNAPSHOT = priceOrder({
-  lines: [{ productId: 'prod-1', productName: 'Engoma Drum', quantity: 1, catalogUnitMinorUnits: 10_000_000 }],
+  lines: [{ productId: PRODUCT_ID, productName: 'Engoma Drum', quantity: 1, catalogUnitMinorUnits: 10_000_000 }],
 });
 
 const CARD_ORDER = {
@@ -54,7 +57,7 @@ const CARD_ORDER = {
   customer_email: 'amina@example.com',
   customer_phone: '256700000111',
   status: 'Pending',
-  payment_status: 'Pending',
+  payment_status: 'pending',
   payment_method: 'card',
   currency: 'UGX',
   subtotal_minor_units: 10_000_000,
@@ -556,7 +559,7 @@ describe('card settlement reconciliation', () => {
     expect(res.status).toBe(200);
     expect(body.received).toBe(true);
 
-    const orderUpdate = sink.find((c) => c.some((x) => x[0] === 'update' && x[1]?.payment_status === 'Paid'));
+    const orderUpdate = sink.find((c) => c.some((x) => x[0] === 'update' && x[1]?.payment_status === 'paid'));
     expect(orderUpdate).toBeTruthy();
   });
 
@@ -575,7 +578,7 @@ describe('card settlement reconciliation', () => {
     expect(res.status).toBe(200);
     expect(body.verified).toBe(false);
     expect(body.reason).toBe('amount mismatch');
-    expect(sink.some((c) => c.some((x) => x[0] === 'update' && x[1]?.payment_status === 'Paid'))).toBe(false);
+    expect(sink.some((c) => c.some((x) => x[0] === 'update' && x[1]?.payment_status === 'paid'))).toBe(false);
   });
 
   it('refuses a card settlement denominated in UGX when the charge was USD', async () => {

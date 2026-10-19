@@ -7,6 +7,14 @@ import {
   isServerSupabaseConfigured,
 } from '@/lib/server/supabaseServer';
 import {
+  ORDER_STATUS,
+  PAYMENT_STATUS,
+  PAYMENT_ROW_STATUS,
+  ADMIN_SETTABLE_ORDER_STATUSES,
+  normaliseOrderStatus,
+  normalisePaymentStatus,
+} from '@/lib/status';
+import {
   createOrderServer,
   buildCatalogPriceIndex,
   ambiguousProductNames,
@@ -26,10 +34,22 @@ import {
 
 export const dynamic = 'force-dynamic';
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const MAX_ITEMS = 50;
 const MAX_QUANTITY = 20;
-const ALLOWED_STATUSES = ['Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled'];
-const ALLOWED_PAYMENT_STATUSES = ['Pending', 'Paid', 'Failed', 'Refunded'];
+/**
+ * The stored vocabulary is lowercase (see lib/status.ts). Requests are accepted
+ * in any casing — the old browser code sent `Pending` — but only the lowercase
+ * value ever reaches the database.
+ */
+const ALLOWED_STATUSES: readonly string[] = ADMIN_SETTABLE_ORDER_STATUSES;
+const ALLOWED_PAYMENT_STATUSES: readonly string[] = [
+  PAYMENT_STATUS.pending,
+  PAYMENT_STATUS.paid,
+  PAYMENT_STATUS.failed,
+  PAYMENT_STATUS.refunded,
+];
 
 /**
  * PII-redacted view for the public order-tracking lookup.
@@ -189,15 +209,37 @@ export async function POST(req: NextRequest) {
     return jsonError(`Order must contain between 1 and ${MAX_ITEMS} items`, 400);
   }
 
-  const items: { productId?: string; productName: string; quantity: number; price: number; variant?: string }[] = [];
+  const items: {
+    productId?: string;
+    variantId?: string;
+    productName: string;
+    quantity: number;
+    price: number;
+    variant?: string;
+  }[] = [];
   for (const raw of body.items) {
     if (!raw || typeof raw !== 'object') return jsonError('Invalid order item', 400);
     if (!isNonEmptyString(raw.productName, 300)) return jsonError('Each item needs a valid product name', 400);
     if (!isIntInRange(raw.quantity, 1, MAX_QUANTITY)) return jsonError('Item quantity must be between 1 and 20', 400);
-    const productId =
-      isNonEmptyString(raw.productId, 64) && /^[A-Za-z0-9_-]{1,64}$/.test(raw.productId) ? raw.productId : undefined;
+    // Product and variant ids are UUIDs in the live catalog. A malformed id is
+    // REFUSED, not silently dropped: dropping it would fall back to a name
+    // lookup (or to the primary variant's price), which is exactly the kind of
+    // substitution a tampered cart is trying to achieve.
+    if (raw.productId !== undefined && raw.productId !== null && raw.productId !== '') {
+      if (!isNonEmptyString(raw.productId, 64) || !UUID_RE.test(raw.productId)) {
+        return jsonError('Invalid product identifier', 400);
+      }
+    }
+    if (raw.variantId !== undefined && raw.variantId !== null && raw.variantId !== '') {
+      if (!isNonEmptyString(raw.variantId, 64) || !UUID_RE.test(raw.variantId)) {
+        return jsonError('Invalid variant identifier', 400);
+      }
+    }
+    const productId = isNonEmptyString(raw.productId, 64) ? raw.productId : undefined;
+    const variantId = isNonEmptyString(raw.variantId, 64) ? raw.variantId : undefined;
     items.push({
       productId,
+      variantId,
       productName: sanitizeText(raw.productName, 300),
       quantity: raw.quantity,
       price: 0, // filled from the catalog below — client prices are never trusted
@@ -251,8 +293,37 @@ export async function POST(req: NextRequest) {
   const ambiguousNames = ambiguousProductNames(catalogProducts);
 
   // Resolve each line's catalog price and effective (promotional) price.
-  const catalogLines: { productId?: string; productName: string; quantity: number; catalogUnitMinorUnits: number }[] = [];
+  const catalogLines: {
+    productId?: string;
+    variantId?: string | null;
+    productName: string;
+    quantity: number;
+    catalogUnitMinorUnits: number;
+  }[] = [];
   for (const item of items) {
+    // ── Variant selection ────────────────────────────────────────────────
+    // A product may have several variants at different prices. If the client
+    // names one, it must exist, be active, and belong to the product it was
+    // offered with — and it becomes both the price source and the stock line.
+    if (item.variantId) {
+      const variant = priceIndex.byVariantId.get(item.variantId);
+      if (!variant) {
+        logger.warn('order_variant_unavailable', { variantId: item.variantId, productId: item.productId });
+        return jsonError(`"${item.productName}" is not available in that option right now.`, 400);
+      }
+      if (item.productId && variant.productId !== item.productId) {
+        // A variant id that belongs to a different product is a client bug or an
+        // attempt to pay one product's price for another.
+        logger.warn('order_variant_product_mismatch', {
+          variantId: item.variantId,
+          productId: item.productId,
+          actualProductId: variant.productId,
+        });
+        return jsonError(`"${item.productName}" is not available in that option right now.`, 400);
+      }
+      item.productId = variant.productId;
+    }
+
     if (!item.productId && ambiguousNames.has(item.productName)) {
       logger.warn('order_ambiguous_product_name', { productName: item.productName });
       return jsonError(
@@ -267,7 +338,9 @@ export async function POST(req: NextRequest) {
       logger.warn('order_product_id_unavailable', { productId: item.productId });
       return jsonError(`"${item.productName}" is not available for purchase right now`, 400);
     }
-    const priceMinor = byId !== undefined ? byId : priceIndex.byName.get(item.productName);
+    // A named variant's own price wins over the product's primary price.
+    const variantPrice = item.variantId ? priceIndex.byVariantId.get(item.variantId)?.priceMinorUnits : undefined;
+    const priceMinor = variantPrice ?? (byId !== undefined ? byId : priceIndex.byName.get(item.productName));
     if (priceMinor === undefined || !Number.isFinite(priceMinor) || priceMinor <= 0) {
       logger.warn('order_unknown_product', { productId: item.productId, productName: item.productName });
       return jsonError(`"${item.productName}" is not available for purchase right now`, 400);
@@ -277,6 +350,7 @@ export async function POST(req: NextRequest) {
     if (item.productId && nameById.has(item.productId)) item.productName = nameById.get(item.productId)!;
     catalogLines.push({
       productId: item.productId,
+      variantId: item.variantId ?? null,
       productName: item.productName,
       quantity: item.quantity,
       catalogUnitMinorUnits: priceMinor,
@@ -342,7 +416,7 @@ export async function POST(req: NextRequest) {
       orderId: result.orderId,
       orderNumber: result.orderNumber,
       total: pricing.totalMinorUnits / 100,
-      status: 'Pending',
+      status: ORDER_STATUS.pending,
     },
     { status: result.idempotent ? 200 : 201 }
   );
@@ -366,29 +440,30 @@ export async function PATCH(req: NextRequest) {
 
   const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
   if (status !== undefined) {
-    if (!ALLOWED_STATUSES.includes(status)) {
+    const normalisedStatus = normaliseOrderStatus(status);
+    if (String(status).trim().toLowerCase() !== normalisedStatus || !ALLOWED_STATUSES.includes(normalisedStatus)) {
       return jsonError(`Status must be one of: ${ALLOWED_STATUSES.join(', ')}`, 400);
     }
-    update.status = status;
+    update.status = normalisedStatus;
   }
   if (paymentStatus !== undefined) {
-    const normalized = String(paymentStatus).charAt(0).toUpperCase() + String(paymentStatus).slice(1).toLowerCase();
-    if (!ALLOWED_PAYMENT_STATUSES.includes(normalized)) {
+    const normalized = normalisePaymentStatus(paymentStatus);
+    if (String(paymentStatus).trim().toLowerCase() !== normalized || !ALLOWED_PAYMENT_STATUSES.includes(normalized)) {
       return jsonError(`paymentStatus must be one of: ${ALLOWED_PAYMENT_STATUSES.join(', ')}`, 400);
     }
-    if (normalized === 'Refunded') {
+    if (normalized === PAYMENT_STATUS.refunded) {
       return jsonError('Use POST /api/orders/refund to record a refund (amount + reason are required).', 400);
     }
-    if (normalized === 'Paid' || normalized === 'Failed') {
+    if (normalized === PAYMENT_STATUS.paid || normalized === PAYMENT_STATUS.failed) {
       const note = isNonEmptyString(body.note, 500) ? sanitizeText(body.note, 500) : '';
-      if (normalized === 'Paid' && note.length < 3) {
+      if (normalized === PAYMENT_STATUS.paid && note.length < 3) {
         return jsonError('A reason is required to manually mark an order as Paid.', 400);
       }
       if (note) update.payment_note = note;
     }
     update.payment_status = normalized;
-    if (normalized === 'Paid' && status === undefined) {
-      update.status = 'Processing';
+    if (normalized === PAYMENT_STATUS.paid && status === undefined) {
+      update.status = ORDER_STATUS.processing;
     }
   }
   if (body.trackingNumber !== undefined) {
@@ -437,7 +512,8 @@ export async function PATCH(req: NextRequest) {
     }
 
     if (
-      status === 'Cancelled' &&
+      status !== undefined &&
+      update.status === ORDER_STATUS.cancelled &&
       currentPayment === 'paid' &&
       Number(existing.refunded_minor_units || 0) < Number(existing.total_minor_units || 0)
     ) {
@@ -459,7 +535,7 @@ export async function PATCH(req: NextRequest) {
 
     // A hand-reconciled payment must still produce a payment record, otherwise
     // the order shows Paid with nothing in the ledger.
-    if (update.payment_status === 'Paid') {
+    if (update.payment_status === PAYMENT_STATUS.paid) {
       try {
         const amount = Number(existing.total_minor_units || 0) - Number(existing.refunded_minor_units || 0);
         if (amount > 0) {
@@ -467,7 +543,7 @@ export async function PATCH(req: NextRequest) {
             order_id: orderId,
             provider: 'manual',
             provider_reference: `MANUAL-${existing.order_number || orderId}`,
-            status: 'success',
+            status: PAYMENT_ROW_STATUS.success,
             amount_minor_units: amount,
             settled_amount_minor_units: amount,
             net_amount_minor_units: amount,

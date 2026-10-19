@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { authenticateRequest, getServerAdminClient } from '@/lib/server/supabaseServer';
 import { logger } from '@/lib/server/logging';
 import { readJsonBody, isIntInRange, isNonEmptyString, sanitizeText, jsonError } from '@/lib/server/validation';
+import { PAYMENT_STATUS } from '@/lib/status';
 
 export const dynamic = 'force-dynamic';
 
@@ -74,7 +75,7 @@ export async function POST(req: NextRequest) {
     const { count: paidCount } = await (client.from('orders') as any)
       .select('id', { count: 'exact', head: true })
       .eq('customer_id', auth.userId)
-      .eq('payment_status', 'Paid');
+      .eq('payment_status', PAYMENT_STATUS.paid);
 
     if (!paidCount || paidCount === 0) {
       return jsonError(

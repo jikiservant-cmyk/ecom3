@@ -18,8 +18,11 @@ import {
 import { valueOrderAgainstCatalog, buildCatalogPriceIndex, ambiguousProductNames } from '@/lib/server/orders';
 import { signLivePayWebhook } from '@/lib/server/webhook';
 
+// Product ids are UUIDs in the live database; the route rejects anything else.
+const PRODUCT_ID = '11111111-1111-4111-8111-111111111111';
+
 const DRUM = {
-  id: 'prod-1',
+  id: PRODUCT_ID,
   name: 'Engoma Drum',
   status: 'active',
   product_variants: [{ price_minor_units: 1_500_000, position: 0, status: 'active' }], // 15,000 UGX
@@ -29,10 +32,10 @@ const DRUM = {
 // MI-06 / MI-07 — promotions are real, bounded, and whole-shilling.
 // ---------------------------------------------------------------------------
 describe('priceOrder — promotions are honoured and can only reduce a price', () => {
-  const lines = [{ productId: 'prod-1', productName: 'Engoma Drum', quantity: 2, catalogUnitMinorUnits: 1_500_000 }];
+  const lines = [{ productId: PRODUCT_ID, productName: 'Engoma Drum', quantity: 2, catalogUnitMinorUnits: 1_500_000 }];
 
   it('applies a percentage deal to the catalog price', () => {
-    const p = priceOrder({ lines, deals: [{ id: 'deal-1', productId: 'prod-1', discountPercent: 10 }] });
+    const p = priceOrder({ lines, deals: [{ id: 'deal-1', productId: PRODUCT_ID, discountPercent: 10 }] });
     expect(p.lines[0].unitMinorUnits).toBe(1_350_000);
     expect(p.discountMinorUnits).toBe(2 * 150_000);
     expect(p.subtotalMinorUnits).toBe(3_000_000);
@@ -41,23 +44,23 @@ describe('priceOrder — promotions are honoured and can only reduce a price', (
   });
 
   it('honours an explicit deal price', () => {
-    const p = priceOrder({ lines, deals: [{ id: 'd', productId: 'prod-1', customPrice: 12000 }] });
+    const p = priceOrder({ lines, deals: [{ id: 'd', productId: PRODUCT_ID, customPrice: 12000 }] });
     expect(p.lines[0].unitMinorUnits).toBe(1_200_000);
   });
 
   it('ignores a deal that would RAISE the price', () => {
-    const p = priceOrder({ lines, deals: [{ productId: 'prod-1', customPrice: 99_000 }] });
+    const p = priceOrder({ lines, deals: [{ productId: PRODUCT_ID, customPrice: 99_000 }] });
     expect(p.lines[0].unitMinorUnits).toBe(1_500_000);
     expect(p.discountMinorUnits).toBe(0);
   });
 
   it('never goes below one shilling', () => {
-    const p = priceOrder({ lines, deals: [{ productId: 'prod-1', discountPercent: 99.99 }] });
+    const p = priceOrder({ lines, deals: [{ productId: PRODUCT_ID, discountPercent: 99.99 }] });
     expect(p.lines[0].unitMinorUnits).toBeGreaterThanOrEqual(100);
   });
 
   it('does not apply an inactive or unrelated deal', () => {
-    expect(priceOrder({ lines, deals: [{ productId: 'prod-1', discountPercent: 50, active: false }] }).totalMinorUnits)
+    expect(priceOrder({ lines, deals: [{ productId: PRODUCT_ID, discountPercent: 50, active: false }] }).totalMinorUnits)
       .toBe(priceOrder({ lines }).totalMinorUnits);
     expect(priceOrder({ lines, deals: [{ productId: 'other', discountPercent: 50 }] }).totalMinorUnits)
       .toBe(priceOrder({ lines }).totalMinorUnits);
@@ -80,8 +83,8 @@ describe('priceOrder — promotions are honoured and can only reduce a price', (
 // ---------------------------------------------------------------------------
 describe('validatePricingSnapshot — a placed order cannot be repriced or forged', () => {
   const pricing: OrderPricing = priceOrder({
-    lines: [{ productId: 'prod-1', productName: 'Engoma Drum', quantity: 1, catalogUnitMinorUnits: 1_500_000 }],
-    deals: [{ id: 'deal-1', productId: 'prod-1', discountPercent: 10 }],
+    lines: [{ productId: PRODUCT_ID, productName: 'Engoma Drum', quantity: 1, catalogUnitMinorUnits: 1_500_000 }],
+    deals: [{ id: 'deal-1', productId: PRODUCT_ID, discountPercent: 10 }],
   });
   const stored = {
     storedSubtotalMinorUnits: pricing.subtotalMinorUnits,
@@ -289,7 +292,7 @@ async function postWebhook(payload: any) {
 }
 
 const SNAPSHOT = priceOrder({
-  lines: [{ productId: 'prod-1', productName: 'Engoma Drum', quantity: 1, catalogUnitMinorUnits: 1_500_000 }],
+  lines: [{ productId: PRODUCT_ID, productName: 'Engoma Drum', quantity: 1, catalogUnitMinorUnits: 1_500_000 }],
 });
 const TOTAL_MINOR = SNAPSHOT.totalMinorUnits; // 2,500,000 (25,000 UGX)
 
@@ -297,7 +300,7 @@ const BASE_ORDER = {
   id: 'order-1',
   order_number: 'DP-AAAA-BBBB',
   status: 'Pending',
-  payment_status: 'Pending',
+  payment_status: 'pending',
   payment_method: 'momo',
   currency: 'UGX',
   subtotal_minor_units: SNAPSHOT.subtotalMinorUnits,
@@ -342,7 +345,7 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 describe('webhook — payment state can never move backwards', () => {
   it('ignores a late "Failed" for an order that is already Paid', async () => {
-    const { sink } = makeClient({ order: { ...BASE_ORDER, payment_status: 'Paid' } });
+    const { sink } = makeClient({ order: { ...BASE_ORDER, payment_status: 'paid' } });
     const res = await postWebhook({
       ...PAID_PAYLOAD,
       status: 'Failed',
@@ -368,7 +371,7 @@ describe('webhook — payment state can never move backwards', () => {
     );
     expect(paymentsUpdate).toBeTruthy();
     const orderUpdate = sink.find((calls) =>
-      calls.some((c) => c[0] === 'update' && c[1]?.payment_status === 'Paid')
+      calls.some((c) => c[0] === 'update' && c[1]?.payment_status === 'paid')
     );
     expect(orderUpdate).toBeTruthy();
   });
@@ -383,7 +386,7 @@ describe('webhook — payment state can never move backwards', () => {
   });
 
   it('does not mark a cancelled order Paid', async () => {
-    makeClient({ order: { ...BASE_ORDER, status: 'Cancelled' } });
+    makeClient({ order: { ...BASE_ORDER, status: 'cancelled' } });
     const res = await postWebhook(PAID_PAYLOAD);
     const body: any = await res.json();
     expect(body.verified).toBe(false);
@@ -391,7 +394,7 @@ describe('webhook — payment state can never move backwards', () => {
   });
 
   it('ignores notifications for a refunded order', async () => {
-    makeClient({ order: { ...BASE_ORDER, payment_status: 'Refunded', refunded_minor_units: TOTAL_MINOR } });
+    makeClient({ order: { ...BASE_ORDER, payment_status: 'refunded', refunded_minor_units: TOTAL_MINOR } });
     const res = await postWebhook(PAID_PAYLOAD);
     const body: any = await res.json();
     expect(body.ignored).toBe('order refunded');
@@ -434,8 +437,8 @@ describe('livepay initiation — state gates and the charge amount', () => {
   });
 
   it.each([
-    ['cancelled order', { status: 'Cancelled' }, /cancelled/i],
-    ['refunded order', { payment_status: 'Refunded', refunded_minor_units: TOTAL_MINOR }, /refunded/i],
+    ['cancelled order', { status: 'cancelled' }, /cancelled/i],
+    ['refunded order', { payment_status: 'refunded', refunded_minor_units: TOTAL_MINOR }, /refunded/i],
     ['delivered order', { status: 'Delivered' }, /dispatched|already/i],
     ['cash-on-delivery order', { payment_method: 'cod' }, /pay on delivery/i],
   ])('refuses a %s', async (_label, patch, pattern) => {
@@ -494,7 +497,7 @@ describe('refund endpoint', () => {
   }
 
   it('requires a reason and a positive whole-shilling amount', async () => {
-    makeClient({ order: { ...BASE_ORDER, payment_status: 'Paid' } });
+    makeClient({ order: { ...BASE_ORDER, payment_status: 'paid' } });
     expect((await refund({ orderId: 'order-1', amount: 100 })).res.status).toBe(400);
     expect((await refund({ orderId: 'order-1', amount: 0, note: 'goodwill' })).res.status).toBe(400);
     expect((await refund({ orderId: 'order-1', amount: 100.5, note: 'goodwill' })).res.status).toBe(400);
@@ -508,13 +511,13 @@ describe('refund endpoint', () => {
   });
 
   it('refuses to refund more than the remaining balance', async () => {
-    makeClient({ order: { ...BASE_ORDER, payment_status: 'Paid', refunded_minor_units: TOTAL_MINOR - 10_000 } });
+    makeClient({ order: { ...BASE_ORDER, payment_status: 'paid', refunded_minor_units: TOTAL_MINOR - 10_000 } });
     const { res } = await refund({ orderId: 'order-1', amount: 1000, note: 'too much' });
     expect(res.status).toBe(400);
   });
 
   it('records a partial refund as a ledger row and a negative payment', async () => {
-    const { sink } = makeClient({ order: { ...BASE_ORDER, payment_status: 'Paid' } });
+    const { sink } = makeClient({ order: { ...BASE_ORDER, payment_status: 'paid' } });
     const { res, body } = await refund({ orderId: 'order-1', amount: 5000, note: 'damaged in transit' });
     expect(res.status).toBe(200);
     expect(body.fullyRefunded).toBe(false);
@@ -526,18 +529,18 @@ describe('refund endpoint', () => {
     );
     expect(negativePayment).toBeTruthy();
     // A partial refund must NOT flip the order to Refunded.
-    const statusFlip = sink.find((calls) => calls.some((c) => c[0] === 'update' && c[1]?.payment_status === 'Refunded'));
+    const statusFlip = sink.find((calls) => calls.some((c) => c[0] === 'update' && c[1]?.payment_status === 'refunded'));
     expect(statusFlip).toBeUndefined();
   });
 
   it('flips to Refunded only when the balance is exhausted', async () => {
     const { sink } = makeClient({
-      order: { ...BASE_ORDER, payment_status: 'Paid', refunded_minor_units: TOTAL_MINOR - 500_000 },
+      order: { ...BASE_ORDER, payment_status: 'paid', refunded_minor_units: TOTAL_MINOR - 500_000 },
     });
     const { res, body } = await refund({ orderId: 'order-1', amount: 5000, note: 'final refund' });
     expect(res.status).toBe(200);
     expect(body.fullyRefunded).toBe(true);
-    const statusFlip = sink.find((calls) => calls.some((c) => c[0] === 'update' && c[1]?.payment_status === 'Refunded'));
+    const statusFlip = sink.find((calls) => calls.some((c) => c[0] === 'update' && c[1]?.payment_status === 'refunded'));
     expect(statusFlip).toBeTruthy();
   });
 });
@@ -552,7 +555,7 @@ describe('order creation route — promotions, snapshot and idempotency', () => 
     phone: '256700000000',
     shippingAddress: 'Kampala Road 12',
     paymentMethod: 'momo',
-    items: [{ productId: 'prod-1', productName: 'Engoma Drum', quantity: 2 }],
+    items: [{ productId: PRODUCT_ID, productName: 'Engoma Drum', quantity: 2 }],
   };
 
   async function create(patch: Record<string, unknown>, headers: Record<string, string> = {}) {
@@ -571,7 +574,7 @@ describe('order creation route — promotions, snapshot and idempotency', () => 
     makeClient({
       products: [DRUM],
       items: [],
-      settings: { hotDeals: [{ id: 'deal-1', productId: 'prod-1', discountPercent: 10, active: true }] },
+      settings: { hotDeals: [{ id: 'deal-1', productId: PRODUCT_ID, discountPercent: 10, active: true }] },
     });
   });
 
@@ -629,7 +632,7 @@ describe('order creation route — promotions, snapshot and idempotency', () => 
       items: [],
       settings: { hotDeals: [], freeShippingThreshold: 500000 },
     });
-    const { res } = await create({ items: [{ productId: 'prod-1', productName: 'Engoma Drum', quantity: 1 }], total: 600_000 });
+    const { res } = await create({ items: [{ productId: PRODUCT_ID, productName: 'Engoma Drum', quantity: 1 }], total: 600_000 });
     expect(res.status).toBe(201);
     const input: any = (globalThis as any).__lastOrderInput;
     expect(input.shippingMinorUnits).toBe(0);

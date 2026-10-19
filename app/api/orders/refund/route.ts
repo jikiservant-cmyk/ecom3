@@ -3,6 +3,7 @@ import { authenticateAdmin, getServerAdminClient } from '@/lib/server/supabaseSe
 import { logger } from '@/lib/server/logging';
 import { readJsonBody, isNonEmptyString, isFiniteNumber, sanitizeText, jsonError } from '@/lib/server/validation';
 import { isWholeShillingMinor, toMinorUnits } from '@/lib/pricing';
+import { ORDER_STATUS, PAYMENT_STATUS } from '@/lib/status';
 
 export const dynamic = 'force-dynamic';
 
@@ -146,8 +147,8 @@ export async function POST(req: NextRequest) {
       updated_at: now,
     };
     if (fullyRefunded) {
-      orderUpdate.payment_status = 'Refunded';
-      orderUpdate.status = 'Cancelled';
+      orderUpdate.payment_status = PAYMENT_STATUS.refunded;
+      orderUpdate.status = ORDER_STATUS.cancelled;
     }
 
     // The guard IS the .eq('refunded_minor_units', alreadyRefunded) below: if
