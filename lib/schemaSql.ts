@@ -492,7 +492,12 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
-  IF NEW.role IS DISTINCT FROM OLD.role AND NOT public.is_admin() THEN
+  -- No JWT (SQL editor / migration / service role) is how the first admin is
+  -- provisioned. Any browser request carries auth.uid() and must already be
+  -- an admin to touch this column.
+  IF NEW.role IS DISTINCT FROM OLD.role
+     AND auth.uid() IS NOT NULL
+     AND NOT public.is_admin() THEN
     RAISE EXCEPTION 'role changes require administrator privileges' USING ERRCODE = '42501';
   END IF;
   RETURN NEW;

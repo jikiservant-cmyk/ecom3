@@ -368,3 +368,23 @@ Section 9 of the migration closes the hole underneath it:
 **Order matters:** deploy the application before running section 9, or the admin
 dashboard's status buttons will fail with a permission error (which is the
 correct behaviour, but confusing during a deploy).
+
+### 7.4 The admin portal's two database dependencies
+
+The portal authenticates properly (server-verified role, throttled sign-in, no
+offline fallback), so the only way in is a `profiles.role = 'admin'` row. Two
+triggers decide whether that is trustworthy:
+
+| Trigger | Without it |
+|---|---|
+| `protect_profile_role` (§7f) | `profiles` allows a user to edit their own row, so a signed-in customer can PATCH `role = 'admin'` and sign into the portal |
+| `handle_new_user` (§7e) | A new sign-up has no profile row: the portal cannot recognise them, and `orders.customer_id REFERENCES profiles(id)` makes their checkout fail |
+
+Both were in `lib/schemaSql.ts` but **not** in the additive half you ran, so they
+are now section 7e/7f of the migration, with the existing users backfilled. The
+role guard permits a role change when the request carries **no** JWT — that is the
+SQL editor, i.e. how the first admin is provisioned:
+
+```sql
+UPDATE public.profiles SET role = 'admin' WHERE email = 'you@example.com';
+```

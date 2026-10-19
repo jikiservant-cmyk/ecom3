@@ -28,6 +28,7 @@ before it.
 | 7 | Register the webhook URL in the LivePay dashboard (B6) | 10 min | Dashboard shows `https://<domain>/api/payments/livepay/webhook` |
 | 8 | Real-money smoke test, section 2: one MoMo order, one decline, one refund, one stock exhaustion | 45 min | Each behaves as listed |
 | 9 | Uptime check on `/api/health` + alert to your phone (M1) | 20 min | Kill the DB URL in a preview env → you get an alert |
+| 10 | Admin portal, section 1a: provision your admin row, sign in, change a status, upload a photo, refund | 30 min | Each row of A1–A7 behaves |
 
 **If you cannot finish the webhook steps (7–8), launch Cash on Delivery only.**
 COD needs no gateway, no webhook and no secret: the order is written `pending`,
@@ -58,6 +59,39 @@ gateway is worse than none, because the customer pays and nothing turns green.
 |---|---|---|
 | B9 | `LIVEPAY_CARD_API_KEY` (`keyId.secret`) | Card calls are 503 without it |
 | B10 | `LIVEPAY_USD_RATE_UGX` set to today's rate | Card checkout answers 422 by design rather than guessing a rate |
+
+---
+
+## 1a. The admin portal
+
+The portal is how you will run the store, so it gets its own list. Authentication
+is the part that is already sound: sign-in goes through a throttled server route,
+the role is read from `public.profiles` with the user's own JWT, every privileged
+route re-checks it, and the old "offline fallback" that accepted any admin profile
+plus a 4-character password is deleted.
+
+| # | Item | Why it matters | How to check |
+|---|---|---|---|
+| A1 | **Install the profile triggers** (`handle_new_user`, `protect_profile_role` — migration §7e/§7f) | Without them: a signed-in customer can PATCH their own `profiles.role` to `admin` and walk into the portal, and a new sign-up has no profile row at all, so that customer cannot check out | The migration's verify query shows both triggers `OK` and "auth users without a profile row" `OK` |
+| A2 | Provision your own admin row | Nothing mints an admin automatically. The trigger intentionally blocks role changes from a browser session | In the SQL editor: `UPDATE public.profiles SET role = 'admin' WHERE email = 'you@example.com';` → verify row says "at least one admin exists" `OK` |
+| A3 | Sign in to the portal on production | Proves A1+A2 and the session plumbing | You land on the dashboard, not the sign-in screen |
+| A4 | Change an order's status from the portal | That write now goes through `PATCH /api/orders` (admin-authorised, audit-logged). It is the one admin action whose implementation changed today | Move an order `processing` → `shipped`; the toast says it worked and the row updates |
+| A5 | Upload a product photo | The bucket policies are admin-only (migration §9b). A public-insert bucket is how storage gets abused | Add a photo to a product, then open the storefront and see it |
+| A6 | Save and delete a product | The portal writes the catalog from the browser with your JWT, which the `is_admin()` policies allow | Create a product, edit its price, delete it |
+| A7 | Issue a refund on a paid order | Requires amount + reason; writes `refunds`, a negative `payments` row and `refunded_minor_units` | The order shows `refunded`, and the refund appears in the ledger |
+
+Known papercuts, not blockers:
+
+* **The portal writes the catalog directly to Supabase, not through
+  `POST /api/products`.** That route exists and is admin-gated, but it calls a
+  helper bound to the anon key, so under strict RLS it would be refused. Use the
+  portal UI; route catalog writes through the API after launch if you want their
+  audit trail.
+* **The portal has no view of the `payments` ledger.** Revenue is computed from
+  orders (paid minus refunded), which is the correct customer-facing figure.
+  Reconciliation against LivePay is done in their dashboard.
+* **`profiles` is readable by any admin**, including other customers' emails.
+  That is the intended admin capability; do not grant `admin` casually.
 
 ---
 
@@ -117,7 +151,7 @@ marked Paid**.
 
 Money handling is now in good shape: pricing is recomputed server-side, totals are
 reconciled against a verified webhook, refunds are atomic, the ledger records
-settlements rather than intents, and 245 tests plus 19 live probes cover the
+settlements rather than intents, and 253 tests plus 19 live probes cover the
 attack surface. But **none of it has ever run against your real database or your
 real LivePay account**, and the schema that makes it safe is still text in a
 file. Apply the schema, set the six environment variables, run one real payment

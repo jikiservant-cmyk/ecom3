@@ -599,6 +599,103 @@ CREATE TRIGGER order_items_require_pending_order BEFORE INSERT ON public.order_i
   FOR EACH ROW EXECUTE PROCEDURE public.order_items_require_pending_order();
 
 -- ---------------------------------------------------------------------------
+-- 7e. New sign-ups get a profile row — and it is ALWAYS 'customer'.
+--
+--    The application deliberately does not create this row itself: registration
+--    posts to Supabase Auth and the trigger does the rest. Without the trigger,
+--    a new user has NO row in public.profiles. That is not cosmetic:
+--      * orders.customer_id REFERENCES profiles(id), so a signed-in customer
+--        with no profile row cannot complete checkout (23503);
+--      * the login route reads the role from profiles, so the admin portal can
+--        never recognise anyone;
+--      * a NULL profile means "customer" by luck, not by design.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $fn$
+BEGIN
+  INSERT INTO public.profiles (id, email, full_name, role)
+  VALUES (
+    new.id,
+    new.email,
+    COALESCE(
+      new.raw_user_meta_data->>'full_name',
+      new.raw_user_meta_data->>'name',
+      split_part(new.email, '@', 1)
+    ),
+    'customer'   -- hard-coded: a sign-up can never choose its own role
+  )
+  ON CONFLICT (id) DO UPDATE
+  SET email = EXCLUDED.email,
+      full_name = COALESCE(EXCLUDED.full_name, public.profiles.full_name);
+  RETURN new;
+END;
+$fn$;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE PROCEDURE public.handle_new_user();
+
+-- Backfill: every existing auth user must have a profile, or that customer
+-- cannot check out and cannot be recognised as an admin.
+INSERT INTO public.profiles (id, email, full_name, role)
+SELECT u.id,
+       u.email,
+       COALESCE(u.raw_user_meta_data->>'full_name',
+                u.raw_user_meta_data->>'name',
+                split_part(COALESCE(u.email, ''), '@', 1)),
+       'customer'
+  FROM auth.users u
+  LEFT JOIN public.profiles p ON p.id = u.id
+ WHERE p.id IS NULL
+ON CONFLICT (id) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- 7f. A customer can never promote themselves.
+--
+--    public.profiles has a self-update policy (you may edit your own name and
+--    phone). Without this trigger, "your own row" also includes the `role`
+--    column — one PostgREST PATCH and a customer is an admin. The function is
+--    SECURITY DEFINER and calls is_admin(), which reads the CALLER's JWT, so an
+--    admin can still promote staff and a customer cannot promote themselves.
+--
+--    NOTE: this is the single most important trigger in this file. It is the
+--    one that protects the admin portal from being entered by anyone who can
+--    sign up.
+--
+--    Bootstrap, in the SQL editor (no JWT => allowed by the guard below):
+--      UPDATE public.profiles SET role = 'admin' WHERE email = 'you@example.com';
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.protect_profile_role()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $fn$
+BEGIN
+  -- A request that carries no user JWT is the SQL editor, a migration or the
+  -- service role: that is how the FIRST admin is provisioned, so it is allowed.
+  -- Every request from a browser carries auth.uid(); those are the ones that
+  -- must be admins already.
+  IF NEW.role IS DISTINCT FROM OLD.role
+     AND auth.uid() IS NOT NULL
+     AND NOT public.is_admin() THEN
+    RAISE EXCEPTION 'role changes require administrator privileges' USING ERRCODE = '42501';
+  END IF;
+  RETURN NEW;
+END;
+$fn$;
+
+DROP TRIGGER IF EXISTS profiles_protect_role ON public.profiles;
+CREATE TRIGGER profiles_protect_role
+  BEFORE UPDATE ON public.profiles
+  FOR EACH ROW EXECUTE PROCEDURE public.protect_profile_role();
+
+-- ---------------------------------------------------------------------------
 -- 8. The three missing tables (wishlists is deliberately NOT created — no app
 --    code reads or writes it).
 --
@@ -760,6 +857,35 @@ GRANT SELECT ON public.orders, public.order_items TO authenticated;
 GRANT ALL ON public.orders, public.order_items, public.payments, public.refunds TO service_role;
 
 -- ---------------------------------------------------------------------------
+-- 9b. Storage: product photos.
+--
+--    AdminPortal uploads product images from the browser, so the bucket needs
+--    policies — and they must be admin-only. A public INSERT policy on
+--    storage.objects lets ANY visitor upload arbitrary files to your bucket
+--    (storage-cost abuse, and a hosting space for anything they like).
+-- ---------------------------------------------------------------------------
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('products', 'products', true)
+ON CONFLICT (id) DO NOTHING;
+
+DROP POLICY IF EXISTS "Public read products bucket"   ON storage.objects;
+DROP POLICY IF EXISTS "Public insert products bucket" ON storage.objects;
+DROP POLICY IF EXISTS "Public update products bucket" ON storage.objects;
+DROP POLICY IF EXISTS "Public delete products bucket" ON storage.objects;
+DROP POLICY IF EXISTS "Admin insert products bucket"  ON storage.objects;
+DROP POLICY IF EXISTS "Admin update products bucket"  ON storage.objects;
+DROP POLICY IF EXISTS "Admin delete products bucket"  ON storage.objects;
+
+CREATE POLICY "Public read products bucket" ON storage.objects
+  FOR SELECT USING (bucket_id = 'products');
+CREATE POLICY "Admin insert products bucket" ON storage.objects
+  FOR INSERT TO authenticated WITH CHECK (bucket_id = 'products' AND (SELECT public.is_admin()));
+CREATE POLICY "Admin update products bucket" ON storage.objects
+  FOR UPDATE TO authenticated USING (bucket_id = 'products' AND (SELECT public.is_admin()));
+CREATE POLICY "Admin delete products bucket" ON storage.objects
+  FOR DELETE TO authenticated USING (bucket_id = 'products' AND (SELECT public.is_admin()));
+
+-- ---------------------------------------------------------------------------
 -- 10. Storefront read access. The browser reads the catalog with the public
 --    anon key, so those four tables need SELECT for anon. They are already
 --    RLS-enabled on your database; these policies are ADDITIVE (permissive
@@ -790,6 +916,27 @@ WITH checks(kind, name, ok) AS (
   UNION ALL
   SELECT 'trigger', 'order_items_require_pending_order',
          EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='order_items_require_pending_order')
+  UNION ALL
+  SELECT 'trigger', 'profiles_protect_role',
+         EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='profiles_protect_role')
+  UNION ALL
+  SELECT 'trigger', 'on_auth_user_created',
+         EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='on_auth_user_created')
+  UNION ALL
+  SELECT 'policy', 'storage admin insert (products)',
+         EXISTS (SELECT 1 FROM pg_policies
+                  WHERE schemaname='storage' AND tablename='objects'
+                    AND policyname='Admin insert products bucket')
+  UNION ALL
+  SELECT 'data', 'at least one admin exists',
+         EXISTS (SELECT 1 FROM public.profiles WHERE role = 'admin')
+  UNION ALL
+  SELECT 'data', 'auth users without a profile row',
+         NOT EXISTS (
+           SELECT 1 FROM auth.users u
+             LEFT JOIN public.profiles p ON p.id = u.id
+            WHERE p.id IS NULL
+         )
   UNION ALL
   SELECT 'index', 'idx_orders_customer_request_id',
          EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_orders_customer_request_id')
