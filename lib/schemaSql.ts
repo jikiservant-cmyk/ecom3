@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS public.categories (
 
 -- 4. Products
 CREATE TABLE IF NOT EXISTS public.products (
-  id TEXT PRIMARY KEY,
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name TEXT NOT NULL,
   slug TEXT NOT NULL,
   description TEXT,
@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS public.products (
 -- 5. Product variants
 CREATE TABLE IF NOT EXISTS public.product_variants (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  product_id TEXT REFERENCES public.products(id) ON DELETE CASCADE,
+  product_id UUID REFERENCES public.products(id) ON DELETE CASCADE,
   sku TEXT NOT NULL,
   attributes JSONB DEFAULT '{}'::jsonb,
   price_minor_units BIGINT NOT NULL DEFAULT 0,
@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS public.product_variants (
 -- 6. Product images
 CREATE TABLE IF NOT EXISTS public.product_images (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  product_id TEXT REFERENCES public.products(id) ON DELETE CASCADE,
+  product_id UUID REFERENCES public.products(id) ON DELETE CASCADE,
   storage_path TEXT NOT NULL,
   alt_text TEXT,
   position INTEGER DEFAULT 0,
@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS public.product_images (
 
 -- 7. Orders
 CREATE TABLE IF NOT EXISTS public.orders (
-  id TEXT PRIMARY KEY,
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   order_number TEXT UNIQUE NOT NULL,
   customer_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
   customer_name TEXT NOT NULL,
@@ -134,6 +134,13 @@ CREATE TABLE IF NOT EXISTS public.orders (
 
 -- For databases created before payment_note existed (CREATE TABLE IF NOT EXISTS
 -- will not add a column to a table that is already there).
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS items JSONB DEFAULT '[]'::jsonb;
+-- payment_status is what the whole money model hangs on: Pending until a
+-- VERIFIED webhook says otherwise. It must exist on databases created before it
+-- (CREATE TABLE IF NOT EXISTS does not add columns to an existing table).
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'Pending';
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS total_amount NUMERIC;
+ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS email TEXT;
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_note TEXT;
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS refunded_minor_units BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS pricing_snapshot JSONB;
@@ -186,10 +193,10 @@ END $$;
 -- 8. Order items
 CREATE TABLE IF NOT EXISTS public.order_items (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  order_id TEXT REFERENCES public.orders(id) ON DELETE CASCADE,
+  order_id UUID REFERENCES public.orders(id) ON DELETE CASCADE,
   -- Immutable catalog identity. Valuation must never depend on a product NAME,
   -- which is neither unique nor stable.
-  product_id TEXT,
+  product_id UUID,
   product_name TEXT NOT NULL,
   product_slug TEXT,
   variant_sku TEXT,
@@ -200,12 +207,12 @@ CREATE TABLE IF NOT EXISTS public.order_items (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS product_id TEXT;
+ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS product_id UUID;
 
 -- 9. Payments — SERVICE ROLE ONLY (no grants to anon/authenticated below)
 CREATE TABLE IF NOT EXISTS public.payments (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  order_id TEXT REFERENCES public.orders(id) ON DELETE SET NULL,
+  order_id UUID REFERENCES public.orders(id) ON DELETE SET NULL,
   provider TEXT DEFAULT 'livepay',
   provider_reference TEXT,
   status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'success', 'failed', 'refunded')),
@@ -237,7 +244,7 @@ ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ;
 --     in public.payments. Service role only, like public.payments.
 CREATE TABLE IF NOT EXISTS public.refunds (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  order_id TEXT NOT NULL REFERENCES public.orders(id) ON DELETE CASCADE,
+  order_id UUID NOT NULL REFERENCES public.orders(id) ON DELETE CASCADE,
   amount_minor_units BIGINT NOT NULL CHECK (amount_minor_units > 0 AND amount_minor_units % 100 = 0),
   currency TEXT NOT NULL DEFAULT 'UGX',
   status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('pending', 'completed', 'failed')),
@@ -264,14 +271,14 @@ CREATE TABLE IF NOT EXISTS public.contact_messages (
 CREATE TABLE IF NOT EXISTS public.wishlists (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
-  product_id TEXT REFERENCES public.products(id) ON DELETE CASCADE,
+  product_id UUID REFERENCES public.products(id) ON DELETE CASCADE,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(user_id, product_id)
 );
 
 CREATE TABLE IF NOT EXISTS public.reviews (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  product_id TEXT REFERENCES public.products(id) ON DELETE CASCADE,
+  product_id UUID REFERENCES public.products(id) ON DELETE CASCADE,
   user_name TEXT NOT NULL,
   user_email TEXT,
   rating INTEGER CHECK (rating >= 1 AND rating <= 5),
@@ -344,7 +351,7 @@ CREATE TABLE IF NOT EXISTS public.carts (
 CREATE TABLE IF NOT EXISTS public.cart_items (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   cart_id UUID REFERENCES public.carts(id) ON DELETE CASCADE,
-  product_id TEXT REFERENCES public.products(id) ON DELETE CASCADE,
+  product_id UUID REFERENCES public.products(id) ON DELETE CASCADE,
   quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity > 0),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -498,7 +505,7 @@ DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEX
 DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ);
 DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TIMESTAMPTZ);
 CREATE OR REPLACE FUNCTION public.create_order_v2(
-  p_order_id TEXT,
+  p_order_id UUID,
   p_order_number TEXT,
   p_customer_id UUID,
   p_customer_name TEXT,
@@ -522,7 +529,7 @@ SET search_path = public
 AS $$
 DECLARE
   item RECORD;
-  v_product_id TEXT;
+  v_product_id UUID;
   v_variant_id UUID;
 BEGIN
   -- SERVER-ONLY. This function is SECURITY DEFINER, so an EXECUTE grant to
@@ -586,7 +593,7 @@ BEGIN
 
     -- Stock: prefer the immutable product id, fall back to the (unique-ish)
     -- name for legacy callers.
-    v_product_id := NULLIF(item."productId", '');
+    v_product_id := NULLIF(item."productId", '')::uuid;
     IF v_product_id IS NOT NULL THEN
       SELECT p.id INTO v_product_id FROM public.products p
         WHERE p.id = v_product_id AND p.status = 'active' LIMIT 1;
@@ -616,8 +623,8 @@ $$;
 
 -- EXECUTE is for the service role ONLY. Order rows are written by the API
 -- server, never by a browser holding a user JWT.
-REVOKE ALL ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ) TO service_role;
+REVOKE ALL ON FUNCTION public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ) TO service_role;
 
 -- 20a2. Atomic refund recording (server only).
 -- Two concurrent refunds (double click, two admin tabs, a retried request) must
@@ -626,7 +633,7 @@ GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, T
 -- the balance re-checked inside the transaction, and the ledger rows written
 -- with the counter.
 CREATE OR REPLACE FUNCTION public.record_refund(
-  p_order_id TEXT,
+  p_order_id UUID,
   p_amount_minor_units BIGINT,
   p_reason TEXT,
   p_actor_id UUID,
@@ -699,8 +706,8 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.record_refund(TEXT, BIGINT, TEXT, UUID, TEXT, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.record_refund(TEXT, BIGINT, TEXT, UUID, TEXT, TEXT, TIMESTAMPTZ) TO service_role;
+REVOKE ALL ON FUNCTION public.record_refund(UUID, BIGINT, TEXT, UUID, TEXT, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.record_refund(UUID, BIGINT, TEXT, UUID, TEXT, TEXT, TIMESTAMPTZ) TO service_role;
 
 -- 20b. CRITICAL — order state may never be supplied by a client.
 -- Force EVERY insert to Pending with no money already refunded, regardless of

@@ -26,6 +26,8 @@ const ROOT = process.cwd();
 const SCHEMA_FILE = join(ROOT, 'lib/schemaSql.ts');
 const STRICT = process.argv.includes('--strict');
 const EMIT_SQL = process.argv.includes('--emit-sql');
+const LIVE = process.argv.includes('--live');
+const LIVE_FILE = join(ROOT, 'tools/live-schema.json');
 
 const schemaSrc = readFileSync(SCHEMA_FILE, 'utf8');
 
@@ -115,10 +117,12 @@ for (const m of schemaSrc.matchAll(/CREATE TABLE IF NOT EXISTS public\.(\w+)\s*\
   tables.set(table, cols);
 }
 
+const alteredColumns = new Set();
 for (const m of schemaSrc.matchAll(/ALTER TABLE public\.(\w+)\s+ADD COLUMN IF NOT EXISTS\s+(\w+)/g)) {
   const [, table, col] = m;
   if (!tables.has(table)) tables.set(table, new Set());
   tables.get(table).add(col);
+  alteredColumns.add(`${table}.${col}`);
 }
 
 for (const m of schemaSrc.matchAll(/CREATE (?:UNIQUE )?INDEX(?: IF NOT EXISTS)?\s+(\w+)\s+ON\s+public\.(\w+)\s*\(([^)]*)\)/g)) {
@@ -380,6 +384,67 @@ if (rpcCalls.length > 0) {
   for (const call of rpcCalls) console.log(`  ${call.name}(${call.args.join(', ')})  ← ${call.file.replace(ROOT + '/', '')}`);
   console.log(rpcProblems.length ? '\nRPC argument mismatches:' : '\nAll RPC calls match a defined function signature.');
   for (const p of rpcProblems) console.log(`  ✗ ${p}`);
+}
+
+// ── LIVE comparison ─────────────────────────────────────────────────────────
+if (LIVE) {
+  let live;
+  try {
+    live = JSON.parse(readFileSync(LIVE_FILE, 'utf8'));
+  } catch (e) {
+    console.error(`Cannot read ${LIVE_FILE}: ${e.message}`);
+    process.exit(2);
+  }
+  const liveTables = new Map(Object.entries(live.tables).map(([t, cols]) => [t, new Set(cols)]));
+
+  // A reference the LIVE database cannot satisfy is only acceptable if the
+  // schema script creates it. Everything else is a bug the migration will not
+  // magically fix.
+  const willBeCreated = [];
+  const reallyBroken = [];
+  const seenLive = new Set();
+
+  for (const r of refs) {
+    const key = `${r.table}.${r.column}`;
+    if (seenLive.has(key)) continue;
+    seenLive.add(key);
+    const liveCols = liveTables.get(r.table);
+    if (!liveCols) {
+      // Table does not exist yet; schemaSql creates the missing ones.
+      if (tables.has(r.table)) willBeCreated.push(`${key} (table missing in live DB; created by schema)`);
+      else reallyBroken.push(`${key} (table exists nowhere)`);
+      continue;
+    }
+    if (liveCols.has(r.column)) continue;
+    // `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so a column
+    // only arrives via `ALTER TABLE ... ADD COLUMN`. Claiming the schema has it
+    // is not enough.
+    if (alteredColumns.has(key)) willBeCreated.push(key);
+    else if (tables.get(r.table)?.has(r.column)) reallyBroken.push(`${key} (in CREATE TABLE, but NO ALTER — an existing DB will never get it)`);
+    else reallyBroken.push(key);
+  }
+
+  console.log('\n=== LIVE DATABASE COMPARISON (tools/live-schema.json) ===');
+  console.log(`live public tables: ${liveTables.size}`);
+  console.log(`\nSatisfied by a column that exists live: ${seenLive.size - willBeCreated.length - reallyBroken.length}`);
+  console.log(`\nRequires schemaSql.ts to run first (${willBeCreated.length}):`);
+  for (const k of willBeCreated.sort()) console.log(`  + ${k}`);
+  console.log(`\nBroken even after the schema runs (${reallyBroken.length}):`);
+  for (const k of reallyBroken.sort()) console.log(`  ✗ ${k}`);
+
+  const liveOnly = [];
+  for (const [t, cols] of liveTables) {
+    const canonical = tables.get(t);
+    for (const c of cols) if (!canonical?.has(c)) liveOnly.push(`${t}.${c}`);
+  }
+  console.log(`\nExists live but not in the app schema (${liveOnly.length}): ${liveOnly.sort().join(', ') || '—'}`);
+
+  console.log('\nValue vocabularies that must be migrated (see supabase/migrations/20261019_align_live_db.sql):');
+  for (const [col, values] of Object.entries(live.checks || {})) {
+    console.log(`  ${col}: ${values.join(', ')}`);
+  }
+
+  if (STRICT && reallyBroken.length > 0) process.exit(1);
 }
 
 // Columns the schema defines but code never mentions — usually fine (audit

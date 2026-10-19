@@ -1,5 +1,11 @@
 # Database alignment
 
+> **Update (live inventory received):** the real database is an earlier, normalized
+design — 13 `public` tables, no `refunds`/`reviews`/`store_ratings`/`wishlists`/
+`contact_messages`, no `payment_status`, and `orders.status` carrying payment
+state. Section 6 covers exactly what to run. `npm run schema:live` diffs the code
+against the reported inventory (`tools/live-schema.json`).
+
 **Question:** does the application perfectly align with what is in the database?
 
 **Answer:** the code and the canonical schema (`lib/schemaSql.ts`) now match exactly — every
@@ -167,3 +173,81 @@ Expected upgrade effects of the latest schema, if you are coming from the previo
 | RLS as a real `anon` / `authenticated` role | Needs a live project | `set role anon; select * from payments;` must return 0 rows |
 | Trigger bodies executing | No Postgres in this environment | Apply the schema to staging, then attempt `update orders set payment_status='Paid'` as `anon` — it must raise |
 | Backfilled historical rows | `NOT VALID` constraints skip existing rows | `select count(*) from orders where total_minor_units % 100 <> 0;` |
+
+
+---
+
+## 6. Your live database (13 public tables)
+
+The inventory you supplied is an **earlier, normalized** design, not the schema in
+`lib/schemaSql.ts`. It is a good design — prices live in `product_variants`,
+images in `product_images`, ids are UUIDs — and the storefront already reads it
+that way (`getProductsFromDb` queries variants, images and categories, and falls
+back to individual table queries). The money path, however, assumes columns that
+do not exist yet.
+
+### 6.1 The four real conflicts
+
+| # | Live database | What the app needs | Consequence if unchanged |
+|---|---|---|---|
+| L1 | `orders` has **no `payment_status`**; payment state is folded into `status` (`paid`, `refunded`, `completed`) | a separate `payment_status` (`Pending`/`Paid`/`Failed`/`Refunded`) | every checkout insert fails (unknown column), refunds and the webhook cannot mark anything Paid |
+| L2 | `orders.status` CHECK allows **lowercase** `pending…refunded`, and has `paid`/`completed` but **no `Delivered`** | `Pending`/`Processing`/`Shipped`/`Delivered`/`Cancelled` | inserts rejected; admin status buttons fail |
+| L3 | `payments.status` CHECK allows `pending/processing/paid/failed/cancelled/refunded` | the ledger writes **`success`** for a settled payment | the settlement update is rejected → payments stay `pending` forever |
+| L4 | No `refunds` table; no `(provider, event_id)` uniqueness on `payment_webhook_events` | refund ledger + idempotent webhooks | refunds 500; a redelivered webhook can be processed twice |
+
+Also missing and created by the schema script: `reviews`, `store_ratings`,
+`wishlists`, `contact_messages`, `orders.{items,payment_method,pricing_snapshot,
+client_request_id,refunded_minor_units,payment_note,tracking_number}`,
+`payments.{settled_amount_minor_units,fee_minor_units,net_amount_minor_units,
+provider_transaction_id,settled_at}`, and `profiles.email`.
+
+### 6.2 Run these two files, in this order
+
+```text
+1.  lib/schemaSql.ts                          (Admin Portal → Cloud Sync → Copy Complete SQL Schema)
+      ↳ creates the missing tables, adds the missing columns, installs the RPCs,
+        triggers, RLS policies and grants. Idempotent.
+
+2.  supabase/migrations/20261019_align_live_db.sql
+      ↳ backfills payment_status from the legacy status, rewrites status values to
+        the app's vocabulary, REPLACES the three CHECK constraints (schemaSql cannot
+        alter an existing table's constraint), de-duplicates webhook events and adds
+        their unique key, and drops stale RPC overloads.
+```
+
+Step 2 refuses to run (with a clear message) if step 1 has not been applied, and
+every statement in it is guarded, so it is safe to re-run. **Take a backup first**
+— step 2 rewrites existing `orders.status` values:
+
+| legacy `status` | new `status` | new `payment_status` |
+|---|---|---|
+| `pending` | `Pending` | `Pending` |
+| `paid` | `Processing` | `Paid` |
+| `processing` | `Processing` | unchanged (`Pending`) |
+| `shipped` | `Shipped` | unchanged |
+| `completed` | `Delivered` | `Paid` |
+| `cancelled` | `Cancelled` | unchanged |
+| `refunded` | `Cancelled` | `Refunded` |
+
+`payments.status`: `paid|succeeded|completed → success`, `processing → pending`,
+`cancelled → failed`.
+
+### 6.3 Verify
+
+```bash
+npm run schema:live     # code vs the reported live inventory (should print 0 broken)
+npm run schema:verify-sql
+```
+
+Then paste `tools/verify-db.sql` into the Supabase SQL editor: every row must say
+`OK`. The migration ends with a count query whose `bad_rows` must all be `0`.
+
+### 6.4 Id types now match the live database
+
+The schema previously declared `TEXT` ids for products, orders, order items,
+payments and refunds, while your database uses `UUID` with foreign keys. That was
+not cosmetic: `create_order_v2(p_order_id TEXT)` inserting into a `UUID` column
+raises *"column is of type uuid but expression is of type text"*, so the atomic
+path would fail and checkout would silently use the non-atomic fallback. The
+schema and both RPCs now use `UUID`, and the JSONB line-item product id is cast
+explicitly (`::uuid`).
