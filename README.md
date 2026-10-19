@@ -94,7 +94,7 @@ price a customer sees is the price they are charged.
 - **Promotions are server-side.** Active deals in `store_settings.hotDeals` are
   applied by the server; a deal can only lower a price. There is no client-side
   anchor price — if no genuine "was" price is configured, none is shown.
-- **Delivery** is 25,000 UGX unless the net subtotal (after discounts) reaches
+- **Delivery** is 10,000 UGX unless the net subtotal (after discounts) reaches
   `store_settings.freeShippingThreshold` (default 500,000 UGX).
 - **Idempotent checkout.** The client sends `Idempotency-Key`; the API stores it in
   `orders.client_request_id` (unique) and returns the original order on a replay,
@@ -113,6 +113,17 @@ price a customer sees is the price they are charged.
 > the pricing/idempotency/refund columns on `orders`, the money `CHECK`
 > constraints, the payment-state triggers, and the service-role-only
 > `create_order_v2`.
+
+### Penetration test
+
+```bash
+npm run pentest:money            # against BASE_URL (default http://localhost:3000)
+LIVEPAY_WEBHOOK_SECRET=… BASE_URL=https://staging.example.com npm run pentest:money
+```
+
+Probes unauthenticated admin/refund routes, webhook forgery and replay, tracking injection,
+body limits, method tampering and rate limiting. The adversarial money tests run with the rest
+of the suite (`tests/moneyPentest.test.ts`).
 
 ## Webhook integration (verified against docs.livepay.me, 2026-10-05)
 

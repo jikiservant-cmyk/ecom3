@@ -585,6 +585,89 @@ $$;
 REVOKE ALL ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ) TO service_role;
 
+-- 20a2. Atomic refund recording (server only).
+-- Two concurrent refunds (double click, two admin tabs, a retried request) must
+-- not together exceed the order total. The application also guards this with an
+-- optimistic update, but the real guarantee is here: the order row is locked,
+-- the balance re-checked inside the transaction, and the ledger rows written
+-- with the counter.
+CREATE OR REPLACE FUNCTION public.record_refund(
+  p_order_id TEXT,
+  p_amount_minor_units BIGINT,
+  p_reason TEXT,
+  p_actor_id UUID,
+  p_actor_email TEXT,
+  p_gateway_reference TEXT,
+  p_created_at TIMESTAMPTZ
+) RETURNS TABLE (refund_id UUID, refunded_minor_units BIGINT, fully_refunded BOOLEAN)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_order public.orders%ROWTYPE;
+  v_refund_id UUID;
+  v_new_refunded BIGINT;
+  v_full BOOLEAN;
+BEGIN
+  IF COALESCE(auth.role(), '') <> 'service_role' THEN
+    RAISE EXCEPTION 'record_refund is server-only' USING ERRCODE = '42501';
+  END IF;
+  IF p_amount_minor_units IS NULL OR p_amount_minor_units <= 0 OR p_amount_minor_units % 100 <> 0 THEN
+    RAISE EXCEPTION 'invalid refund amount' USING ERRCODE = '22023';
+  END IF;
+  IF p_reason IS NULL OR length(btrim(p_reason)) < 3 THEN
+    RAISE EXCEPTION 'a refund reason is required' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT * INTO v_order FROM public.orders WHERE id = p_order_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'order not found' USING ERRCODE = 'P0002';
+  END IF;
+  IF lower(COALESCE(v_order.payment_status, '')) <> 'paid' THEN
+    RAISE EXCEPTION 'only a paid order can be refunded' USING ERRCODE = '22023';
+  END IF;
+  IF v_order.refunded_minor_units + p_amount_minor_units > v_order.total_minor_units THEN
+    RAISE EXCEPTION 'refund exceeds the refundable balance' USING ERRCODE = '22023';
+  END IF;
+
+  v_new_refunded := v_order.refunded_minor_units + p_amount_minor_units;
+  v_full := v_new_refunded >= v_order.total_minor_units;
+
+  INSERT INTO public.refunds (
+    order_id, amount_minor_units, currency, reason, method, gateway_reference,
+    actor_id, actor_email, created_at
+  ) VALUES (
+    p_order_id, p_amount_minor_units, 'UGX', p_reason, 'manual', p_gateway_reference,
+    p_actor_id, p_actor_email, p_created_at
+  ) RETURNING id INTO v_refund_id;
+
+  INSERT INTO public.payments (
+    order_id, provider, provider_reference, status, amount_minor_units,
+    settled_amount_minor_units, net_amount_minor_units, currency, raw_payload,
+    settled_at, created_at, updated_at
+  ) VALUES (
+    p_order_id, 'manual', COALESCE(p_gateway_reference, 'REFUND-' || v_order.order_number), 'refunded',
+    p_amount_minor_units, -p_amount_minor_units, -p_amount_minor_units, 'UGX',
+    jsonb_build_object('kind', 'refund', 'refund_id', v_refund_id, 'reason', p_reason, 'refunded_by', p_actor_id),
+    p_created_at, p_created_at, p_created_at
+  );
+
+  UPDATE public.orders
+     SET refunded_minor_units = v_new_refunded,
+         payment_note = p_reason,
+         payment_status = CASE WHEN v_full THEN 'Refunded' ELSE payment_status END,
+         status = CASE WHEN v_full THEN 'Cancelled' ELSE status END,
+         updated_at = p_created_at
+   WHERE id = p_order_id;
+
+  RETURN QUERY SELECT v_refund_id, v_new_refunded, v_full;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.record_refund(TEXT, BIGINT, TEXT, UUID, TEXT, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.record_refund(TEXT, BIGINT, TEXT, UUID, TEXT, TEXT, TIMESTAMPTZ) TO service_role;
+
 -- 20b. CRITICAL — order state may never be supplied by a client.
 -- Force EVERY insert to Pending with no money already refunded, regardless of
 -- caller: the server's creation path always writes Pending anyway, so this costs

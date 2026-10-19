@@ -213,16 +213,19 @@ const APP_URL = 'https://shop.example.com';
 const WEBHOOK_URL = `${APP_URL}/api/payments/livepay/webhook`;
 const APP_ID = 'app.example.com';
 
-function chainable(result: any, sink: any[][]) {
+function chainable(result: any, sink: any[][], resultForOp?: Record<string, any>) {
   const calls: any[][] = [];
+  let op = 'select';
   const obj: any = {
     then: (resolve: any, reject: any) => {
       sink.push(calls);
-      return Promise.resolve(result).then(resolve, reject);
+      const chosen = (resultForOp && resultForOp[op]) ?? result;
+      return Promise.resolve(chosen).then(resolve, reject);
     },
   };
-  for (const m of ['select', 'insert', 'update', 'delete', 'eq', 'in', 'maybeSingle', 'order', 'range']) {
+  for (const m of ['select', 'insert', 'update', 'delete', 'eq', 'in', 'is', 'maybeSingle', 'order', 'range']) {
     obj[m] = (...args: any[]) => {
+      if (m === 'insert' || m === 'update' || m === 'delete') op = m;
       calls.push([m, ...args]);
       return obj;
     };
@@ -245,7 +248,13 @@ function makeClient(fix: FakeFix) {
     from: (table: string) => {
       const error = fix.errors?.[table] ?? null;
       if (table === 'payment_webhook_events') return chainable({ data: null, error }, sink);
-      if (table === 'orders') return chainable({ data: fix.order ?? null, error }, sink);
+      if (table === 'orders') {
+        return chainable({ data: fix.order ?? null, error }, sink, {
+          // A guarded refund update reports the affected row(s).
+          update: { data: [{ id: fix.order?.id ?? 'order-1' }], error: null },
+          insert: { data: fix.order ?? null, error },
+        });
+      }
       if (table === 'order_items') return chainable({ data: fix.items ?? [], error }, sink);
       if (table === 'products') return chainable({ data: fix.products ?? [], error }, sink);
       if (table === 'store_settings') return chainable({ data: { settings: fix.settings ?? {} }, error }, sink);
@@ -282,7 +291,7 @@ async function postWebhook(payload: any) {
 const SNAPSHOT = priceOrder({
   lines: [{ productId: 'prod-1', productName: 'Engoma Drum', quantity: 1, catalogUnitMinorUnits: 1_500_000 }],
 });
-const TOTAL_MINOR = SNAPSHOT.totalMinorUnits; // 1,525,000
+const TOTAL_MINOR = SNAPSHOT.totalMinorUnits; // 2,500,000 (25,000 UGX)
 
 const BASE_ORDER = {
   id: 'order-1',
@@ -567,15 +576,15 @@ describe('order creation route — promotions, snapshot and idempotency', () => 
   });
 
   it('charges the promotional price and records a verifiable snapshot', async () => {
-    // 2 x 13,500 UGX (10% off 15,000) = 27,000 + 25,000 delivery = 52,000 UGX
-    const { res, body } = await create({ total: 52_000 });
+    // 2 x 13,500 UGX (10% off 15,000) = 27,000 + 10,000 delivery = 37,000 UGX
+    const { res, body } = await create({ total: 37_000 });
     expect(res.status).toBe(201);
     expect(body.success).toBe(true);
 
     const input: any = (globalThis as any).__lastOrderInput;
-    expect(input.totalMinorUnits).toBe(5_200_000);
+    expect(input.totalMinorUnits).toBe(3_700_000);
     expect(input.discountMinorUnits).toBe(300_000);
-    expect(input.shippingMinorUnits).toBe(2_500_000);
+    expect(input.shippingMinorUnits).toBe(1_000_000);
     expect(input.subtotalMinorUnits).toBe(3_000_000);
     expect(input.pricingSnapshot.lines[0].unitMinorUnits).toBe(1_350_000);
     expect(input.items[0].price).toBe(13_500); // order_items show what was charged
@@ -591,8 +600,8 @@ describe('order creation route — promotions, snapshot and idempotency', () => 
   });
 
   it('rejects a client total that ignores the promotion (the old display price)', async () => {
-    // 2 x 15,000 + 25,000 = 55,000 — the pre-fix cart total.
-    const { res, body } = await create({ total: 55_000 });
+    // 2 x 15,000 + 10,000 = 40,000 — the pre-discount cart total.
+    const { res, body } = await create({ total: 40_000 });
     expect(res.status).toBe(400);
     expect(body.error).toMatch(/match current catalog prices/i);
     expect((globalThis as any).__lastOrderInput).toBeUndefined();
@@ -604,12 +613,12 @@ describe('order creation route — promotions, snapshot and idempotency', () => 
   });
 
   it('forwards the Idempotency-Key so a retry cannot double-charge', async () => {
-    await create({ total: 52_000 }, { 'Idempotency-Key': 'ck-8f3a-4d2b-9c1e-77aa' });
+    await create({ total: 37_000 }, { 'Idempotency-Key': 'ck-8f3a-4d2b-9c1e-77aa' });
     expect((globalThis as any).__lastOrderInput.clientRequestId).toBe('ck-8f3a-4d2b-9c1e-77aa');
   });
 
   it('ignores a malformed Idempotency-Key instead of storing it', async () => {
-    await create({ total: 52_000 }, { 'Idempotency-Key': 'x' });
+    await create({ total: 37_000 }, { 'Idempotency-Key': 'x' });
     expect((globalThis as any).__lastOrderInput.clientRequestId).toBeNull();
   });
 

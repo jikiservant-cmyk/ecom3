@@ -66,9 +66,9 @@ function markerReleased(sink: any[][]): boolean {
   return sink.some((calls) => calls.some((c) => c[0] === 'delete'));
 }
 
-// Drum 475,000 minor + flat delivery 2,500,000 minor = 2,975,000 minor
+// Drum 475,000 minor + flat delivery 1,000,000 minor = 1,475,000 minor
 // = 29,750 UGX major. The fixtures must agree or the catalog check rejects them.
-const CATALOG_TOTAL_MINOR = 475_000 + 2_500_000;
+const CATALOG_TOTAL_MINOR = 475_000 + 1_000_000;
 const CATALOG_TOTAL_MAJOR = CATALOG_TOTAL_MINOR / 100;
 
 const PAID_ORDER = {

@@ -24,7 +24,7 @@ import {
 
 const ORDER_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'; // no 0/O/1/I/L
 
-/** Flat delivery fee used by the storefront: 25,000 UGX (minor units). */
+/** Flat delivery fee used by the storefront: 10,000 UGX (minor units). */
 export const FLAT_DELIVERY_FEE_MINOR_UNITS = DELIVERY_FEE_MINOR_UNITS;
 
 export interface OrderTotals {
@@ -354,14 +354,15 @@ function isDuplicateError(err: any): boolean {
 
 async function findExistingOrder(
   client: any,
-  clientRequestId: string
+  clientRequestId: string,
+  customerId: string | null
 ): Promise<{ orderId: string; orderNumber: string } | null> {
   try {
-    const { data } = await client
-      .from('orders')
-      .select('id, order_number')
-      .eq('client_request_id', clientRequestId)
-      .maybeSingle();
+    // Scoped to the caller: a guessed or leaked idempotency key must not hand
+    // back another customer's order id and order number.
+    let query = client.from('orders').select('id, order_number').eq('client_request_id', clientRequestId);
+    query = customerId ? query.eq('customer_id', customerId) : query.is('customer_id', null);
+    const { data } = await query.maybeSingle();
     if (data?.id && data?.order_number) {
       return { orderId: String(data.id), orderNumber: String(data.order_number) };
     }
@@ -390,8 +391,10 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
 
   // Idempotency: a retried checkout must not create a second order (and a second
   // mobile-money prompt) for the same intent.
+  const existingCustomerId =
+    input.customerId && UUID_RE.test(input.customerId) ? input.customerId : null;
   if (clientRequestId) {
-    const existing = await findExistingOrder(client, clientRequestId);
+    const existing = await findExistingOrder(client, clientRequestId, existingCustomerId);
     if (existing) {
       logger.info('order_create_idempotent_replay', existing);
       return { success: true, ...existing, idempotent: true };
@@ -457,7 +460,7 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       return { success: true, orderId, orderNumber };
     }
     if (isDuplicateError(error) && clientRequestId) {
-      const existing = await findExistingOrder(client, clientRequestId);
+      const existing = await findExistingOrder(client, clientRequestId, existingCustomerId);
       if (existing) return { success: true, ...existing, idempotent: true };
     }
     // PGRST202 / 42883 => function (or its argument list) not deployed;
@@ -555,7 +558,7 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
 
     if (orderError) {
       if (isDuplicateError(orderError) && clientRequestId) {
-        const existing = await findExistingOrder(client, clientRequestId);
+        const existing = await findExistingOrder(client, clientRequestId, existingCustomerId);
         if (existing) return { success: true, ...existing, idempotent: true };
       }
       logger.error('order_insert_failed', { error: orderError.message });

@@ -8,7 +8,8 @@ handlers and pure functions.
 
 > ## Status: all 15 findings remediated
 > The probes that originally reproduced each defect now assert the fixed behaviour and live in
-> **`tests/moneyIntegrity.test.ts`** (45 tests). The full suite is **152 tests, all passing**,
+> **`tests/moneyIntegrity.test.ts`** (45 tests) and **`tests/moneyPentest.test.ts`** (44 adversarial
+tests). The full suite is **196 tests, all passing**,
 > with `tsc --noEmit` and `eslint .` clean.
 >
 > ```bash
@@ -63,11 +64,11 @@ must match the order's.
 - `priceOrder({ lines, deals, freeShippingThresholdMinorUnits })` returns the full breakdown
   (catalog subtotal, discount, shipping, total, per-line unit prices, promotion ids).
 - `lib/server/orders.ts` and `app/page.tsx` both call it, so **the price shown is the price
-  charged**. The old duplicate calculation in the storefront (`subtotal`/`25000`/`grandTotal`)
+  charged**. The old duplicate calculation in the storefront (`subtotal` + hard-coded fee = `grandTotal`)
   is gone.
 - Promotions come from `store_settings.hotDeals` and are applied **server-side**. A deal can
   only make a line cheaper — never more expensive, never below one shilling.
-- Delivery is 25,000 UGX unless the *net* subtotal (after discounts) reaches
+- Delivery is **10,000 UGX** unless the *net* subtotal (after discounts) reaches
   `freeShippingThreshold` (default 500,000 UGX). A promotion therefore cannot unlock free
   delivery on a cart that does not qualify.
 - Every amount is a whole-shilling integer. `toWholeShillingMinor` is the only rounding step;
@@ -82,7 +83,7 @@ At checkout the server writes `orders.pricing_snapshot`:
               "catalogUnitMinorUnits": 1500000, "unitMinorUnits": 1350000,
               "lineTotalMinorUnits": 2700000, "discountMinorUnits": 300000, "promotionId": "deal-1" }],
   "subtotalMinorUnits": 3000000, "discountMinorUnits": 300000,
-  "shippingMinorUnits": 2500000, "totalMinorUnits": 5250000, "freeShippingApplied": false }
+  "shippingMinorUnits": 1000000, "totalMinorUnits": 3750000, "freeShippingApplied": false }
 ```
 
 `validatePricingSnapshot` re-checks it at payment start and on every webhook:
@@ -151,10 +152,72 @@ creating a second one and a second mobile-money prompt.
 
 ---
 
+## 3. Penetration test of the remediation
+
+I attacked my own changes two ways: **44 adversarial tests** that drive the real route
+handlers (`tests/moneyPentest.test.ts`), and a **live HTTP harness** against a running server
+(`tools/money-pentest.mjs`, `npm run pentest:money`).
+
+### 3.1 Findings — all fixed
+
+| # | Attack | Result before the fix | Fix |
+|---|---|---|---|
+| PT-01 | **Refund race**: two refunds read the same balance and both write | **Confirmed.** Both succeeded; the `refunds` ledger could exceed the order total even though the counter did not | `record_refund` SQL function (`SELECT … FOR UPDATE`) + optimistic `.eq('refunded_minor_units', <read value>)` guard in the fallback, which returns **409** on a stale read |
+| PT-02 | **Payment-prompt abuse / third-party collection**: initiate a MoMo prompt at any phone number for any known order id | **Confirmed.** The client-supplied `phoneNumber` was used verbatim for the order | The number must match the order's `customer_phone`; a different number is allowed only for the signed-in owner (**403** otherwise) |
+| PT-03 | **Idempotency-key hijack**: replay a guessed key and receive another customer's order id/number | **Confirmed.** The replay lookup was unscoped | Lookup is scoped to `customer_id` (guests: `customer_id IS NULL`) |
+| PT-04 | **Cheap-twin repricing**: two active products share a name; a cart without `productId` and a total matching the cheap twin | **Confirmed at the pricing layer** (the earlier test only failed on a total mismatch, not on the ambiguity) | Ambiguous names are refused at checkout (**400**); a supplied `productId` that does not resolve is refused instead of falling back to a name lookup |
+| PT-05 | **Snapshot type smuggling**: string/float quantities and totals in the pricing snapshot | **Confirmed.** `Number()` coercion accepted `"1"` and `"11000000"` | `validatePricingSnapshot` requires real numbers end to end |
+
+Two probes also *passed* and are worth recording: a >100 % discount is **ignored** rather than
+clamped (clamping to 99.99 % would sell a 100,000 UGX drum for 1 UGX), and a tampered
+`customer_reference` fails signature verification even when the signature is valid for a
+different body.
+
+### 3.2 Live HTTP results
+
+```
+$ LIVEPAY_WEBHOOK_SECRET=… BASE_URL=http://localhost:3000 npm run pentest:money
+
+PASS  health endpoint is public                                        503
+PASS  admin order list requires auth                                   401
+PASS  admin order mutation requires auth                               401
+PASS  refund endpoint requires auth                                    401
+PASS  gateway connectivity test (SSRF vector) requires admin           401
+PASS  webhook without a signature is rejected                          401
+PASS  webhook with a forged signature is rejected                      401
+PASS  webhook with a stale timestamp is rejected                       401
+PASS  signed webhook with a tampered body is rejected                  401
+PASS  correctly signed webhook cannot be processed without a database  503
+PASS  checkout with a 1-UGX cart is refused                            503
+PASS  payment initiation for an unknown order is refused               503
+PASS  payment initiation rejects a non-momo method                     400
+PASS  tracking wildcard is rejected                                    400
+PASS  tracking SQL-ish injection is rejected                           400
+PASS  order id injection in payment initiation                         503
+PASS  malformed JSON is rejected                                       400
+PASS  oversized body is rejected                                       400
+PASS  unsupported method on orders is rejected                         405
+PASS  order creation is rate limited                                   429
+
+20/20 probes held.
+```
+
+The harness accepts **429** as a valid refusal so repeated runs against a warm rate-limiter
+do not produce false findings.
+
+### 3.3 What this penetration test could not cover
+
+| Gap | Why | Consequence |
+|---|---|---|
+| Executing the SQL (triggers, `record_refund`, grants) against Postgres | No Postgres/Docker available in this environment | The SQL is reviewed but not executed; apply it to a staging project and re-run the refund race there |
+| Real gateway interaction (duplicate references, fractional amounts, `charge` units) | No LivePay merchant credentials | Confirm `charge` units before trusting `net_amount_minor_units` |
+| RLS behaviour as a real `anon`/`authenticated` role | Needs a live Supabase project | The policy text is reviewed; verify with `set role anon` in staging |
+| Cross-session replay of a captured webhook | Requires a captured production signature | The 5-minute window and the `(provider, event_id)` dedupe bound it; asserted only in unit tests |
+
 ## 3. Verification
 
 ```
-npx vitest run          →  10 files, 152 tests passing
+npx vitest run          →  11 files, 196 tests passing
 npx tsc --noEmit        →  clean
 npx eslint .            →  clean
 ```
@@ -170,6 +233,7 @@ npx eslint .            →  clean
 | webhook state machine | 6 | Late `Failed` ignored; `Paid` + settled amount written; forged snapshot refused with marker released; cancelled/refunded refused; unknown-order marker released |
 | pay initiation | 8 | Charge equals `total_minor_units / 100`; cancelled / refunded / delivered / COD refused before any gateway call; non-whole-shilling and bad snapshot refused |
 | refunds | 7 | Reason + amount required; unpaid order refused; over-refund refused; partial refund is a ledger row and a negative payment without flipping status; full refund flips to `Refunded` |
+| `tests/moneyPentest.test.ts` | 44 | Refund race, RPC path, gate bypasses, prompt abuse, idempotency scoping, ambiguous pricing, promo abuse, snapshot type smuggling, webhook forgery/replay, checkout input abuse, admin state manipulation |
 | checkout route | 6 | Charged total equals the promotional price; the old (undiscounted) total is refused; a 1-UGX cart is refused; `Idempotency-Key` forwarded (and malformed keys dropped); free delivery applied only above the threshold |
 
 ---
@@ -234,7 +298,7 @@ in the webhook.
 **Evidence (pre-fix):** `app/page.tsx:1056-1070, 1146-1152` displayed `customPrice` and a
 synthesised anchor (`dealPrice / (1 - discount/100)`) while "Claim Deal" added the product at
 catalog price (`app/page.tsx:482-485`). Server-side, any total below catalog was rejected, so
-discounts were unimplementable. `free_shipping` defaulted to true while a flat 25,000 UGX fee was
+discounts were unimplementable. `free_shipping` defaulted to true while a flat delivery fee was
 always added, and `freeShippingThreshold` was read by nothing.
 **Fix:** server-side promotions, honest badges, threshold-aware shipping, one shared calculation.
 

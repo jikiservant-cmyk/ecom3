@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getServerAdminClient } from '@/lib/server/supabaseServer';
+import { getServerAdminClient, authenticateRequest } from '@/lib/server/supabaseServer';
 import { logger } from '@/lib/server/logging';
 import { readJsonBody, isNonEmptyString, jsonError } from '@/lib/server/validation';
 import { consumeRateLimit } from '@/lib/server/rateLimit';
@@ -86,7 +86,7 @@ export async function POST(req: NextRequest) {
   try {
     const { data, error } = await (client.from('orders') as any)
       .select(
-        'id, order_number, customer_name, customer_phone, status, payment_method, payment_status, ' +
+        'id, order_number, customer_id, customer_name, customer_phone, status, payment_method, payment_status, ' +
           'subtotal_minor_units, discount_minor_units, shipping_minor_units, total_minor_units, ' +
           'refunded_minor_units, currency, pricing_snapshot'
       )
@@ -213,6 +213,27 @@ export async function POST(req: NextRequest) {
   } catch (e: any) {
     logger.error('livepay_order_valuation_exception', { orderId, error: e?.message });
     return jsonError('Payment could not be started', 500);
+  }
+
+  // PHONE BINDING. Without this, anyone who learns an order id can push a
+  // Mobile Money prompt at an arbitrary phone number (payment-prompt spam) or
+  // attempt to collect from a third party. A caller may only use the number the
+  // order was placed with, unless they are the signed-in owner.
+  const normalisePhone = (value: unknown) => String(value ?? '').replace(/[^\d]/g, '');
+  const orderPhone = normalisePhone(order.customer_phone);
+  const requestedPhone = normalisePhone(phoneNumber);
+  if (requestedPhone && orderPhone && requestedPhone !== orderPhone) {
+    let isOwner = false;
+    try {
+      const requester = await authenticateRequest(req);
+      isOwner = Boolean(requester?.userId && order.customer_id && requester.userId === order.customer_id);
+    } catch {
+      isOwner = false;
+    }
+    if (!isOwner) {
+      logger.warn('livepay_phone_mismatch', { orderId });
+      return jsonError('Use the phone number this order was placed with, or sign in to pay from another number.', 403);
+    }
   }
 
   const effectivePhone = phoneNumber || (order.customer_phone || '').replace(/[^\d+]/g, '');

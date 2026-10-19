@@ -10,8 +10,12 @@
 
 export const MINOR_UNITS_PER_MAJOR = 100;
 
-/** Flat delivery fee: 25,000 UGX. Single definition for client + server. */
-export const DELIVERY_FEE_MINOR_UNITS = 2_500_000;
+/**
+ * Flat delivery fee: 10,000 UGX. Single definition for client and server, so the
+ * cart summary and the charged amount can never disagree. Matches the published
+ * delivery policy (`components/InfoViews.tsx`).
+ */
+export const DELIVERY_FEE_MINOR_UNITS = 1_000_000;
 
 /** Free delivery above this net subtotal (500,000 UGX) unless settings say otherwise. */
 export const DEFAULT_FREE_SHIPPING_THRESHOLD_MINOR_UNITS = 50_000_000;
@@ -250,11 +254,18 @@ export function validatePricingSnapshot(opts: {
   let total = 0;
 
   for (const line of s.lines) {
-    const quantity = Number(line?.quantity);
-    const catalogUnit = Number(line?.catalogUnitMinorUnits);
-    const unit = Number(line?.unitMinorUnits);
-    const lineTotal = Number(line?.lineTotalMinorUnits);
-    const lineDiscount = Number(line?.discountMinorUnits);
+    // Type-strict: a snapshot is written by our own server, so a string or a
+    // float in a money field means someone forged or mangled it. Do not coerce.
+    if (typeof line?.quantity !== 'number' || typeof line?.catalogUnitMinorUnits !== 'number'
+        || typeof line?.unitMinorUnits !== 'number' || typeof line?.lineTotalMinorUnits !== 'number'
+        || typeof line?.discountMinorUnits !== 'number') {
+      return fail('snapshot line types');
+    }
+    const quantity = line.quantity;
+    const catalogUnit = line.catalogUnitMinorUnits;
+    const unit = line.unitMinorUnits;
+    const lineTotal = line.lineTotalMinorUnits;
+    const lineDiscount = line.discountMinorUnits;
 
     if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 1000) return fail('snapshot quantity');
     if (!isWholeShillingMinor(catalogUnit) || catalogUnit <= 0) return fail('snapshot catalog price');
@@ -268,25 +279,29 @@ export function validatePricingSnapshot(opts: {
     total += lineTotal;
   }
 
-  if (!isWholeShillingMinor(Number(s.subtotalMinorUnits)) || Number(s.subtotalMinorUnits) !== subtotal) {
+  if (typeof s.subtotalMinorUnits !== 'number' || !isWholeShillingMinor(s.subtotalMinorUnits) || s.subtotalMinorUnits !== subtotal) {
     return fail('snapshot subtotal');
   }
-  if (!isWholeShillingMinor(Number(s.discountMinorUnits)) || Number(s.discountMinorUnits) !== discount) {
+  if (typeof s.discountMinorUnits !== 'number' || !isWholeShillingMinor(s.discountMinorUnits) || s.discountMinorUnits !== discount) {
     return fail('snapshot discount');
   }
-  if (Number(s.shippingMinorUnits) !== 0 && !isWholeShillingMinor(Number(s.shippingMinorUnits))) {
+  if (typeof s.shippingMinorUnits !== 'number' || !isWholeShillingMinor(s.shippingMinorUnits)) {
     return fail('snapshot shipping');
   }
-  if (Number(s.totalMinorUnits) !== total + Number(s.shippingMinorUnits)) return fail('snapshot total');
+  if (typeof s.totalMinorUnits !== 'number' || s.totalMinorUnits !== total + s.shippingMinorUnits) {
+    return fail('snapshot total');
+  }
 
-  const storedTotal = Number(opts.storedTotalMinorUnits);
-  if (!isWholeShillingMinor(storedTotal)) return fail('stored total is not a whole shilling');
-  if (storedTotal !== Number(s.totalMinorUnits)) return fail('stored total disagrees with snapshot');
+  const storedTotal = opts.storedTotalMinorUnits;
+  if (typeof storedTotal !== 'number' || !isWholeShillingMinor(storedTotal)) {
+    return fail('stored total is not a whole-shilling number');
+  }
+  if (storedTotal !== s.totalMinorUnits) return fail('stored total disagrees with snapshot');
 
   const comparison: [string, unknown, number][] = [
     ['stored subtotal', opts.storedSubtotalMinorUnits, subtotal],
     ['stored discount', opts.storedDiscountMinorUnits, discount],
-    ['stored shipping', opts.storedShippingMinorUnits, Number(s.shippingMinorUnits)],
+    ['stored shipping', opts.storedShippingMinorUnits, s.shippingMinorUnits],
   ];
   for (const [label, stored, expected] of comparison) {
     if (stored === undefined || stored === null) continue;

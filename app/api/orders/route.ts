@@ -6,7 +6,7 @@ import {
   getServerAnonClient,
   isServerSupabaseConfigured,
 } from '@/lib/server/supabaseServer';
-import { createOrderServer, buildCatalogPriceIndex } from '@/lib/server/orders';
+import { createOrderServer, buildCatalogPriceIndex, ambiguousProductNames } from '@/lib/server/orders';
 import { priceOrder, PromoDeal, toMinorUnits } from '@/lib/pricing';
 import { logger, newRequestId } from '@/lib/server/logging';
 import {
@@ -239,10 +239,28 @@ export async function POST(req: NextRequest) {
     if (p?.status === 'active' && p?.id && p?.name) nameById.set(String(p.id), String(p.name));
   }
 
+  // AMBIGUITY GUARD. If two active products share a name, a name-keyed price is
+  // whichever row Postgres returned first — an attacker could aim a cart at the
+  // cheaper twin. Refuse the line instead of guessing.
+  const ambiguousNames = ambiguousProductNames(catalogProducts);
+
   // Resolve each line's catalog price and effective (promotional) price.
   const catalogLines: { productId?: string; productName: string; quantity: number; catalogUnitMinorUnits: number }[] = [];
   for (const item of items) {
+    if (!item.productId && ambiguousNames.has(item.productName)) {
+      logger.warn('order_ambiguous_product_name', { productName: item.productName });
+      return jsonError(
+        `"${item.productName}" matches more than one product. Please refresh the page and try again.`,
+        400
+      );
+    }
     const byId = item.productId ? priceIndex.byId.get(item.productId) : undefined;
+    // A supplied id that does not resolve must NOT fall back to a name lookup:
+    // that silently repriced by a client-controlled string.
+    if (item.productId && byId === undefined) {
+      logger.warn('order_product_id_unavailable', { productId: item.productId });
+      return jsonError(`"${item.productName}" is not available for purchase right now`, 400);
+    }
     const priceMinor = byId !== undefined ? byId : priceIndex.byName.get(item.productName);
     if (priceMinor === undefined || !Number.isFinite(priceMinor) || priceMinor <= 0) {
       logger.warn('order_unknown_product', { productId: item.productId, productName: item.productName });
