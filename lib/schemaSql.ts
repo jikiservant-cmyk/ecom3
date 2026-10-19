@@ -118,6 +118,14 @@ CREATE TABLE IF NOT EXISTS public.orders (
   -- Pending forever looking like abandoned payments.
   payment_method TEXT DEFAULT 'momo' CHECK (payment_method IN ('momo', 'cod')),
   tracking_number TEXT,
+  -- Money already returned to the customer (partial refunds accumulate here).
+  refunded_minor_units BIGINT NOT NULL DEFAULT 0,
+  -- Immutable pricing basis captured at checkout: unit prices, discounts and
+  -- shipping as they were when the customer pressed Pay. Every later check
+  -- validates against this instead of re-pricing from live catalog data.
+  pricing_snapshot JSONB,
+  -- Idempotency key for checkout: a retried request returns the same order.
+  client_request_id TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -125,14 +133,47 @@ CREATE TABLE IF NOT EXISTS public.orders (
 -- For databases created before payment_note existed (CREATE TABLE IF NOT EXISTS
 -- will not add a column to a table that is already there).
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_note TEXT;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS refunded_minor_units BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS pricing_snapshot JSONB;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS client_request_id TEXT;
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_method TEXT DEFAULT 'momo';
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS tracking_number TEXT;
 ALTER TABLE public.products ADD COLUMN IF NOT EXISTS origin TEXT DEFAULT 'local';
+
+-- 7b. Money invariants. NOT VALID so they can be installed on a database that
+--     already holds rows: existing rows are left alone, but every new write is
+--     checked. '% 100 = 0' encodes "UGX has no circulating subunit" — the amount
+--     charged, stored and reconciled is always one whole-shilling integer.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_amounts_whole_shillings') THEN
+    ALTER TABLE public.orders ADD CONSTRAINT orders_amounts_whole_shillings
+      CHECK (
+        total_minor_units % 100 = 0
+        AND subtotal_minor_units % 100 = 0
+        AND discount_minor_units % 100 = 0
+        AND shipping_minor_units % 100 = 0
+        AND tax_minor_units % 100 = 0
+      ) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_totals_add_up') THEN
+    ALTER TABLE public.orders ADD CONSTRAINT orders_totals_add_up
+      CHECK (total_minor_units = subtotal_minor_units - discount_minor_units + shipping_minor_units + tax_minor_units)
+      NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_refund_within_total') THEN
+    ALTER TABLE public.orders ADD CONSTRAINT orders_refund_within_total
+      CHECK (refunded_minor_units >= 0 AND refunded_minor_units <= total_minor_units) NOT VALID;
+  END IF;
+END $$;
 
 -- 8. Order items
 CREATE TABLE IF NOT EXISTS public.order_items (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   order_id TEXT REFERENCES public.orders(id) ON DELETE CASCADE,
+  -- Immutable catalog identity. Valuation must never depend on a product NAME,
+  -- which is neither unique nor stable.
+  product_id TEXT,
   product_name TEXT NOT NULL,
   product_slug TEXT,
   variant_sku TEXT,
@@ -143,6 +184,8 @@ CREATE TABLE IF NOT EXISTS public.order_items (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS product_id TEXT;
+
 -- 9. Payments — SERVICE ROLE ONLY (no grants to anon/authenticated below)
 CREATE TABLE IF NOT EXISTS public.payments (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -150,11 +193,41 @@ CREATE TABLE IF NOT EXISTS public.payments (
   provider TEXT DEFAULT 'livepay',
   provider_reference TEXT,
   status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'success', 'failed', 'refunded')),
+  -- What we ASKED the gateway to collect.
   amount_minor_units BIGINT NOT NULL DEFAULT 0,
+  -- What the gateway says it actually collected, its fee, and the net.
+  settled_amount_minor_units BIGINT,
+  fee_minor_units BIGINT NOT NULL DEFAULT 0,
+  net_amount_minor_units BIGINT,
+  provider_transaction_id TEXT,
+  settled_at TIMESTAMPTZ,
   currency TEXT DEFAULT 'UGX',
   raw_payload JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS settled_amount_minor_units BIGINT;
+ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS fee_minor_units BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS net_amount_minor_units BIGINT;
+ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS provider_transaction_id TEXT;
+ALTER TABLE public.payments ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ;
+
+-- 9b. Refunds — the money-out ledger. A refund is NOT a status flip: it is a
+--     row here (amount, reason, actor, reference) plus a negative cash-flow row
+--     in public.payments. Service role only, like public.payments.
+CREATE TABLE IF NOT EXISTS public.refunds (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id TEXT NOT NULL REFERENCES public.orders(id) ON DELETE CASCADE,
+  amount_minor_units BIGINT NOT NULL CHECK (amount_minor_units > 0 AND amount_minor_units % 100 = 0),
+  currency TEXT NOT NULL DEFAULT 'UGX',
+  status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('pending', 'completed', 'failed')),
+  reason TEXT NOT NULL,
+  method TEXT NOT NULL DEFAULT 'manual' CHECK (method IN ('manual', 'gateway')),
+  gateway_reference TEXT,
+  actor_id UUID,
+  actor_email TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- 10. Contact messages
@@ -273,6 +346,11 @@ CREATE TABLE IF NOT EXISTS public.payment_webhook_events (
 CREATE INDEX IF NOT EXISTS idx_orders_customer_id ON public.orders (customer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_created_at ON public.orders (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders (status);
+-- Idempotent checkout: one order per client request key.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_client_request_id
+  ON public.orders (client_request_id) WHERE client_request_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_refunds_order_id ON public.refunds (order_id);
+CREATE INDEX IF NOT EXISTS idx_payments_provider_transaction_id ON public.payments (provider_transaction_id);
 CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON public.order_items (order_id);
 CREATE INDEX IF NOT EXISTS idx_payments_order_id ON public.payments (order_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_product_id ON public.reviews (product_id);
@@ -296,8 +374,10 @@ GRANT SELECT ON public.categories, public.products, public.product_variants,
 GRANT SELECT ON public.orders TO anon;
 GRANT SELECT, INSERT ON public.orders TO authenticated;
 GRANT UPDATE, DELETE ON public.orders TO authenticated;
-GRANT SELECT ON public.order_items TO anon;
-GRANT SELECT, INSERT ON public.order_items TO authenticated;
+-- Line items are written only by the server (service role). An anon/authenticated
+-- INSERT here let anyone append lines to any pending order, which desynchronised
+-- the order total from its items and could strand a legitimate payment.
+GRANT SELECT ON public.order_items TO authenticated;
 GRANT INSERT ON public.contact_messages TO anon, authenticated;
 GRANT SELECT, UPDATE ON public.contact_messages TO authenticated;
 GRANT INSERT ON public.reviews TO authenticated;
@@ -308,8 +388,9 @@ GRANT SELECT, UPDATE ON public.profiles TO authenticated;
 GRANT UPDATE ON public.store_settings TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.carts, public.cart_items TO authenticated;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO authenticated;
--- NOTE: public.payments and public.payment_webhook_events intentionally have NO
--- grants for anon/authenticated; only the service role (BYPASSRLS) touches them.
+-- NOTE: public.payments, public.refunds and public.payment_webhook_events
+-- intentionally have NO grants for anon/authenticated; only the service role
+-- (BYPASSRLS) touches them.
 
 -- 17. Admin helper
 CREATE OR REPLACE FUNCTION public.is_admin()
@@ -383,6 +464,8 @@ CREATE TRIGGER profiles_protect_role
 -- 20. Atomic order creation with stock decrement (used by the API server).
 -- Drop any older signature first so CREATE OR REPLACE can change the argument list.
 DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, TIMESTAMPTZ);
+DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ);
+DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TIMESTAMPTZ);
 CREATE OR REPLACE FUNCTION public.create_order_v2(
   p_order_id TEXT,
   p_order_number TEXT,
@@ -393,8 +476,12 @@ CREATE OR REPLACE FUNCTION public.create_order_v2(
   p_shipping_address TEXT,
   p_items JSONB,
   p_subtotal_minor_units BIGINT,
+  p_discount_minor_units BIGINT,
   p_shipping_minor_units BIGINT,
   p_total_minor_units BIGINT,
+  p_pricing_snapshot JSONB,
+  p_client_request_id TEXT,
+  p_payment_method TEXT,
   p_created_at TIMESTAMPTZ
 )
 RETURNS VOID
@@ -407,27 +494,54 @@ DECLARE
   v_product_id TEXT;
   v_variant_id UUID;
 BEGIN
+  -- SERVER-ONLY. This function is SECURITY DEFINER, so an EXECUTE grant to
+  -- anon/authenticated would let any visitor write an order with a
+  -- caller-chosen total (and decrement real stock). The guard is inside the
+  -- function so a future mis-grant cannot re-open the hole.
+  IF COALESCE(auth.role(), '') <> 'service_role' THEN
+    RAISE EXCEPTION 'create_order_v2 is server-only' USING ERRCODE = '42501';
+  END IF;
+
+  -- Money invariants, enforced at the write as well as in the app.
+  IF p_subtotal_minor_units % 100 <> 0
+     OR p_discount_minor_units % 100 <> 0
+     OR p_shipping_minor_units % 100 <> 0
+     OR p_total_minor_units % 100 <> 0 THEN
+    RAISE EXCEPTION 'order amounts must be whole shillings' USING ERRCODE = '22023';
+  END IF;
+  IF p_total_minor_units <> p_subtotal_minor_units - p_discount_minor_units + p_shipping_minor_units THEN
+    RAISE EXCEPTION 'order totals do not add up' USING ERRCODE = '22023';
+  END IF;
+  IF p_total_minor_units <= 0 THEN
+    RAISE EXCEPTION 'order total must be positive' USING ERRCODE = '22023';
+  END IF;
+  IF p_pricing_snapshot IS NOT NULL
+     AND COALESCE((p_pricing_snapshot->>'totalMinorUnits')::BIGINT, -1) <> p_total_minor_units THEN
+    RAISE EXCEPTION 'pricing snapshot disagrees with the order total' USING ERRCODE = '22023';
+  END IF;
+
   INSERT INTO public.orders (
-    id, order_number, customer_id, customer_name, customer_email, customer_phone,
-    shipping_address, items, status, payment_status, currency,
+    id, order_number, client_request_id, customer_id, customer_name, customer_email, customer_phone,
+    shipping_address, items, status, payment_status, payment_method, currency,
     subtotal_minor_units, discount_minor_units, shipping_minor_units, tax_minor_units,
-    total_minor_units, total_amount, created_at, updated_at
+    total_minor_units, total_amount, pricing_snapshot, refunded_minor_units, created_at, updated_at
   ) VALUES (
-    p_order_id, p_order_number, p_customer_id, p_customer_name, p_customer_email, p_customer_phone,
-    jsonb_build_object('address', COALESCE(p_shipping_address, '')), p_items, 'Pending', 'Pending', 'UGX',
-    p_subtotal_minor_units, 0, p_shipping_minor_units, 0,
-    p_total_minor_units, ROUND(p_total_minor_units / 100.0, 2), p_created_at, p_created_at
+    p_order_id, p_order_number, p_client_request_id, p_customer_id, p_customer_name, p_customer_email, p_customer_phone,
+    jsonb_build_object('address', COALESCE(p_shipping_address, '')), p_items, 'Pending', 'Pending',
+    CASE WHEN p_payment_method = 'cod' THEN 'cod' ELSE 'momo' END, 'UGX',
+    p_subtotal_minor_units, p_discount_minor_units, p_shipping_minor_units, 0,
+    p_total_minor_units, p_total_minor_units / 100.0, p_pricing_snapshot, 0, p_created_at, p_created_at
   );
 
   FOR item IN
     SELECT * FROM jsonb_to_recordset(p_items)
-      AS x("productName" TEXT, quantity INT, price NUMERIC, variant TEXT)
+      AS x("productName" TEXT, "productId" TEXT, quantity INT, price NUMERIC, variant TEXT)
   LOOP
     INSERT INTO public.order_items (
-      order_id, product_name, product_slug, variant_sku, variant_attributes,
+      order_id, product_id, product_name, product_slug, variant_sku, variant_attributes,
       unit_price_minor_units, quantity, line_total_minor_units, created_at
     ) VALUES (
-      p_order_id, item."productName",
+      p_order_id, NULLIF(item."productId", ''), item."productName",
       regexp_replace(lower(item."productName"), '[^a-z0-9]+', '-', 'g'),
       COALESCE(item.variant, 'Standard'), jsonb_build_object('variant', COALESCE(item.variant, 'Standard')),
       ROUND(COALESCE(item.price, 0) * 100)::BIGINT,
@@ -436,8 +550,18 @@ BEGIN
       p_created_at
     );
 
-    SELECT p.id INTO v_product_id FROM public.products p
-      WHERE p.name = item."productName" AND p.status = 'active' LIMIT 1;
+    -- Stock: prefer the immutable product id, fall back to the (unique-ish)
+    -- name for legacy callers.
+    v_product_id := NULLIF(item."productId", '');
+    IF v_product_id IS NOT NULL THEN
+      SELECT p.id INTO v_product_id FROM public.products p
+        WHERE p.id = v_product_id AND p.status = 'active' LIMIT 1;
+    END IF;
+    IF v_product_id IS NULL THEN
+      SELECT p.id INTO v_product_id FROM public.products p
+        WHERE p.name = item."productName" AND p.status = 'active' LIMIT 1;
+    END IF;
+
     IF v_product_id IS NOT NULL THEN
       SELECT pv.id INTO v_variant_id FROM public.product_variants pv
         WHERE pv.product_id = v_product_id AND pv.status = 'active'
@@ -456,19 +580,16 @@ BEGIN
 END;
 $$;
 
--- Revoked from anon: calling the RPC directly writes orders with caller-chosen
--- totals, bypassing the catalog re-pricing in app/api/orders/route.ts.
-GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) TO authenticated;
+-- EXECUTE is for the service role ONLY. Order rows are written by the API
+-- server, never by a browser holding a user JWT.
+REVOKE ALL ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ) TO service_role;
 
 -- 20b. CRITICAL — order state may never be supplied by a client.
--- public.orders is INSERTable by anon/authenticated (guest checkout) and
--- payment_status is a plain settable column whose CHECK constraint permits
--- 'Paid'. Without a trigger, any browser holding the public anon key could
--- PostgREST-insert an order already marked Paid for 1 UGX, defeating the
--- server-side catalog re-pricing and the webhook-only Paid transition.
--- Force EVERY insert to Pending regardless of caller: the server's order
--- creation path (create_order_v2 and the fallback insert) always writes
--- Pending anyway, so this costs nothing and closes the hole at the database.
+-- Force EVERY insert to Pending with no money already refunded, regardless of
+-- caller: the server's creation path always writes Pending anyway, so this costs
+-- nothing and closes the hole where a browser holding the public anon key could
+-- PostgREST-insert an order already marked Paid.
 CREATE OR REPLACE FUNCTION public.orders_force_pending()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -478,6 +599,7 @@ AS $$
 BEGIN
   NEW.status := 'Pending';
   NEW.payment_status := 'Pending';
+  NEW.refunded_minor_units := 0;
   RETURN NEW;
 END;
 $$;
@@ -487,16 +609,34 @@ CREATE TRIGGER orders_force_pending
   BEFORE INSERT ON public.orders
   FOR EACH ROW EXECUTE PROCEDURE public.orders_force_pending();
 
--- Payment state advances only via the verified gateway webhook (service role)
--- or an explicit admin reconciliation. Blocks direct PostgREST writes.
+-- Payment state is MONOTONIC:
+--   Pending -> Paid | Failed        (gateway webhook or audited admin)
+--   Paid    -> Refunded             (refund ledger only)
+--   Refunded is terminal.
+-- Nothing may move a Paid order back to Failed/Pending: a late or replayed
+-- failure notification used to cancel real revenue.
 CREATE OR REPLACE FUNCTION public.orders_protect_payment_status()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
 AS $$
+DECLARE
+  old_status TEXT := lower(COALESCE(OLD.payment_status, ''));
+  new_status TEXT := lower(COALESCE(NEW.payment_status, ''));
 BEGIN
-  IF NEW.payment_status IS DISTINCT FROM OLD.payment_status
+  IF new_status IS NOT DISTINCT FROM old_status THEN
+    RETURN NEW;
+  END IF;
+
+  IF old_status = 'paid' AND new_status NOT IN ('paid', 'refunded') THEN
+    RAISE EXCEPTION 'a paid order cannot be moved back to %', NEW.payment_status USING ERRCODE = '42501';
+  END IF;
+  IF old_status = 'refunded' AND new_status <> 'refunded' THEN
+    RAISE EXCEPTION 'a refunded order is final' USING ERRCODE = '42501';
+  END IF;
+
+  IF new_status IN ('paid', 'refunded')
      AND COALESCE(auth.role(), '') <> 'service_role'
      AND NOT public.is_admin() THEN
     RAISE EXCEPTION 'payment_status changes require the payment service role' USING ERRCODE = '42501';
@@ -510,8 +650,36 @@ CREATE TRIGGER orders_protect_payment_status
   BEFORE UPDATE ON public.orders
   FOR EACH ROW EXECUTE PROCEDURE public.orders_protect_payment_status();
 
--- Line items may only be attached to an order that is still Pending, so an
--- attacker cannot grow an already-paid order after the fact.
+-- The money on a non-pending order is frozen. Repricing a paid order after the
+-- fact would rewrite history and break every reconciliation.
+CREATE OR REPLACE FUNCTION public.orders_protect_amounts()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF lower(COALESCE(OLD.payment_status, '')) <> 'pending' THEN
+    IF NEW.total_minor_units IS DISTINCT FROM OLD.total_minor_units
+       OR NEW.subtotal_minor_units IS DISTINCT FROM OLD.subtotal_minor_units
+       OR NEW.discount_minor_units IS DISTINCT FROM OLD.discount_minor_units
+       OR NEW.shipping_minor_units IS DISTINCT FROM OLD.shipping_minor_units
+       OR NEW.pricing_snapshot IS DISTINCT FROM OLD.pricing_snapshot THEN
+      RAISE EXCEPTION 'amounts on a settled order are immutable' USING ERRCODE = '42501';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS orders_protect_amounts ON public.orders;
+CREATE TRIGGER orders_protect_amounts
+  BEFORE UPDATE ON public.orders
+  FOR EACH ROW EXECUTE PROCEDURE public.orders_protect_amounts();
+
+-- Line items are server-written. Even a legitimate owner may not add lines to a
+-- pending order from the browser: doing so desynchronises the total from the
+-- items and strands the payment.
 CREATE OR REPLACE FUNCTION public.order_items_require_pending_order()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -524,10 +692,13 @@ BEGIN
   IF COALESCE(auth.role(), '') = 'service_role' THEN
     RETURN NEW;
   END IF;
+  IF NOT public.is_admin() THEN
+    RAISE EXCEPTION 'order items are written by the server only' USING ERRCODE = '42501';
+  END IF;
   SELECT o.payment_status INTO v_payment_status
     FROM public.orders o
    WHERE o.id = NEW.order_id;
-  IF v_payment_status IS NULL OR v_payment_status <> 'Pending' THEN
+  IF v_payment_status IS NULL OR lower(v_payment_status) <> 'pending' THEN
     RAISE EXCEPTION 'cannot modify line items on a paid or missing order' USING ERRCODE = '42501';
   END IF;
   RETURN NEW;
@@ -590,6 +761,7 @@ ALTER TABLE public.carts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.cart_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.store_ratings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.payment_webhook_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.refunds ENABLE ROW LEVEL SECURITY;
 
 -- Catalog: public read, admin write
 DROP POLICY IF EXISTS "Catalog public read" ON public.categories;
@@ -635,9 +807,10 @@ DROP POLICY IF EXISTS "Store ratings own write" ON public.store_ratings;
 CREATE POLICY "Store ratings own write" ON public.store_ratings FOR ALL TO authenticated USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
 
 DROP POLICY IF EXISTS "Order items insert" ON public.order_items;
-CREATE POLICY "Order items insert" ON public.order_items FOR INSERT WITH CHECK (
-  EXISTS (SELECT 1 FROM public.orders o WHERE o.id = order_id)
-);
+-- Server/service-role only: no policy grants INSERT to anon or authenticated.
+-- (The role-level GRANT was revoked above; this removes the old permissive
+-- policy so a future re-grant cannot resurrect it.)
+DROP POLICY IF EXISTS "Order items owner insert" ON public.order_items;
 DROP POLICY IF EXISTS "Order items owner read" ON public.order_items;
 CREATE POLICY "Order items owner read" ON public.order_items FOR SELECT TO authenticated USING (
   EXISTS (SELECT 1 FROM public.orders o WHERE o.id = order_id AND (o.customer_id = auth.uid() OR public.is_admin()))

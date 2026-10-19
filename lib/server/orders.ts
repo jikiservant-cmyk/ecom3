@@ -1,50 +1,78 @@
 /**
- * Server-side order creation. This is the ONLY code path allowed to create orders.
+ * Server-side order creation and money reconciliation.
  *
  * Guarantees:
  * - Orders are created as Pending/Pending — payment state can only advance via a
- *   verified gateway webhook.
- * - Totals are accepted only from the server-computed checkout payload validated
- *   by the API route (client-supplied prices are still validated + capped here).
+ *   verified gateway webhook (or an audited admin reconciliation).
+ * - The total is computed by `lib/pricing.ts` from catalog prices, stored with an
+ *   immutable `pricing_snapshot`, and every later check (payment start, webhook)
+ *   validates against that snapshot instead of re-deriving from live data.
+ * - All amounts are whole-shilling integer minor units. The charge and the
+ *   reconciliation therefore use the same integer and cannot drift by rounding.
  * - Order numbers use a CSPRNG alphabet (no Math.random, no 6-digit collisions).
- * - Prefer the atomic `create_order_v2` Postgres function (single transaction,
- *   inventory decrement). Fall back to sequential service-role inserts with
- *   explicit error propagation when the function is not deployed.
+ * - Creation is idempotent per `client_request_id`.
  */
 import { randomBytes } from 'crypto';
 import { getServerAdminClient } from './supabaseServer';
 import { logger } from './logging';
+import {
+  DELIVERY_FEE_MINOR_UNITS,
+  computeShippingMinorUnits,
+  isWholeShillingMinor,
+  toWholeShillingMinor,
+} from '@/lib/pricing';
 
 const ORDER_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'; // no 0/O/1/I/L
 
 /** Flat delivery fee used by the storefront: 25,000 UGX (minor units). */
-export const FLAT_DELIVERY_FEE_MINOR_UNITS = 2_500_000;
+export const FLAT_DELIVERY_FEE_MINOR_UNITS = DELIVERY_FEE_MINOR_UNITS;
 
 export interface OrderTotals {
   subtotalMinorUnits: number;
+  discountMinorUnits: number;
   shippingMinorUnits: number;
   totalMinorUnits: number;
 }
 
 /**
- * Authoritative server-side total computation. The client's claimed total must
- * match this exactly (within a 1-unit rounding tolerance) or the order is
- * rejected. Shipping rule mirrors the storefront: flat fee whenever the cart
- * is non-empty.
+ * Authoritative server-side total computation for a set of line totals.
+ * Shipping is flat unless the cart qualifies for free delivery. `discount` is
+ * subtracted before the free-shipping threshold is evaluated, so a promotion
+ * cannot be used to unlock free delivery on an order that does not qualify.
  */
-export function computeOrderTotals(lineTotalsMinorUnits: number[]): OrderTotals {
-  const subtotalMinorUnits = lineTotalsMinorUnits.reduce((sum, v) => sum + (Number.isFinite(v) ? Math.round(v) : 0), 0);
-  const shippingMinorUnits = subtotalMinorUnits > 0 ? FLAT_DELIVERY_FEE_MINOR_UNITS : 0;
+export function computeOrderTotals(
+  lineTotalsMinorUnits: number[],
+  opts: { discountMinorUnits?: number; freeShippingThresholdMinorUnits?: number } = {}
+): OrderTotals {
+  const subtotalMinorUnits = (lineTotalsMinorUnits || []).reduce(
+    (sum, v) => sum + (Number.isFinite(v) ? Math.round(v) : 0),
+    0
+  );
+  const discountMinorUnits = Math.max(0, Math.round(opts.discountMinorUnits || 0));
+  const netSubtotal = subtotalMinorUnits - discountMinorUnits;
+  const shippingMinorUnits = computeShippingMinorUnits(
+    netSubtotal,
+    opts.freeShippingThresholdMinorUnits || 0
+  );
   return {
     subtotalMinorUnits,
+    discountMinorUnits,
     shippingMinorUnits,
-    totalMinorUnits: subtotalMinorUnits + shippingMinorUnits,
+    totalMinorUnits: netSubtotal + shippingMinorUnits,
   };
 }
 
-/** True when the client's claimed total matches the server-computed total. */
-export function totalsMatch(server: OrderTotals, claimedTotalMinorUnits: number, toleranceMinorUnits = 1): boolean {
-  return Number.isFinite(claimedTotalMinorUnits) && Math.abs(server.totalMinorUnits - claimedTotalMinorUnits) <= toleranceMinorUnits;
+/**
+ * True when the client's claimed total matches the server-computed total.
+ * Tolerance is 1 UGX (100 minor units) to absorb whole-shilling rounding on the
+ * client; it is far too small to be worth exploiting and far larger than any
+ * legitimate rounding difference.
+ */
+export function totalsMatch(server: OrderTotals, claimedTotalMinorUnits: number, toleranceMinorUnits = 100): boolean {
+  return (
+    Number.isFinite(claimedTotalMinorUnits) &&
+    Math.abs(server.totalMinorUnits - claimedTotalMinorUnits) <= toleranceMinorUnits
+  );
 }
 
 export interface CatalogPriceIndex {
@@ -55,7 +83,6 @@ export interface CatalogPriceIndex {
 }
 
 export interface CatalogValuation {
-  /** True when the stored total is justified by what the catalog says the items cost. */
   ok: boolean;
   catalogSubtotalMinor: number;
   catalogTotalMinor: number;
@@ -66,20 +93,14 @@ export interface CatalogValuation {
 }
 
 /**
- * Re-derive an order's value from the catalog and compare it to the total
- * stored on the order row.
+ * LEGACY valuation for orders created before pricing snapshots existed.
  *
- * Why this exists: `anon` can INSERT into `public.orders` (guest checkout), the
- * insert policy is `WITH CHECK (true)`, and the guard triggers only force
- * `payment_status` — nothing ever checks that `total_minor_units` reflects what
- * the items actually cost. An attacker can therefore insert an order for real
- * products with a 1-UGX total, call the public payment endpoint, pay 1 UGX, and
- * receive a webhook that reconciles against that same forged total and marks the
- * order Paid. Re-pricing here closes that regardless of how the row got there.
+ * Re-derive the order's value from the live catalog and compare it to the total
+ * stored on the order row. A stored total BELOW the catalog value is refused;
+ * a total above it is allowed (the catalog price dropped after checkout).
  *
- * A stored total BELOW the catalog value is the money-losing direction and is
- * always refused. A total above it (catalog price dropped after checkout) is
- * allowed — that is a normal price change, not a loss.
+ * New orders carry a `pricing_snapshot` and are validated with
+ * `validatePricingSnapshot` instead — see `lib/pricing.ts`.
  */
 export function valueOrderAgainstCatalog(opts: {
   items: { productName: string; quantity: number; productId?: string | null }[];
@@ -90,7 +111,18 @@ export function valueOrderAgainstCatalog(opts: {
   const unknownItems: string[] = [];
 
   for (const item of opts.items || []) {
-    const quantity = Number.isFinite(Number(item?.quantity)) ? Math.max(0, Math.round(Number(item.quantity))) : 0;
+    const rawQuantity = Number(item?.quantity);
+    if (!Number.isFinite(rawQuantity)) {
+      unknownItems.push(String(item?.productName || '(unnamed)'));
+      continue;
+    }
+    const quantity = Math.round(rawQuantity);
+    // A zero (or negative) quantity line is not chargeable and must never make
+    // an order "worth" zero while still claiming to be ok.
+    if (quantity <= 0) {
+      unknownItems.push(String(item?.productName || '(unnamed)'));
+      continue;
+    }
     const byId = item?.productId ? opts.prices.byId.get(String(item.productId)) : undefined;
     const priceMinor = byId !== undefined ? byId : opts.prices.byName.get(String(item?.productName || ''));
     if (priceMinor === undefined || !Number.isFinite(priceMinor) || priceMinor <= 0) {
@@ -101,7 +133,9 @@ export function valueOrderAgainstCatalog(opts: {
   }
 
   const catalog = computeOrderTotals(lineTotalsMinor);
-  const stored = Number.isFinite(Number(opts.storedTotalMinorUnits)) ? Math.round(Number(opts.storedTotalMinorUnits)) : NaN;
+  const stored = Number.isFinite(Number(opts.storedTotalMinorUnits))
+    ? Math.round(Number(opts.storedTotalMinorUnits))
+    : NaN;
   const shortByMinor = Number.isFinite(stored) ? Math.max(0, catalog.totalMinorUnits - stored) : Infinity;
 
   return {
@@ -118,6 +152,9 @@ export function valueOrderAgainstCatalog(opts: {
  * `select('id, name, status, product_variants ( price_minor_units, position, status )')`.
  * Inactive products are skipped; the first product wins a given name so a
  * duplicate name can never silently re-price a line to a cheaper product.
+ *
+ * NOTE: this index is only used for LEGACY (snapshot-less) orders. For those we
+ * also refuse to trust an ambiguous name — see `hasAmbiguousName`.
  */
 export function buildCatalogPriceIndex(products: any[]): CatalogPriceIndex {
   const byId = new Map<string, number>();
@@ -139,52 +176,83 @@ export function buildCatalogPriceIndex(products: any[]): CatalogPriceIndex {
   return { byId, byName };
 }
 
+/**
+ * Names that resolve to more than one active product. A name-keyed valuation
+ * for such a name is nondeterministic, so legacy orders that use one are
+ * refused rather than priced by whichever row Postgres returned first.
+ */
+export function ambiguousProductNames(products: any[]): Set<string> {
+  const seen = new Map<string, number>();
+  for (const p of products || []) {
+    if (!p || p.status !== 'active' || !p.name) continue;
+    seen.set(String(p.name), (seen.get(String(p.name)) || 0) + 1);
+  }
+  const ambiguous = new Set<string>();
+  for (const [name, count] of seen) if (count > 1) ambiguous.add(name);
+  return ambiguous;
+}
+
 export interface Reconciliation {
   amountOk: boolean;
   currencyOk: boolean;
   expectedMinor: number;
   paidMinor: number;
+  /** Why the notification was refused (for logs). Undefined when acceptable. */
+  reason?: string;
 }
+
+const STRICT_AMOUNT = /^\d{1,12}(\.\d{1,2})?$/;
 
 /**
  * Reconcile a gateway payment notification against the stored order.
  *
- * This is the ONLY amount defence we have: LivePay's documented signature
- * covers just customer_reference, internal_reference and status — `amount` is
- * NOT signed, so a notification with a valid signature can still carry a
- * tampered amount. Anything that is not exactly right (including a missing or
- * non-numeric amount) fails closed.
+ * LivePay's documented signature covers only customer_reference,
+ * internal_reference and status — `amount` is NOT signed — so this is the only
+ * amount defence. Everything fails closed.
  *
- * LivePay sends `amount` in major units (integer UGX), so it is scaled by 100.
+ * The expected amount comes from `total_minor_units` (one source of truth), not
+ * from the legacy `total_amount` column. `amount` is in major units (integer
+ * UGX per LivePay docs) and is scaled by 100.
  */
 export function reconcilePaymentAmount(opts: {
-  orderTotalAmount?: number | string | null;
   orderTotalMinorUnits?: number | string | null;
   orderCurrency?: string | null;
   payloadAmount?: unknown;
   payloadCurrency?: unknown;
 }): Reconciliation {
-  const totalAmount = opts.orderTotalAmount == null ? NaN : Number(opts.orderTotalAmount);
-  const totalMinor = opts.orderTotalMinorUnits == null ? NaN : Number(opts.orderTotalMinorUnits);
-  const expectedMinor = Number.isFinite(totalAmount) && totalAmount > 0
-    ? Math.round(totalAmount * 100)
-    : (Number.isFinite(totalMinor) ? Math.round(totalMinor) : NaN);
+  const expectedMinor = opts.orderTotalMinorUnits == null ? NaN : Number(opts.orderTotalMinorUnits);
 
-  const paidMinor = typeof opts.payloadAmount === 'number' || typeof opts.payloadAmount === 'string'
-    ? Math.round(Number(opts.payloadAmount) * 100)
-    : NaN;
+  let paidMinor = NaN;
+  let reason: string | undefined;
+  const raw = opts.payloadAmount;
+  if (typeof raw === 'number') {
+    if (Number.isFinite(raw)) paidMinor = Math.round(raw * 100);
+  } else if (typeof raw === 'string') {
+    // Strict digits only — no whitespace, no exponent, no hex. `Number()` would
+    // happily accept "1e3" and "0x2AB00"; this is the one field the gateway's
+    // signature does not cover, so it is parsed conservatively.
+    if (STRICT_AMOUNT.test(raw)) paidMinor = Math.round(Number(raw) * 100);
+  }
+  if (!Number.isFinite(paidMinor)) reason = 'amount not parseable';
+  else if (!Number.isSafeInteger(paidMinor)) reason = 'amount out of range';
 
   const payloadCurrency = opts.payloadCurrency == null ? '' : String(opts.payloadCurrency).trim().toUpperCase();
   const orderCurrency = (opts.orderCurrency || 'UGX').trim().toUpperCase();
+  const currencyOk = payloadCurrency === '' || payloadCurrency === orderCurrency;
 
-  return {
-    expectedMinor,
-    paidMinor,
-    amountOk: Number.isFinite(expectedMinor) && Number.isFinite(paidMinor) && paidMinor === expectedMinor,
-    // A missing currency on the notification is tolerated (documented payloads
-    // always carry one); a mismatching one is not.
-    currencyOk: payloadCurrency === '' || payloadCurrency === orderCurrency,
-  };
+  const amountOk =
+    !reason &&
+    isWholeShillingMinor(expectedMinor) &&
+    Number.isFinite(paidMinor) &&
+    paidMinor === expectedMinor;
+
+  if (!amountOk && !reason) {
+    reason = isWholeShillingMinor(expectedMinor)
+      ? 'amount mismatch'
+      : 'order total is not a whole shilling';
+  }
+
+  return { amountOk, currencyOk, expectedMinor, paidMinor, reason };
 }
 
 /**
@@ -217,9 +285,11 @@ export function generateOrderId(): string {
 }
 
 export interface OrderItemInput {
+  productId?: string | null;
   productName: string;
   quantity: number;
-  price: number; // major units (UGX), validated upstream against catalog
+  /** Major units (UGX). Validated upstream against the catalog; stored for display. */
+  price: number;
   variant?: string;
 }
 
@@ -231,8 +301,14 @@ export interface CreateOrderInput {
   customerId?: string | null;
   items: OrderItemInput[];
   total: number; // major units
-  shippingMinorUnits?: number;
+  totalMinorUnits?: number;
   subtotalMinorUnits?: number;
+  discountMinorUnits?: number;
+  shippingMinorUnits?: number;
+  /** Immutable pricing basis recorded at checkout (see lib/pricing.ts). */
+  pricingSnapshot?: unknown;
+  /** Idempotency key: a retried checkout returns the original order. */
+  clientRequestId?: string | null;
   /** 'momo' (gateway) or 'cod' (cash on delivery). Defaults to 'momo'. */
   paymentMethod?: 'momo' | 'cod';
 }
@@ -241,23 +317,66 @@ export interface CreateOrderResult {
   success: boolean;
   orderId?: string;
   orderNumber?: string;
+  /** True when an existing order was returned for a repeated idempotency key. */
+  idempotent?: boolean;
   error?: string;
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 /**
- * Create an order atomically. Uses the service-role client when available
- * (bypasses RLS); otherwise uses the anon client and relies on the public-insert
- * RLS policy documented for guest checkout.
+ * True when a PostgREST error says a column does not exist — i.e. the database
+ * has not had the latest schema applied yet.
+ */
+function isMissingColumnError(err: any): boolean {
+  const code = String(err?.code || '');
+  const msg = String(err?.message || '');
+  return code === 'PGRST204' || code === '42703' || /column .* does not exist/i.test(msg);
+}
+
+/** Remove the given keys from a payload so an un-migrated DB can still be written. */
+function withoutKeys(payload: Record<string, any>, keys: string[]): Record<string, any> {
+  const copy = { ...payload };
+  for (const key of keys) delete copy[key];
+  return copy;
+}
+
+const NEW_ORDER_COLUMNS = ['pricing_snapshot', 'client_request_id', 'refunded_minor_units'];
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CLIENT_REQUEST_ID_RE = /^[A-Za-z0-9-]{8,64}$/;
+
+const DUPLICATE_CODE = '23505';
+
+function isDuplicateError(err: any): boolean {
+  const msg = String(err?.message || '');
+  return err?.code === DUPLICATE_CODE || /duplicate key|already exists/i.test(msg);
+}
+
+async function findExistingOrder(
+  client: any,
+  clientRequestId: string
+): Promise<{ orderId: string; orderNumber: string } | null> {
+  try {
+    const { data } = await client
+      .from('orders')
+      .select('id, order_number')
+      .eq('client_request_id', clientRequestId)
+      .maybeSingle();
+    if (data?.id && data?.order_number) {
+      return { orderId: String(data.id), orderNumber: String(data.order_number) };
+    }
+  } catch {
+    // fall through: creation will surface any real problem
+  }
+  return null;
+}
+
+/**
+ * Create an order atomically. Requires the service-role client: order rows are
+ * only ever written by the server, after the API has priced them from the
+ * catalog. There is no client-side order creation path.
  */
 export async function createOrderServer(input: CreateOrderInput): Promise<CreateOrderResult> {
-  // FINANCIAL INTEGRITY: order writes require the service-role client. The
-  // previous `|| getServerAnonClient()` fallback only worked because anon was
-  // granted INSERT on public.orders — which is precisely what let an attacker
-  // forge an order row with an arbitrary (1 UGX) total and then pay it. Orders
-  // are now written only by this function, under the service role, from
-  // catalog-priced line items.
   const client = getServerAdminClient();
   if (!client) {
     logger.error('order_create_no_service_role', {
@@ -265,18 +384,52 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
     });
     return { success: false, error: 'Checkout is temporarily unavailable. Please try again.' };
   }
+
+  const clientRequestId =
+    input.clientRequestId && CLIENT_REQUEST_ID_RE.test(input.clientRequestId) ? input.clientRequestId : null;
+
+  // Idempotency: a retried checkout must not create a second order (and a second
+  // mobile-money prompt) for the same intent.
+  if (clientRequestId) {
+    const existing = await findExistingOrder(client, clientRequestId);
+    if (existing) {
+      logger.info('order_create_idempotent_replay', existing);
+      return { success: true, ...existing, idempotent: true };
+    }
+  }
+
   const orderId = generateOrderId();
   const orderNumber = generateOrderNumber();
   const now = new Date().toISOString();
-  const totalMinorUnits = Math.round(input.total * 100);
+  const totalMinorUnits = Number.isFinite(input.totalMinorUnits)
+    ? Number(input.totalMinorUnits)
+    : Math.round(input.total * 100);
   const safeCustomerId = input.customerId && UUID_RE.test(input.customerId) ? input.customerId : null;
 
-  const subtotalMinorUnits = input.subtotalMinorUnits ?? totalMinorUnits;
-  const shippingMinorUnits = input.shippingMinorUnits ?? Math.max(0, totalMinorUnits - subtotalMinorUnits);
+  const subtotalMinorUnits = Number(input.subtotalMinorUnits ?? totalMinorUnits);
+  const discountMinorUnits = Math.max(0, Number(input.discountMinorUnits ?? 0));
+  const shippingMinorUnits = Number(
+    input.shippingMinorUnits ?? Math.max(0, totalMinorUnits - subtotalMinorUnits + discountMinorUnits)
+  );
+
+  // FINANCIAL INVARIANT: the stored columns must add up, in whole shillings.
+  if (!isWholeShillingMinor(totalMinorUnits) || !isWholeShillingMinor(subtotalMinorUnits)) {
+    logger.error('order_create_non_integer_total', { totalMinorUnits, subtotalMinorUnits });
+    return { success: false, error: 'Checkout is temporarily unavailable. Please try again.' };
+  }
+  if (subtotalMinorUnits - discountMinorUnits + shippingMinorUnits !== totalMinorUnits) {
+    logger.error('order_create_total_mismatch', {
+      subtotalMinorUnits,
+      discountMinorUnits,
+      shippingMinorUnits,
+      totalMinorUnits,
+    });
+    return { success: false, error: 'Checkout is temporarily unavailable. Please try again.' };
+  }
 
   // Path 1: atomic Postgres function (transaction + stock decrement).
   try {
-    const { data, error } = await (client.rpc as any)('create_order_v2', {
+    const { error } = await (client.rpc as any)('create_order_v2', {
       p_order_id: orderId,
       p_order_number: orderNumber,
       p_customer_id: safeCustomerId,
@@ -286,22 +439,32 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       p_shipping_address: input.shippingAddress || '',
       p_items: input.items.map((it) => ({
         productName: it.productName,
+        productId: it.productId || null,
         quantity: it.quantity,
         price: it.price,
         variant: it.variant || 'Standard',
       })),
       p_subtotal_minor_units: subtotalMinorUnits,
+      p_discount_minor_units: discountMinorUnits,
       p_shipping_minor_units: shippingMinorUnits,
       p_total_minor_units: totalMinorUnits,
+      p_pricing_snapshot: input.pricingSnapshot ?? null,
+      p_client_request_id: clientRequestId,
+      p_payment_method: input.paymentMethod === 'cod' ? 'cod' : 'momo',
       p_created_at: now,
     });
     if (!error) {
       return { success: true, orderId, orderNumber };
     }
-    // PGRST202 / 42883 => function not deployed; fall through to manual path.
+    if (isDuplicateError(error) && clientRequestId) {
+      const existing = await findExistingOrder(client, clientRequestId);
+      if (existing) return { success: true, ...existing, idempotent: true };
+    }
+    // PGRST202 / 42883 => function (or its argument list) not deployed;
+    // fall through to the manual path.
     const code = (error as any).code || '';
     const msg = (error as any).message || '';
-    if (!msg.includes('create_order_v2') && code !== 'PGRST202' && code !== '42883') {
+    if (!msg.includes('create_order_v2') && code !== 'PGRST202' && code !== '42883' && code !== 'PGRST203') {
       logger.error('order_create_rpc_failed', { error: msg, code });
       return { success: false, error: 'Order could not be created. Please try again.' };
     }
@@ -311,14 +474,9 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
   }
 
   // Path 2: sequential inserts with strict error propagation (no silent partials).
-  // Reached only when create_order_v2 is not deployed; `client` is already the
-  // service-role client (see the guard at the top of this function).
-  //
-  // create_order_v2 decrements stock atomically and raises on oversell. This
-  // fallback cannot — PostgREST has no way to express
-  // `inventory_quantity = inventory_quantity - n` without an RPC — so it does a
-  // best-effort pre-flight check instead. It is NOT atomic: two simultaneous
-  // checkouts can both pass it. Deploy create_order_v2 for the real guarantee.
+  // Reached only when the current create_order_v2 signature is not deployed.
+  // It is NOT atomic: two simultaneous checkouts can both pass the pre-flight
+  // stock check. Deploy create_order_v2 for the real guarantee.
   try {
     const names = [...new Set(input.items.map((it) => it.productName))];
     const { data: variants, error: vErr } = await (client.from('product_variants') as any)
@@ -328,8 +486,6 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
     if (vErr) {
       logger.warn('order_stock_precheck_skipped', { error: vErr.message });
     } else {
-      // Mirror create_order_v2: the lowest-position active variant of an active
-      // product is the sellable one.
       const candidates = new Map<string, { position: number; qty: number }>();
       for (const v of variants || []) {
         const product = (v as any)?.products;
@@ -357,9 +513,10 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
   }
 
   try {
-    const { error: orderError } = await (client.from('orders') as any).insert({
+    let orderPayload: Record<string, any> = {
       id: orderId,
       order_number: orderNumber,
+      client_request_id: clientRequestId,
       customer_id: safeCustomerId,
       customer_name: input.customerName,
       customer_email: input.customerEmail,
@@ -371,15 +528,36 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       payment_method: input.paymentMethod === 'cod' ? 'cod' : 'momo',
       currency: 'UGX',
       subtotal_minor_units: subtotalMinorUnits,
-      discount_minor_units: 0,
+      discount_minor_units: discountMinorUnits,
       shipping_minor_units: shippingMinorUnits,
       tax_minor_units: 0,
       total_minor_units: totalMinorUnits,
-      total_amount: input.total,
+      total_amount: totalMinorUnits / 100,
+      pricing_snapshot: input.pricingSnapshot ?? null,
+      refunded_minor_units: 0,
       created_at: now,
       updated_at: now,
-    });
+    };
+
+    let { error: orderError } = await (client.from('orders') as any).insert(orderPayload);
+
+    // A database that has not had the latest schema applied would otherwise
+    // reject every checkout. Retry without the new columns, loudly.
+    if (orderError && isMissingColumnError(orderError)) {
+      logger.warn('order_create_schema_outdated', {
+        error: orderError.message,
+        hint: 'Re-run lib/schemaSql.ts — pricing snapshots and idempotency are disabled until then',
+      });
+      orderPayload = withoutKeys(orderPayload, NEW_ORDER_COLUMNS);
+      const retry = await (client.from('orders') as any).insert(orderPayload);
+      orderError = retry.error;
+    }
+
     if (orderError) {
+      if (isDuplicateError(orderError) && clientRequestId) {
+        const existing = await findExistingOrder(client, clientRequestId);
+        if (existing) return { success: true, ...existing, idempotent: true };
+      }
       logger.error('order_insert_failed', { error: orderError.message });
       return { success: false, error: 'Order could not be created. Please try again.' };
     }
@@ -387,6 +565,7 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
     if (input.items.length > 0) {
       const itemsPayload = input.items.map((it) => ({
         order_id: orderId,
+        product_id: it.productId || null,
         product_name: it.productName,
         product_slug: it.productName.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
         variant_sku: it.variant || 'Standard',
@@ -396,7 +575,13 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
         line_total_minor_units: Math.round(it.price * 100) * it.quantity,
         created_at: now,
       }));
-      const { error: itemsError } = await (client.from('order_items') as any).insert(itemsPayload);
+      let { error: itemsError } = await (client.from('order_items') as any).insert(itemsPayload);
+      if (itemsError && isMissingColumnError(itemsError)) {
+        const retry = await (client.from('order_items') as any).insert(
+          itemsPayload.map((row: Record<string, any>) => withoutKeys(row, ['product_id']))
+        );
+        itemsError = retry.error;
+      }
       if (itemsError) {
         // Compensate: do not leave a dangling order header.
         await (client.from('orders') as any).delete().eq('id', orderId);
@@ -410,4 +595,9 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
     logger.error('order_create_exception', { error: e?.message });
     return { success: false, error: 'Order could not be created. Please try again.' };
   }
+}
+
+/** Whole-shilling normalisation for catalog prices written by the admin UI. */
+export function normaliseCatalogPriceMinor(priceMinorUnits: number): number {
+  return toWholeShillingMinor(priceMinorUnits);
 }

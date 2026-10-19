@@ -552,6 +552,64 @@ export default function AdminPortal({
     }
   };
 
+  // Record a refund. LivePay has no refund API (momo collection only), so a
+  // refund is money the merchant sends back out of band — the server requires an
+  // amount and a reason and writes it to the refunds ledger.
+  const handleRefund = async (order: DbOrder) => {
+    const refundable = Math.max(0, (order.totalMinorUnits ?? 0) - (order.refundedMinorUnits ?? 0));
+    if (refundable <= 0) {
+      showToast("This order has already been fully refunded.");
+      return;
+    }
+    const amountInput = window.prompt(
+      `Refund amount in UGX (max ${refundable / 100}):`,
+      String(refundable / 100)
+    );
+    if (amountInput === null) return;
+    const amount = Number(amountInput);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      showToast("Enter a positive refund amount.");
+      return;
+    }
+    const reason = window.prompt(`Reason for refunding ${order.orderNumber} (required, recorded in the audit log):`);
+    if (reason === null) return;
+    if (reason.trim().length < 3) {
+      showToast("Please enter a reason of at least 3 characters.");
+      return;
+    }
+    try {
+      let accessToken: string | null = null;
+      try {
+        const { data } = await supabase.auth.getSession();
+        accessToken = data?.session?.access_token || null;
+      } catch {
+        accessToken = null;
+      }
+      if (!accessToken) {
+        showToast("Session expired. Please sign in again to record a refund.");
+        return;
+      }
+      const res = await fetch("/api/orders/refund", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+        body: JSON.stringify({ orderId: order.id, amount, note: reason.trim() }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.success) {
+        showToast(data?.error || "Could not record the refund.");
+        return;
+      }
+      showToast(
+        data.fullyRefunded
+          ? `Order refunded in full (${formatMoney(amount, currency)}).`
+          : `Refund of ${formatMoney(amount, currency)} recorded.`
+      );
+      loadData();
+    } catch {
+      showToast("Could not record the refund.");
+    }
+  };
+
   // Manual payment reconciliation escape hatch (admin-only). Used when the gateway
   // webhook could not confirm a payment. Every change is audit-logged server-side.
   const handleUpdatePaymentStatus = async (orderId: string, paymentStatus: "Pending" | "Paid" | "Failed" | "Refunded") => {
@@ -929,7 +987,18 @@ export default function AdminPortal({
     return o.status === orderStatusFilter;
   });
 
-  const totalRevenue = orders.reduce((sum, o) => sum + (o.paymentStatus === "Paid" ? o.total : 0), 0);
+  // Net collected money: paid orders minus refunds. Refunded orders keep their
+  // original total and carry the refunded amount, so subtracting is correct for
+  // both partial and full refunds. (The previous figure counted `Paid` only and
+  // was fed by a mapper that rewrote Failed/Refunded as Pending.)
+  const totalRevenue =
+    orders.reduce((sum, o) => {
+      if (o.paymentStatus !== "Paid" && o.paymentStatus !== "Refunded") return sum;
+      return sum + Math.max(0, (o.totalMinorUnits ?? 0) - (o.refundedMinorUnits ?? 0)) / 100;
+    }, 0);
+
+  const totalRefunded =
+    orders.reduce((sum, o) => sum + (o.refundedMinorUnits ?? 0) / 100, 0);
 
   // -------------------------------------------------------------
   // VIEW: Admin Authentication Screen
@@ -2627,20 +2696,58 @@ export default function AdminPortal({
                         <div className="flex items-center gap-2 flex-wrap">
                           <span className="font-bold text-sm text-slate-900 dark:text-white">
                             {formatMoney(order.total, currency)}
+                            {order.refundedMinorUnits > 0 && (
+                              <span className="block text-[10px] font-semibold text-rose-600 dark:text-rose-400">
+                                −{formatMoney(order.refundedMinorUnits / 100, currency)} refunded
+                              </span>
+                            )}
                           </span>
                           <select
-                            value={order.paymentStatus === "Paid" ? "Paid" : "Pending"}
-                            onChange={(e) => handleUpdatePaymentStatus(order.id, e.target.value as any)}
-                            title="Payment reconciliation (admin)"
-                            className={`py-1 px-2.5 text-xs rounded-lg border font-bold focus:outline-none ${
+                            value={order.paymentStatus}
+                            onChange={(e) => {
+                              const next = e.target.value as "Pending" | "Paid" | "Failed" | "Refunded";
+                              if (next === "Refunded") return;
+                              handleUpdatePaymentStatus(order.id, next);
+                            }}
+                            disabled={order.paymentStatus === "Refunded"}
+                            title={
+                              order.paymentStatus === "Paid"
+                                ? "A paid order cannot be un-paid. Use Record refund."
+                                : "Payment reconciliation (admin)"
+                            }
+                            className={`py-1 px-2.5 text-xs rounded-lg border font-bold focus:outline-none disabled:opacity-70 ${
                               order.paymentStatus === "Paid"
                                 ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:border-emerald-900 dark:text-emerald-300"
+                                : order.paymentStatus === "Failed"
+                                ? "border-rose-200 bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:border-rose-900 dark:text-rose-300"
+                                : order.paymentStatus === "Refunded"
+                                ? "border-slate-300 bg-slate-100 text-slate-600 dark:bg-slate-800 dark:border-slate-600 dark:text-slate-300"
                                 : "border-amber-200 bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:border-amber-900 dark:text-amber-300"
                             }`}
                           >
-                            <option value="Pending">Payment: Pending</option>
-                            <option value="Paid">Payment: Paid</option>
+                            <option value="Pending" disabled={order.paymentStatus !== "Pending"}>
+                              Payment: Pending
+                            </option>
+                            <option value="Paid" disabled={order.paymentStatus !== "Pending" && order.paymentStatus !== "Failed"}>
+                              Payment: Paid
+                            </option>
+                            <option value="Failed" disabled={order.paymentStatus !== "Pending"}>
+                              Payment: Failed
+                            </option>
+                            <option value="Refunded" disabled>
+                              Payment: Refunded
+                            </option>
                           </select>
+                          {(order.paymentStatus === "Paid" || order.paymentStatus === "Refunded") &&
+                            (order.totalMinorUnits ?? 0) - (order.refundedMinorUnits ?? 0) > 0 && (
+                              <button
+                                onClick={() => handleRefund(order)}
+                                title="Record a refund against this order"
+                                className="py-1 px-2.5 text-xs rounded-lg border border-rose-200 bg-rose-50 text-rose-700 font-bold hover:bg-rose-100 dark:bg-rose-950/40 dark:border-rose-900 dark:text-rose-300"
+                              >
+                                Record refund
+                              </button>
+                            )}
                           <select
                             value={order.status}
                             onChange={(e) => handleUpdateOrderStatus(order.id, e.target.value as any)}

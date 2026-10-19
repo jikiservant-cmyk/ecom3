@@ -79,6 +79,41 @@ The following is now enforced:
   PII-redacted view; no wildcards, no listing.
 - **No secrets in the browser.** LivePay credentials are server env vars only.
 
+## Money handling (see `MONEY_INTEGRITY_REVIEW.md`)
+
+Every amount is an integer count of **minor units** (1 UGX = 100), and only whole
+shillings are ever charged: UGX has no circulating subunit, so the amount charged,
+stored and reconciled is the same integer. `lib/pricing.ts` is the single pricing
+implementation — the storefront and the order API both call `priceOrder()`, so the
+price a customer sees is the price they are charged.
+
+- **Immutable pricing basis.** Checkout records `orders.pricing_snapshot` (per-line
+  catalog and effective unit prices, discount, shipping, total). Payment start and
+  the webhook validate the order against that snapshot, so a later catalog change
+  can neither strand nor reprice a placed order.
+- **Promotions are server-side.** Active deals in `store_settings.hotDeals` are
+  applied by the server; a deal can only lower a price. There is no client-side
+  anchor price — if no genuine "was" price is configured, none is shown.
+- **Delivery** is 25,000 UGX unless the net subtotal (after discounts) reaches
+  `store_settings.freeShippingThreshold` (default 500,000 UGX).
+- **Idempotent checkout.** The client sends `Idempotency-Key`; the API stores it in
+  `orders.client_request_id` (unique) and returns the original order on a replay,
+  so a retry cannot create a second order or a second mobile-money prompt.
+- **Monotonic payment state.** `Pending → Paid | Failed`, `Paid → Refunded`, and
+  `Refunded` is terminal, enforced in the webhook and by a DB trigger. Amounts on a
+  settled order are immutable.
+- **Refunds are recorded.** `POST /api/orders/refund` (admin) requires amount and
+  reason, writes a `refunds` row plus a negative `payments` row, and supports
+  partial refunds. Revenue in the admin portal is paid minus refunded.
+- **Settlements, not intentions.** `payments` stores requested *and* settled
+  amounts, gateway fee, net, provider transaction id and settlement time.
+
+> **Schema:** re-run the schema SQL after pulling these changes — it adds
+> `refunds`, the settlement columns on `payments`, `product_id` on `order_items`,
+> the pricing/idempotency/refund columns on `orders`, the money `CHECK`
+> constraints, the payment-state triggers, and the service-role-only
+> `create_order_v2`.
+
 ## Webhook integration (verified against docs.livepay.me, 2026-10-05)
 
 - LivePay POSTs the terminal transaction state to `/api/payments/livepay/webhook`

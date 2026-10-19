@@ -22,6 +22,7 @@ import {
 } from '@/lib/supabaseDb';
 import { ProductItem } from '@/lib/types';
 import { formatMoney } from '@/lib/utils';
+import { priceOrder, resolveUnitPriceMinor, toMinorUnits } from '@/lib/pricing';
 import { 
   getStoreSettings, 
   StoreSettings, 
@@ -141,6 +142,9 @@ export default function DrumPalaceApp() {
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const [showAdminPortal, setShowAdminPortal] = useState<boolean>(false);
   const hotDealsScrollRef = useRef<HTMLDivElement | null>(null);
+  // One idempotency key per checkout intent: a retry after a timeout returns the
+  // order that already exists instead of creating (and charging) a second one.
+  const checkoutAttemptRef = useRef<string | null>(null);
 
   // Auth States
   const [currentUser, setCurrentUser] = useState<{ id?: string; email: string; name?: string; role?: string; phone?: string } | null>(null);
@@ -479,13 +483,42 @@ export default function DrumPalaceApp() {
 
   const totalCartCount = cart.reduce((sum, item) => sum + item.qty, 0);
 
-  const subtotal = cart.reduce((sum, item) => {
-    const p = products.find((prod) => prod.id === item.id);
-    return sum + (p ? p.price * item.qty : 0);
-  }, 0);
+  // SINGLE SOURCE OF TRUTH: the cart totals are computed by the same pure
+  // function the order API uses, so the price shown is the price charged.
+  // Promotions from store settings are applied here too (previously the deals
+  // carousel advertised a discount that the cart never honoured).
+  const freeShippingThresholdMinorUnits = Number(storeSettings.freeShippingThreshold) > 0
+    ? toMinorUnits(Number(storeSettings.freeShippingThreshold))
+    : 0;
 
-  const deliveryFee = subtotal > 0 ? 25000 : 0;
-  const grandTotal = subtotal + deliveryFee;
+  const cartPricing = priceOrder({
+    lines: cart.flatMap((item) => {
+      const p = products.find((prod) => prod.id === item.id);
+      if (!p) return [];
+      return [{
+        productId: p.id,
+        productName: p.name,
+        quantity: item.qty,
+        catalogUnitMinorUnits: toMinorUnits(p.price),
+      }];
+    }),
+    deals: storeSettings.hotDeals,
+    freeShippingThresholdMinorUnits,
+  });
+
+  const subtotal = cartPricing.subtotalMinorUnits / 100;
+  const cartDiscount = cartPricing.discountMinorUnits / 100;
+  const deliveryFee = cartPricing.shippingMinorUnits / 100;
+  const grandTotal = cartPricing.totalMinorUnits / 100;
+
+  /** Effective price for one unit of a product (catalog or active promotion). */
+  const effectiveUnitPrice = (p: { id: string; name: string; price: number }) =>
+    resolveUnitPriceMinor({
+      productId: p.id,
+      productName: p.name,
+      catalogUnitMinorUnits: toMinorUnits(p.price),
+      deals: storeSettings.hotDeals,
+    }).unitMinorUnits / 100;
 
   const activeProduct = products.find((p) => p.id === activeProductId) || products[0];
 
@@ -663,6 +696,10 @@ export default function DrumPalaceApp() {
     }
   };
 
+  useEffect(() => {
+    checkoutAttemptRef.current = null;
+  }, [cart]);
+
   const handleCheckoutConfirm = async () => {
     if (cart.length === 0) {
       showToast('Your cart is empty.');
@@ -712,10 +749,17 @@ export default function DrumPalaceApp() {
           accessToken = null;
         }
       }
+      if (!checkoutAttemptRef.current) {
+        checkoutAttemptRef.current =
+          typeof crypto !== 'undefined' && 'randomUUID' in crypto
+            ? crypto.randomUUID()
+            : `ck-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      }
       const orderRes = await fetch('/api/orders', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Idempotency-Key': checkoutAttemptRef.current,
           ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
         },
         body: JSON.stringify({
@@ -758,6 +802,7 @@ export default function DrumPalaceApp() {
       } else {
         showToast(`Order #${orderData.orderNumber} received. You will pay ${formatMoney(grandTotal)} on delivery.`);
       }
+      checkoutAttemptRef.current = null;
       setCart([]);
       setMomoPhone('');
       setCheckoutName('');
@@ -1055,12 +1100,30 @@ export default function DrumPalaceApp() {
                       
                       if (!prod) return null;
                       
-                      const discount = deal.discountPercent || 25;
-                      const badge = deal.customBadge || `${discount}% OFF`;
+                      // The deal price is resolved by the SAME function the
+                      // checkout uses. The struck-through price is only shown
+                      // when the admin actually recorded one (and it is higher):
+                      // an anchor price invented from a percentage is a fake
+                      // discount.
+                      const resolved = resolveUnitPriceMinor({
+                        productId: prod.id,
+                        productName: prod.name,
+                        catalogUnitMinorUnits: toMinorUnits(prod.price),
+                        deals: [deal],
+                      });
+                      const dealPrice = resolved.unitMinorUnits / 100;
+                      const catalogPrice = resolved.catalogUnitMinorUnits / 100;
+                      const discount = resolved.catalogUnitMinorUnits > 0
+                        ? Math.round((resolved.discountMinorUnits / resolved.catalogUnitMinorUnits) * 100)
+                        : 0;
+                      const badge = deal.customBadge || (discount > 0 ? `${discount}% OFF` : "");
                       const dealImage = deal.customImage?.trim() || prod.image || "https://images.unsplash.com/photo-1519892300165-cb5542fb47c7?auto=format&fit=crop&w=700&q=85";
                       const dealTitle = deal.customTitle?.trim() || prod.name || "Hot Deal Instrument";
-                      const dealPrice = deal.customPrice ?? prod.price ?? 1000000;
-                      const originalPrice = deal.originalPrice ?? Math.round(dealPrice / (1 - discount / 100));
+                      const explicitOriginal = Number(deal.originalPrice);
+                      const originalPrice =
+                        Number.isFinite(explicitOriginal) && explicitOriginal > dealPrice
+                          ? explicitOriginal
+                          : undefined;
                       
                       return {
                         id: deal.id || `deal-${idx}`,
@@ -1085,11 +1148,14 @@ export default function DrumPalaceApp() {
                           key={`hotdeal-${id}-${prod.id}`}
                           className="snap-start shrink-0 w-[220px] xs:w-[240px] sm:w-[260px] md:w-[280px] bg-[var(--surface)] border border-[var(--line)] rounded-2xl overflow-hidden shadow-sm hover:shadow-md transition-all flex flex-col justify-between group relative"
                         >
-                          {/* Discount / Promotional Badge */}
-                          <div className="absolute top-2.5 left-2.5 z-10 flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-rose-600 text-white text-[10px] font-bold shadow-sm">
-                            <Flame size={11} className="shrink-0" />
-                            <span>{badge.includes('%') ? badge : `${badge} -${discount}%`}</span>
-                          </div>
+                          {/* Discount / Promotional Badge — only when the price
+                              really is below the catalog price. */}
+                          {badge && discount > 0 && (
+                            <div className="absolute top-2.5 left-2.5 z-10 flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-rose-600 text-white text-[10px] font-bold shadow-sm">
+                              <Flame size={11} className="shrink-0" />
+                              <span>{badge.includes('%') ? badge : `${badge} -${discount}%`}</span>
+                            </div>
+                          )}
 
                           {/* Wishlist Button */}
                           <button
@@ -1132,9 +1198,11 @@ export default function DrumPalaceApp() {
                                 <p className="text-sm sm:text-base font-extrabold text-rose-600 dark:text-rose-400">
                                   {formatMoney(dealPrice)}
                                 </p>
-                                <p className="text-[11px] sm:text-xs text-[var(--muted)] line-through">
-                                  {formatMoney(originalPrice)}
-                                </p>
+                                {originalPrice !== undefined && (
+                                  <p className="text-[11px] sm:text-xs text-[var(--muted)] line-through">
+                                    {formatMoney(originalPrice)}
+                                  </p>
+                                )}
                               </div>
                             </div>
 
@@ -1678,7 +1746,7 @@ export default function DrumPalaceApp() {
                             {prod.name}
                           </h3>
                           <p className="text-xs sm:text-sm font-bold text-[var(--accent)]">
-                            {formatMoney(prod.price)}
+                            {formatMoney(effectiveUnitPrice(prod))}
                           </p>
                         </div>
 
@@ -1713,9 +1781,17 @@ export default function DrumPalaceApp() {
                     <span>Subtotal</span>
                     <span className="font-semibold text-[var(--ink)]">{formatMoney(subtotal)}</span>
                   </div>
+                  {cartDiscount > 0 && (
+                    <div className="flex justify-between text-xs sm:text-sm text-emerald-600 mb-2">
+                      <span>Discount</span>
+                      <span className="font-semibold">−{formatMoney(cartDiscount)}</span>
+                    </div>
+                  )}
                   <div className="flex justify-between text-xs sm:text-sm text-[var(--muted)] mb-3">
                     <span>Delivery fee</span>
-                    <span className="font-semibold text-[var(--ink)]">{formatMoney(deliveryFee)}</span>
+                    <span className="font-semibold text-[var(--ink)]">
+                      {deliveryFee > 0 ? formatMoney(deliveryFee) : 'Free'}
+                    </span>
                   </div>
                   <div className="flex justify-between text-base sm:text-xl font-bold text-[var(--ink)] border-t border-[var(--line)] pt-3">
                     <span>Total</span>
@@ -1965,7 +2041,7 @@ export default function DrumPalaceApp() {
                           </div>
                           <div className="flex-1 min-w-0">
                             <p className="text-xs font-bold text-[var(--ink)] truncate">{prod.name}</p>
-                            <p className="text-[11px] text-[var(--muted)]">Qty: {cItem.qty} × {formatMoney(prod.price)}</p>
+                            <p className="text-[11px] text-[var(--muted)]">Qty: {cItem.qty} × {formatMoney(effectiveUnitPrice(prod))}</p>
                           </div>
                         </div>
                       );
@@ -1978,9 +2054,17 @@ export default function DrumPalaceApp() {
                       <span>Subtotal</span>
                       <span className="font-semibold text-[var(--ink)]">{formatMoney(subtotal)}</span>
                     </div>
+                    {cartDiscount > 0 && (
+                      <div className="flex justify-between text-xs sm:text-sm text-emerald-600">
+                        <span>Discount</span>
+                        <span className="font-semibold">−{formatMoney(cartDiscount)}</span>
+                      </div>
+                    )}
                     <div className="flex justify-between text-xs sm:text-sm text-[var(--muted)]">
                       <span>Delivery (Uganda)</span>
-                      <span className="font-semibold text-[var(--ink)]">{formatMoney(deliveryFee)}</span>
+                      <span className="font-semibold text-[var(--ink)]">
+                        {deliveryFee > 0 ? formatMoney(deliveryFee) : 'Free'}
+                      </span>
                     </div>
                     <div className="flex justify-between text-base sm:text-xl font-bold text-[var(--ink)] border-t border-[var(--line)] pt-2.5">
                       <span>Grand Total</span>

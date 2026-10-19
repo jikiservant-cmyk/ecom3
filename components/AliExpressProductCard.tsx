@@ -32,7 +32,10 @@ export default function AliExpressProductCard({
   currency = "UGX"
 }: AliExpressProductCardProps) {
   const currentFormatted = formatMoney(product.price, currency);
-  const oldFormatted = product.originalPrice > product.price ? formatMoney(product.originalPrice, currency) : undefined;
+  const oldFormatted =
+    typeof product.originalPrice === 'number' && product.originalPrice > product.price
+      ? formatMoney(product.originalPrice, currency)
+      : undefined;
   const priceFormatted = {
     current: currentFormatted,
     old: oldFormatted,

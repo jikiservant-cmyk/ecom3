@@ -3,7 +3,13 @@ import { getServerAdminClient } from '@/lib/server/supabaseServer';
 import { logger } from '@/lib/server/logging';
 import { readJsonBody, isNonEmptyString, jsonError } from '@/lib/server/validation';
 import { consumeRateLimit } from '@/lib/server/rateLimit';
-import { safeReturnUrl, valueOrderAgainstCatalog, buildCatalogPriceIndex } from '@/lib/server/orders';
+import {
+  safeReturnUrl,
+  valueOrderAgainstCatalog,
+  buildCatalogPriceIndex,
+  ambiguousProductNames,
+} from '@/lib/server/orders';
+import { isWholeShillingMinor, validatePricingSnapshot } from '@/lib/pricing';
 
 export const dynamic = 'force-dynamic';
 
@@ -79,7 +85,11 @@ export async function POST(req: NextRequest) {
   let order: any = null;
   try {
     const { data, error } = await (client.from('orders') as any)
-      .select('id, order_number, customer_name, customer_phone, total_minor_units, total_amount, currency, payment_status')
+      .select(
+        'id, order_number, customer_name, customer_phone, status, payment_method, payment_status, ' +
+          'subtotal_minor_units, discount_minor_units, shipping_minor_units, total_minor_units, ' +
+          'refunded_minor_units, currency, pricing_snapshot'
+      )
       .eq('id', orderId)
       .maybeSingle();
     if (error) {
@@ -93,61 +103,112 @@ export async function POST(req: NextRequest) {
   }
 
   if (!order) return jsonError('Order not found', 404);
-  if (order.payment_status === 'Paid') return jsonError('This order has already been paid', 409);
 
-  const amountUgx = Math.round(order.total_amount ? Number(order.total_amount) : Number(order.total_minor_units || 0) / 100);
-  if (!(amountUgx > 0)) {
-    logger.error('livepay_invalid_order_amount', { orderId });
-    return jsonError('Order has an invalid amount', 422);
+  // 1a. STATE GATES. Only an unpaid, non-terminal, mobile-money order may be
+  //     charged. Without these, a Cancelled order could be paid (silently
+  //     un-cancelling it), a Refunded order could be charged again, and a COD
+  //     order could be paid online while the courier also collects cash.
+  const paymentStatus = String(order.payment_status || '').toLowerCase();
+  const orderStatus = String(order.status || '').toLowerCase();
+  const paymentMethod = String(order.payment_method || 'momo').toLowerCase();
+
+  if (paymentStatus === 'paid') return jsonError('This order has already been paid', 409);
+  if (paymentStatus === 'refunded') {
+    return jsonError('This order has been refunded and cannot be paid again.', 409);
+  }
+  if (orderStatus === 'cancelled') {
+    return jsonError('This order was cancelled. Please place a new order.', 409);
+  }
+  if (orderStatus === 'delivered' || orderStatus === 'shipped') {
+    return jsonError('This order has already been dispatched. Please contact support.', 409);
+  }
+  if (paymentMethod !== 'momo') {
+    return jsonError('This order is set to pay on delivery, so there is nothing to charge now.', 409);
+  }
+  if (Number(order.refunded_minor_units || 0) > 0) {
+    return jsonError('This order already has a refund recorded against it. Please contact support.', 409);
   }
 
-  // 1b. FINANCIAL INTEGRITY: re-derive the order's value from the catalog and
-  //     refuse to charge a total the items do not justify. Without this, an
-  //     attacker who inserts an order row directly (anon has INSERT on
-  //     public.orders and the insert policy is `WITH CHECK (true)`) could set
-  //     total_amount to 1 UGX, pay 1 UGX here, and then receive a webhook that
-  //     reconciles against that same forged total and marks the order Paid.
+  // 1b. AMOUNT — one source of truth, and it must be a whole shilling so the
+  //     amount we charge is exactly the amount the webhook will reconcile.
+  const totalMinorUnits = Number(order.total_minor_units);
+  if (!isWholeShillingMinor(totalMinorUnits) || totalMinorUnits <= 0) {
+    logger.error('livepay_invalid_order_amount', { orderId, totalMinorUnits });
+    return jsonError('Order has an invalid amount', 422);
+  }
+  const amountUgx = totalMinorUnits / 100;
+
+  // 1c. FINANCIAL INTEGRITY — the order must be worth what it says it is worth.
+  //
+  //     Orders written by this app carry an immutable `pricing_snapshot` taken
+  //     at checkout; it is validated for internal consistency and against the
+  //     stored columns. Orders created before snapshots existed fall back to
+  //     re-pricing against the live catalog (legacy path).
   try {
-    const { data: orderItems } = await (client.from('order_items') as any)
-      .select('product_name, quantity, variant_sku')
-      .eq('order_id', order.id);
-
-    if (!Array.isArray(orderItems) || orderItems.length === 0) {
-      logger.error('livepay_order_has_no_items', { orderId });
-      return jsonError('This order has no items and cannot be paid.', 422);
-    }
-
-    const productNames = [...new Set(orderItems.map((it: any) => String(it?.product_name || '')).filter(Boolean))];
-    const { data: catalogRows, error: catErr } = await (client.from('products') as any)
-      .select('id, name, status, product_variants ( price_minor_units, position, status )')
-      .in('name', productNames);
-    if (catErr) {
-      logger.error('livepay_catalog_lookup_error', { error: catErr.message });
-      return jsonError('Payment could not be started', 500);
-    }
-
-    const valuation = valueOrderAgainstCatalog({
-      items: orderItems.map((it: any) => ({
-        productName: String(it?.product_name || ''),
-        quantity: Number(it?.quantity) || 0,
-      })),
-      prices: buildCatalogPriceIndex(catalogRows || []),
-      storedTotalMinorUnits: Number(order.total_minor_units ?? Math.round(Number(order.total_amount || 0) * 100)),
-    });
-
-    if (!valuation.ok) {
-      logger.error('livepay_order_total_not_justified_by_catalog', {
-        orderId,
-        orderNumber: order.order_number,
-        storedTotalMinor: Number(order.total_minor_units),
-        catalogTotalMinor: valuation.catalogTotalMinor,
-        shortByMinor: valuation.shortByMinor,
-        unknownItems: valuation.unknownItems,
+    if (order.pricing_snapshot) {
+      const validation = validatePricingSnapshot({
+        snapshot: order.pricing_snapshot,
+        storedSubtotalMinorUnits: order.subtotal_minor_units,
+        storedDiscountMinorUnits: order.discount_minor_units,
+        storedShippingMinorUnits: order.shipping_minor_units,
+        storedTotalMinorUnits: totalMinorUnits,
       });
-      return jsonError(
-        'The total on this order no longer matches our catalog. Please place a new order.',
-        409
-      );
+      if (!validation.ok) {
+        logger.error('livepay_order_snapshot_invalid', {
+          orderId,
+          orderNumber: order.order_number,
+          reason: validation.reason,
+          storedTotalMinor: totalMinorUnits,
+        });
+        return jsonError('The total on this order could not be verified. Please place a new order.', 409);
+      }
+    } else {
+      const { data: orderItems } = await (client.from('order_items') as any)
+        .select('product_id, product_name, quantity, variant_sku')
+        .eq('order_id', order.id);
+
+      if (!Array.isArray(orderItems) || orderItems.length === 0) {
+        logger.error('livepay_order_has_no_items', { orderId });
+        return jsonError('This order has no items and cannot be paid.', 422);
+      }
+
+      const productNames = [...new Set(orderItems.map((it: any) => String(it?.product_name || '')).filter(Boolean))];
+      const { data: catalogRows, error: catErr } = await (client.from('products') as any)
+        .select('id, name, status, product_variants ( price_minor_units, position, status )')
+        .in('name', productNames);
+      if (catErr) {
+        logger.error('livepay_catalog_lookup_error', { error: catErr.message });
+        return jsonError('Payment could not be started', 500);
+      }
+
+      const ambiguous = ambiguousProductNames(catalogRows || []);
+      const ambiguousUsed = productNames.filter((n) => ambiguous.has(n));
+      if (ambiguousUsed.length > 0) {
+        logger.error('livepay_ambiguous_product_name', { orderId, ambiguousUsed });
+        return jsonError('This order could not be priced unambiguously. Please place a new order.', 409);
+      }
+
+      const valuation = valueOrderAgainstCatalog({
+        items: orderItems.map((it: any) => ({
+          productId: it?.product_id ? String(it.product_id) : null,
+          productName: String(it?.product_name || ''),
+          quantity: Number(it?.quantity) || 0,
+        })),
+        prices: buildCatalogPriceIndex(catalogRows || []),
+        storedTotalMinorUnits: totalMinorUnits,
+      });
+
+      if (!valuation.ok) {
+        logger.error('livepay_order_total_not_justified_by_catalog', {
+          orderId,
+          orderNumber: order.order_number,
+          storedTotalMinor: totalMinorUnits,
+          catalogTotalMinor: valuation.catalogTotalMinor,
+          shortByMinor: valuation.shortByMinor,
+          unknownItems: valuation.unknownItems,
+        });
+        return jsonError('The total on this order no longer matches our catalog. Please place a new order.', 409);
+      }
     }
   } catch (e: any) {
     logger.error('livepay_order_valuation_exception', { orderId, error: e?.message });
@@ -201,7 +262,7 @@ export async function POST(req: NextRequest) {
       provider: 'livepay',
       provider_reference: transactionReference,
       status: 'pending',
-      amount_minor_units: amountUgx * 100,
+      amount_minor_units: totalMinorUnits, // requested; settled_* is written by the webhook
       currency: 'UGX',
       raw_payload: { method: 'momo', initiated_at: new Date().toISOString() },
       created_at: new Date().toISOString(),

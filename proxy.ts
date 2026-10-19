@@ -33,6 +33,8 @@ const LIMITS: RouteLimit[] = [
   { match: /^\/api\/payments\/livepay\/test-connection$/, methods: ['POST'], windowMs: MINUTE, max: 5, bucket: 'pay-test' },
   { match: /^\/api\/payments\/livepay$/, methods: ['POST'], windowMs: MINUTE, max: 10, bucket: 'pay' },
   { match: /^\/api\/orders$/, methods: ['POST'], windowMs: MINUTE, max: 10, bucket: 'order-create' },
+  // Admin money-out action: tight cap so a hijacked session cannot mass-refund.
+  { match: /^\/api\/orders\/refund$/, methods: ['POST'], windowMs: MINUTE, max: 20, bucket: 'order-refund' },
   { match: /^\/api\/contact$/, methods: ['POST'], windowMs: MINUTE, max: 5, bucket: 'contact' },
   { match: /^\/api\/reviews$/, methods: ['POST'], windowMs: MINUTE, max: 5, bucket: 'review' },
   { match: /^\/api\//, methods: ['GET', 'POST', 'PATCH', 'DELETE'], windowMs: MINUTE, max: 120, bucket: 'api' },

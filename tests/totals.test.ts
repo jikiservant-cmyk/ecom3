@@ -19,10 +19,23 @@ describe('server-side order totals', () => {
   it('accepts a matching client total, rejects a mismatch', () => {
     const t = computeOrderTotals([100_00_00]);
     expect(totalsMatch(t, t.totalMinorUnits)).toBe(true);
-    expect(totalsMatch(t, t.totalMinorUnits + 1)).toBe(true); // 1-unit tolerance
-    expect(totalsMatch(t, t.totalMinorUnits + 2)).toBe(false);
+    expect(totalsMatch(t, t.totalMinorUnits + 100)).toBe(true); // 1 UGX rounding tolerance
+    expect(totalsMatch(t, t.totalMinorUnits + 101)).toBe(false);
     expect(totalsMatch(t, 1)).toBe(false); // attacker 1-UGX attempt
     expect(totalsMatch(t, NaN)).toBe(false);
+  });
+
+  it('applies discounts before deciding on free delivery', () => {
+    const t = computeOrderTotals([60_000_00], { discountMinorUnits: 20_000_00, freeShippingThresholdMinorUnits: 50_000_00 });
+    expect(t.discountMinorUnits).toBe(20_000_00);
+    expect(t.shippingMinorUnits).toBe(FLAT_DELIVERY_FEE_MINOR_UNITS); // net 40k < 50k threshold
+    expect(t.totalMinorUnits).toBe(40_000_00 + FLAT_DELIVERY_FEE_MINOR_UNITS);
+  });
+
+  it('drops the delivery fee at or above the free-delivery threshold', () => {
+    const t = computeOrderTotals([50_000_00], { freeShippingThresholdMinorUnits: 50_000_00 });
+    expect(t.shippingMinorUnits).toBe(0);
+    expect(t.totalMinorUnits).toBe(50_000_00);
   });
 });
 
@@ -63,7 +76,7 @@ describe('clientIp trusts the rightmost X-Forwarded-For entry only', () => {
 });
 
 describe('reconcilePaymentAmount (the only defence for unsigned `amount`)', () => {
-  const order = { orderTotalAmount: 175000, orderTotalMinorUnits: 17_500_000, orderCurrency: 'UGX' };
+  const order = { orderTotalMinorUnits: 17_500_000, orderCurrency: 'UGX' };
 
   it('accepts an exact match', () => {
     const r = reconcilePaymentAmount({ ...order, payloadAmount: 175000, payloadCurrency: 'UGX' });
@@ -88,9 +101,8 @@ describe('reconcilePaymentAmount (the only defence for unsigned `amount`)', () =
     expect(reconcilePaymentAmount({ ...order, payloadAmount: {} }).amountOk).toBe(false);
   });
 
-  it('falls back to total_minor_units when total_amount is absent', () => {
+  it('uses total_minor_units as the single source of truth', () => {
     const r = reconcilePaymentAmount({
-      orderTotalAmount: null,
       orderTotalMinorUnits: 5_000_000,
       orderCurrency: 'UGX',
       payloadAmount: 50000,
@@ -99,9 +111,25 @@ describe('reconcilePaymentAmount (the only defence for unsigned `amount`)', () =
     expect(r.amountOk).toBe(true);
   });
 
+  it('fails closed when the order total is not a whole shilling', () => {
+    const r = reconcilePaymentAmount({
+      orderTotalMinorUnits: 5_000_050, // 50 minor units = half a shilling
+      orderCurrency: 'UGX',
+      payloadAmount: 50000.5,
+      payloadCurrency: 'UGX',
+    });
+    expect(r.amountOk).toBe(false);
+    expect(r.reason).toMatch(/whole shilling/);
+  });
+
+  it('rejects lenient string amounts that Number() would accept', () => {
+    for (const payloadAmount of ['1e3', '0x2AB00', ' 175000 ', '175000abc']) {
+      expect(reconcilePaymentAmount({ ...order, payloadAmount }).amountOk).toBe(false);
+    }
+  });
+
   it('fails closed when the order has no usable total', () => {
     const r = reconcilePaymentAmount({
-      orderTotalAmount: null,
       orderTotalMinorUnits: null,
       payloadAmount: 50000,
       payloadCurrency: 'UGX',

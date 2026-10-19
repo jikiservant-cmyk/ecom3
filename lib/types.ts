@@ -4,7 +4,8 @@ export interface ProductItem {
   category: string;
   subtitle: string;
   price: number;
-  originalPrice: number;
+  /** Optional genuine "was" price. Absent means: no discount is being claimed. */
+  originalPrice?: number;
   rating: number;
   reviewsCount: number;
   soldCount: string;

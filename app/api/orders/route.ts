@@ -1,8 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { authenticateAdmin, authenticateRequest, getServerAdminClient, getServerAnonClient, isServerSupabaseConfigured } from '@/lib/server/supabaseServer';
-import { createOrderServer, computeOrderTotals, totalsMatch } from '@/lib/server/orders';
+import {
+  authenticateAdmin,
+  authenticateRequest,
+  getServerAdminClient,
+  getServerAnonClient,
+  isServerSupabaseConfigured,
+} from '@/lib/server/supabaseServer';
+import { createOrderServer, buildCatalogPriceIndex } from '@/lib/server/orders';
+import { priceOrder, PromoDeal, toMinorUnits } from '@/lib/pricing';
 import { logger, newRequestId } from '@/lib/server/logging';
-import { readJsonBody, isNonEmptyString, isEmail, isFiniteNumber, isIntInRange, sanitizeText, jsonError } from '@/lib/server/validation';
+import {
+  readJsonBody,
+  isNonEmptyString,
+  isEmail,
+  isFiniteNumber,
+  isIntInRange,
+  sanitizeText,
+  jsonError,
+} from '@/lib/server/validation';
 
 export const dynamic = 'force-dynamic';
 
@@ -11,14 +26,18 @@ const MAX_QUANTITY = 20;
 const ALLOWED_STATUSES = ['Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled'];
 const ALLOWED_PAYMENT_STATUSES = ['Pending', 'Paid', 'Failed', 'Refunded'];
 
-/** Redact PII for the public order-tracking lookup. */
+/**
+ * PII-redacted view for the public order-tracking lookup.
+ *
+ * Deliberately omits the order `id`: that id is the key used to attach line
+ * items, so publishing it turned a capability URL into write access.
+ */
 function publicOrderView(order: any, items: any[]) {
   return {
-    id: order.id,
     orderNumber: order.order_number,
     status: order.status,
     paymentStatus: order.payment_status,
-    total: order.total_amount ?? (order.total_minor_units ? Number(order.total_minor_units) / 100 : 0),
+    total: order.total_minor_units ? Number(order.total_minor_units) / 100 : 0,
     currency: order.currency,
     createdAt: order.created_at,
     itemCount: Array.isArray(items) ? items.length : 0,
@@ -47,7 +66,7 @@ export async function GET(req: NextRequest) {
       const client = getServerAdminClient();
       if (!client) return jsonError('Order lookup is not configured', 503);
       const { data: order, error } = await (client.from('orders') as any)
-        .select('id, order_number, status, payment_status, total_amount, total_minor_units, currency, created_at')
+        .select('id, order_number, status, payment_status, total_minor_units, currency, created_at')
         .eq('order_number', term.toUpperCase())
         .maybeSingle();
       if (error || !order) return jsonError('Order not found', 404);
@@ -72,7 +91,6 @@ export async function GET(req: NextRequest) {
     const query = searchParams.get('q') || searchParams.get('id') || searchParams.get('orderNumber');
     if (query) {
       const term = sanitizeText(query, 64);
-      // Strict charset so the value is safe inside a PostgREST .or() filter.
       if (!/^[A-Za-z0-9_-]{1,64}$/.test(term)) return jsonError('Invalid query format', 400);
       const { data: order, error } = await (client.from('orders') as any)
         .select('*')
@@ -82,7 +100,6 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ success: true, order });
     }
 
-    // Paginated list (default 100, max 500) instead of unbounded full-table dumps.
     const limit = Math.min(Number(searchParams.get('limit') || 100), 500);
     const offset = Math.max(Number(searchParams.get('offset') || 0), 0);
     const { data: orders, error, count } = await (client.from('orders') as any)
@@ -101,9 +118,43 @@ export async function GET(req: NextRequest) {
 }
 
 /**
+ * Pricing configuration owned by the store, read server-side:
+ * active promotions and the free-delivery threshold. `store_settings` is
+ * publicly readable, so the admin client is not required.
+ */
+async function loadPricingSettings(client: any): Promise<{
+  deals: PromoDeal[];
+  freeShippingThresholdMinorUnits: number;
+}> {
+  try {
+    const { data } = await client
+      .from('store_settings')
+      .select('settings')
+      .eq('id', 'default_settings')
+      .maybeSingle();
+    const settings = (data?.settings as any) || {};
+    const deals: PromoDeal[] = Array.isArray(settings.hotDeals)
+      ? settings.hotDeals.filter((d: any) => d && d.active !== false)
+      : [];
+    const thresholdMajor = Number(settings.freeShippingThreshold);
+    return {
+      deals,
+      freeShippingThresholdMinorUnits:
+        Number.isFinite(thresholdMajor) && thresholdMajor > 0 ? toMinorUnits(thresholdMajor) : 0,
+    };
+  } catch (e: any) {
+    logger.warn('order_pricing_settings_unavailable', { error: e?.message });
+    return { deals: [], freeShippingThresholdMinorUnits: 0 };
+  }
+}
+
+/**
  * Create an order. Public (guest checkout supported) but strictly validated and
  * rate-limited in middleware. Orders are always created Pending; payment state
  * advances only through the verified gateway webhook.
+ *
+ * Idempotent per `Idempotency-Key` header (or `clientRequestId` body field), so
+ * a retried request can never produce a second order and a second charge.
  */
 export async function POST(req: NextRequest) {
   const body = await readJsonBody(req);
@@ -116,10 +167,13 @@ export async function POST(req: NextRequest) {
   const customerPhone = isNonEmptyString(body.phone, 32) ? sanitizeText(body.phone, 32) : null;
   const shippingAddress = isNonEmptyString(body.shippingAddress, 500) ? sanitizeText(body.shippingAddress, 500) : null;
 
-  // How the customer intends to pay. Recorded on the order so a Cash-on-Delivery
-  // order is never confused with an unpaid Mobile Money order — otherwise COD
-  // orders sit in Pending forever looking like abandoned payments.
   const paymentMethod: 'momo' | 'cod' = body.paymentMethod === 'cod' ? 'cod' : 'momo';
+
+  const rawIdempotencyKey = req.headers.get('idempotency-key') || body.clientRequestId;
+  const clientRequestId =
+    typeof rawIdempotencyKey === 'string' && /^[A-Za-z0-9-]{8,64}$/.test(rawIdempotencyKey.trim())
+      ? rawIdempotencyKey.trim()
+      : null;
 
   if (!customerName) return jsonError('A valid customer name is required', 400);
   if (!customerEmail) return jsonError('A valid customer email is required', 400);
@@ -134,11 +188,8 @@ export async function POST(req: NextRequest) {
     if (!raw || typeof raw !== 'object') return jsonError('Invalid order item', 400);
     if (!isNonEmptyString(raw.productName, 300)) return jsonError('Each item needs a valid product name', 400);
     if (!isIntInRange(raw.quantity, 1, MAX_QUANTITY)) return jsonError('Item quantity must be between 1 and 20', 400);
-    // Optional stable identifier. Strict charset so it is safe inside a
-    // PostgREST .in() filter.
-    const productId = isNonEmptyString(raw.productId, 64) && /^[A-Za-z0-9_-]{1,64}$/.test(raw.productId)
-      ? raw.productId
-      : undefined;
+    const productId =
+      isNonEmptyString(raw.productId, 64) && /^[A-Za-z0-9_-]{1,64}$/.test(raw.productId) ? raw.productId : undefined;
     items.push({
       productId,
       productName: sanitizeText(raw.productName, 300),
@@ -149,7 +200,6 @@ export async function POST(req: NextRequest) {
   }
 
   // SECURITY: re-price every line from the product catalog in the database.
-  // Prices submitted by the client are ignored entirely.
   if (!isServerSupabaseConfigured) return jsonError('Checkout is not configured', 503);
   const catalogClient = getServerAdminClient() || getServerAnonClient();
   const uniqueIds = [...new Set(items.map((it) => it.productId).filter((v): v is string => Boolean(v)))];
@@ -157,18 +207,11 @@ export async function POST(req: NextRequest) {
 
   let catalogProducts: any[] = [];
   try {
-    // Prefer ids (immutable); names are the fallback for older clients. Matching
-    // on name alone is ambiguous when two products share a name, and breaks for
-    // any cart built before a rename.
-    //
-    // Two separate .in() lookups rather than a hand-built .or() filter string:
-    // supabase-js escapes array values for us, whereas interpolating product
-    // names into a filter would break (or worse) on names containing commas,
-    // parentheses or quotes.
     const select = 'id, name, status, product_variants ( price_minor_units, position, status )';
-    const byId = uniqueIds.length > 0
-      ? await (catalogClient.from('products') as any).select(select).in('id', uniqueIds)
-      : { data: [], error: null };
+    const byId =
+      uniqueIds.length > 0
+        ? await (catalogClient.from('products') as any).select(select).in('id', uniqueIds)
+        : { data: [], error: null };
     if (byId.error) {
       logger.error('order_pricing_lookup_error', { error: byId.error.message });
       return jsonError('Checkout is temporarily unavailable. Please try again.', 500);
@@ -178,7 +221,6 @@ export async function POST(req: NextRequest) {
       logger.error('order_pricing_lookup_error', { error: byName.error.message });
       return jsonError('Checkout is temporarily unavailable. Please try again.', 500);
     }
-    // De-duplicate on id — a product matched by both queries appears twice.
     const seen = new Set<string>();
     for (const p of [...(byId.data || []), ...(byName.data || [])]) {
       const key = String(p?.id);
@@ -191,45 +233,53 @@ export async function POST(req: NextRequest) {
     return jsonError('Checkout is temporarily unavailable. Please try again.', 500);
   }
 
-  const priceById = new Map<string, number>(); // minor units
-  const priceByName = new Map<string, number>();
+  const priceIndex = buildCatalogPriceIndex(catalogProducts);
   const nameById = new Map<string, string>();
   for (const p of catalogProducts) {
-    if (p.status !== 'active') continue;
-    const variants = Array.isArray(p.product_variants) ? p.product_variants : [];
-    const active = variants
-      .filter((v: any) => v.status === 'active')
-      .sort((a: any, b: any) => (a.position || 0) - (b.position || 0));
-    const primary = active[0] || variants[0];
-    if (primary && Number.isFinite(Number(primary.price_minor_units))) {
-      priceById.set(String(p.id), Number(primary.price_minor_units));
-      // Only the first product wins a given name, so a duplicate name can never
-      // silently re-price a line to a different product.
-      if (!priceByName.has(p.name)) priceByName.set(p.name, Number(primary.price_minor_units));
-      nameById.set(String(p.id), p.name);
-    }
+    if (p?.status === 'active' && p?.id && p?.name) nameById.set(String(p.id), String(p.name));
   }
 
-  const lineTotalsMinor: number[] = [];
+  // Resolve each line's catalog price and effective (promotional) price.
+  const catalogLines: { productId?: string; productName: string; quantity: number; catalogUnitMinorUnits: number }[] = [];
   for (const item of items) {
-    const byId = item.productId ? priceById.get(item.productId) : undefined;
-    const priceMinor = byId !== undefined ? byId : priceByName.get(item.productName);
-    if (priceMinor === undefined || priceMinor <= 0) {
+    const byId = item.productId ? priceIndex.byId.get(item.productId) : undefined;
+    const priceMinor = byId !== undefined ? byId : priceIndex.byName.get(item.productName);
+    if (priceMinor === undefined || !Number.isFinite(priceMinor) || priceMinor <= 0) {
       logger.warn('order_unknown_product', { productId: item.productId, productName: item.productName });
       return jsonError(`"${item.productName}" is not available for purchase right now`, 400);
     }
-    item.price = priceMinor / 100;
-    // Use the catalog's authoritative name so order_items and the stock
-    // decrement inside create_order_v2 cannot be steered by a client string.
+    // Use the catalog's authoritative name so order_items, the stock decrement
+    // and the pricing snapshot cannot be steered by a client string.
     if (item.productId && nameById.has(item.productId)) item.productName = nameById.get(item.productId)!;
-    lineTotalsMinor.push(priceMinor * item.quantity);
+    catalogLines.push({
+      productId: item.productId,
+      productName: item.productName,
+      quantity: item.quantity,
+      catalogUnitMinorUnits: priceMinor,
+    });
   }
 
-  const totals = computeOrderTotals(lineTotalsMinor);
+  const { deals, freeShippingThresholdMinorUnits } = await loadPricingSettings(getServerAdminClient());
+  const pricing = priceOrder({ lines: catalogLines, deals, freeShippingThresholdMinorUnits });
+
+  if (!(pricing.totalMinorUnits > 0)) {
+    logger.warn('order_pricing_zero_total', { orderLines: pricing.lines.length });
+    return jsonError('This order has no payable value. Please refresh and try again.', 400);
+  }
+
+  // Record each line's charged unit price for order_items display/fulfilment.
+  for (const line of pricing.lines) {
+    const item = items.find((it) => (line.productId ? it.productId === line.productId : it.productName === line.productName));
+    if (item) item.price = line.unitMinorUnits / 100;
+  }
+
   const claimedTotalMinor = isFiniteNumber(body.total) ? Math.round(body.total * 100) : NaN;
-  if (!totalsMatch(totals, claimedTotalMinor)) {
-    logger.warn('order_total_mismatch', { server: totals.totalMinorUnits, claimed: claimedTotalMinor });
-    return jsonError('Order total does not match current catalog prices. Please refresh and try again.', 400);
+  if (!Number.isFinite(claimedTotalMinor) || Math.abs(claimedTotalMinor - pricing.totalMinorUnits) > 100) {
+    logger.warn('order_total_mismatch', { server: pricing.totalMinorUnits, claimed: claimedTotalMinor });
+    return jsonError(
+      'Order total does not match current catalog prices and promotions. Please refresh and try again.',
+      400
+    );
   }
 
   const result = await createOrderServer({
@@ -240,9 +290,13 @@ export async function POST(req: NextRequest) {
     customerId: auth?.userId || null,
     paymentMethod,
     items,
-    total: totals.totalMinorUnits / 100,
-    subtotalMinorUnits: totals.subtotalMinorUnits,
-    shippingMinorUnits: totals.shippingMinorUnits,
+    total: pricing.totalMinorUnits / 100,
+    totalMinorUnits: pricing.totalMinorUnits,
+    subtotalMinorUnits: pricing.subtotalMinorUnits,
+    discountMinorUnits: pricing.discountMinorUnits,
+    shippingMinorUnits: pricing.shippingMinorUnits,
+    pricingSnapshot: pricing,
+    clientRequestId,
   });
 
   if (!result.success) {
@@ -251,20 +305,30 @@ export async function POST(req: NextRequest) {
   logger.info('order_created', {
     orderId: result.orderId,
     orderNumber: result.orderNumber,
+    idempotent: Boolean(result.idempotent),
     items: items.length,
-    totalMinorUnits: totals.totalMinorUnits,
+    totalMinorUnits: pricing.totalMinorUnits,
+    discountMinorUnits: pricing.discountMinorUnits,
+    shippingMinorUnits: pricing.shippingMinorUnits,
+    promotionIds: pricing.lines.map((l) => l.promotionId).filter(Boolean),
   });
   return NextResponse.json(
-    { success: true, orderId: result.orderId, orderNumber: result.orderNumber, status: 'Pending' },
-    { status: 201 }
+    {
+      success: true,
+      orderId: result.orderId,
+      orderNumber: result.orderNumber,
+      total: pricing.totalMinorUnits / 100,
+      status: 'Pending',
+    },
+    { status: result.idempotent ? 200 : 201 }
   );
 }
 
 /**
- * Update order fulfillment and/or payment status — admin only, allowlisted
- * values. The paymentStatus field is the manual escape hatch for reconciliation
- * (e.g. if the gateway webhook is misconfigured); every change is audit-logged
- * with the admin's user id.
+ * Update order fulfilment and/or payment status — admin only, allowlisted
+ * values. Payment status is a state machine: Paid cannot be undone, Refunded is
+ * terminal and must go through /api/orders/refund, and every manual transition
+ * leaves an audit note plus a payment record.
  */
 export async function PATCH(req: NextRequest) {
   const admin = await authenticateAdmin(req);
@@ -284,35 +348,29 @@ export async function PATCH(req: NextRequest) {
     update.status = status;
   }
   if (paymentStatus !== undefined) {
-    // Normalize legacy lowercase values ('paid' -> 'Paid').
     const normalized = String(paymentStatus).charAt(0).toUpperCase() + String(paymentStatus).slice(1).toLowerCase();
     if (!ALLOWED_PAYMENT_STATUSES.includes(normalized)) {
       return jsonError(`paymentStatus must be one of: ${ALLOWED_PAYMENT_STATUSES.join(', ')}`, 400);
     }
-    // FINANCIAL CONTROL: marking an order Paid or Refunded by hand bypasses the
-    // gateway entirely, so it must leave a reason behind. Without one there is
-    // no way to tell a legitimate reconciliation from an unexplained write to
-    // the books.
-    if (normalized === 'Paid' || normalized === 'Refunded') {
+    if (normalized === 'Refunded') {
+      return jsonError('Use POST /api/orders/refund to record a refund (amount + reason are required).', 400);
+    }
+    if (normalized === 'Paid' || normalized === 'Failed') {
       const note = isNonEmptyString(body.note, 500) ? sanitizeText(body.note, 500) : '';
-      if (note.length < 3) {
-        return jsonError('A reason is required to manually mark an order as Paid or Refunded.', 400);
+      if (normalized === 'Paid' && note.length < 3) {
+        return jsonError('A reason is required to manually mark an order as Paid.', 400);
       }
-      update.payment_note = note;
+      if (note) update.payment_note = note;
     }
     update.payment_status = normalized;
     if (normalized === 'Paid' && status === undefined) {
-      update.status = 'Processing'; // paying an order moves it into the pipeline
+      update.status = 'Processing';
     }
   }
-  // Shipment tracking. Imported items are dispatched from abroad, so the admin
-  // records the carrier reference here for the customer to follow.
   if (body.trackingNumber !== undefined) {
     if (body.trackingNumber === null || body.trackingNumber === '') {
       update.tracking_number = null;
     } else if (isNonEmptyString(body.trackingNumber, 120)) {
-      // Strict charset: tracking codes are alphanumeric with dashes, and this
-      // keeps the value safe to render and to query.
       const tn = sanitizeText(body.trackingNumber, 120);
       if (!/^[A-Za-z0-9-]{3,120}$/.test(tn)) {
         return jsonError('Tracking number may only contain letters, numbers and dashes', 400);
@@ -331,11 +389,8 @@ export async function PATCH(req: NextRequest) {
     const client = getServerAdminClient();
     if (!client) return jsonError('Server database access is not configured', 503);
 
-    // Confirm the order exists before reporting success — an update matching
-    // zero rows previously returned { success: true }, which silently lied to
-    // the admin portal during reconciliation.
     const { data: existing, error: findErr } = await (client.from('orders') as any)
-      .select('id')
+      .select('id, order_number, payment_status, total_minor_units, refunded_minor_units')
       .eq('id', orderId)
       .maybeSingle();
     if (findErr) {
@@ -344,18 +399,71 @@ export async function PATCH(req: NextRequest) {
     }
     if (!existing) return jsonError('Order not found', 404);
 
+    // Monotonic payment state. The DB trigger enforces this too; checking here
+    // turns it into a clear message instead of a constraint violation.
+    const currentPayment = String(existing.payment_status || '').toLowerCase();
+    if (typeof update.payment_status === 'string' && update.payment_status !== existing.payment_status) {
+      const next = String(update.payment_status).toLowerCase();
+      if (currentPayment === 'paid' && next !== 'paid') {
+        return jsonError('A paid order cannot be un-paid. Record a refund instead.', 409);
+      }
+      if (currentPayment === 'refunded') {
+        return jsonError('A refunded order is final and cannot change payment status.', 409);
+      }
+    }
+
+    if (
+      status === 'Cancelled' &&
+      currentPayment === 'paid' &&
+      Number(existing.refunded_minor_units || 0) < Number(existing.total_minor_units || 0)
+    ) {
+      const note = isNonEmptyString(body.note, 500) ? sanitizeText(body.note, 500) : '';
+      if (note.length < 3) {
+        return jsonError(
+          'This order is paid. Record a refund (POST /api/orders/refund) or provide a reason for cancelling a paid order.',
+          409
+        );
+      }
+      update.payment_note = note;
+    }
+
     const { error } = await (client.from('orders') as any).update(update).eq('id', orderId);
     if (error) {
       logger.error('order_status_update_error', { error: error.message });
       return jsonError('Failed to update order', 500);
     }
+
+    // A hand-reconciled payment must still produce a payment record, otherwise
+    // the order shows Paid with nothing in the ledger.
+    if (update.payment_status === 'Paid') {
+      try {
+        const amount = Number(existing.total_minor_units || 0) - Number(existing.refunded_minor_units || 0);
+        if (amount > 0) {
+          await (client.from('payments') as any).insert({
+            order_id: orderId,
+            provider: 'manual',
+            provider_reference: `MANUAL-${existing.order_number || orderId}`,
+            status: 'success',
+            amount_minor_units: amount,
+            settled_amount_minor_units: amount,
+            net_amount_minor_units: amount,
+            currency: 'UGX',
+            raw_payload: { reconciled_by: admin.userId, note: update.payment_note ?? null, method: 'admin' },
+            settled_at: new Date().toISOString(),
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          });
+        }
+      } catch (e: any) {
+        logger.warn('order_manual_payment_record_failed', { orderId, error: e?.message });
+      }
+    }
+
     logger.info('order_status_updated', {
       orderId,
       status,
       paymentStatus,
       trackingNumber: typeof update.tracking_number === 'string' ? update.tracking_number : undefined,
-      // Manual Paid/Refunded writes bypass the gateway; the reason is the audit
-      // trail that distinguishes reconciliation from an unexplained write.
       note: typeof update.payment_note === 'string' ? update.payment_note : undefined,
       admin: admin.userId,
     });

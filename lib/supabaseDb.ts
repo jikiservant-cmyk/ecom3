@@ -22,9 +22,18 @@ export interface DbOrder {
   customerName: string;
   customerEmail: string;
   items: { productName: string; quantity: number; price: number; variant?: string }[];
+  /** Major units (UGX) derived from totalMinorUnits. Never fabricated. */
   total: number;
+  /** Authoritative stored amount, in minor units. Use this for books/reports. */
+  totalMinorUnits: number;
+  /** Money already returned to the customer, in minor units. */
+  refundedMinorUnits: number;
+  discountMinorUnits?: number;
+  shippingMinorUnits?: number;
   status: 'Pending' | 'Processing' | 'Shipped' | 'Delivered' | 'Cancelled';
-  paymentStatus: 'Paid' | 'Pending' | 'Failed';
+  paymentStatus: 'Paid' | 'Pending' | 'Failed' | 'Refunded';
+  /** True when the order row has no line items — a data problem, surfaced not hidden. */
+  missingItems?: boolean;
   createdAt: string;
   shippingAddress?: string;
   /** How the customer is paying. COD orders must not be mistaken for unpaid ones. */
@@ -197,8 +206,9 @@ export async function getProductsFromDb(): Promise<ProductItem[]> {
 
         const soundProfile = attributes.soundProfile || 'High Definition Audio';
         const badge = attributes.badge || undefined;
-        const freeShipping = attributes.freeShipping !== false;
-        const originalPrice = attributes.originalPrice ? Number(attributes.originalPrice) : Math.round(rawPrice * 1.25);
+        const freeShipping = attributes.freeShipping === true;
+        // No synthesised anchor price: an invented "was" price is a fake discount.
+        const originalPrice = attributes.originalPrice ? Number(attributes.originalPrice) : undefined;
         const rating = attributes.rating ? Number(attributes.rating) : 4.9;
         const reviewsCount = attributes.reviewsCount ? Number(attributes.reviewsCount) : 0;
         const soldCount = attributes.soldCount || 'In Stock';
@@ -258,7 +268,7 @@ export async function getProductsFromDb(): Promise<ProductItem[]> {
           category: catMap.get(p.category_id) || 'Instruments',
           subtitle: p.description || '',
           price: rawPrice,
-          originalPrice: attributes.originalPrice || Math.round(rawPrice * 1.25),
+          originalPrice: attributes.originalPrice ? Number(attributes.originalPrice) : undefined,
           rating: attributes.rating || 4.9,
           reviewsCount: attributes.reviewsCount || 0,
           soldCount: attributes.soldCount || 'In Stock',
@@ -269,7 +279,7 @@ export async function getProductsFromDb(): Promise<ProductItem[]> {
           specs: attributes.specs || {},
           soundProfile: attributes.soundProfile || 'High Definition Audio',
           variants: attributes.variants || ['Standard'],
-          freeShipping: attributes.freeShipping !== false,
+          freeShipping: attributes.freeShipping === true,
         };
       });
     }
@@ -334,7 +344,7 @@ export async function getProductByIdFromDb(productId: string): Promise<ProductIt
         category: data.categories?.name || 'Instruments',
         subtitle: data.description || '',
         price: rawPrice,
-        originalPrice: attributes.originalPrice || Math.round(rawPrice * 1.25),
+        originalPrice: attributes.originalPrice ? Number(attributes.originalPrice) : undefined,
         rating: attributes.rating || 4.9,
         reviewsCount: attributes.reviewsCount || 0,
         soldCount: attributes.soldCount || 'In Stock',
@@ -345,7 +355,7 @@ export async function getProductByIdFromDb(productId: string): Promise<ProductIt
         specs: attributes.specs || {},
         soundProfile: attributes.soundProfile || 'High Definition Audio',
         variants: attributes.variants || ['Standard'],
-        freeShipping: attributes.freeShipping !== false,
+        freeShipping: attributes.freeShipping === true,
       };
     }
   } catch (err) {
@@ -397,7 +407,10 @@ export async function saveProductToDb(product: ProductItem): Promise<{ success: 
     product.id = validProductId;
     const baseSlug = (product.name || 'product').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'item';
     const slug = `${baseSlug}-${validProductId.slice(0, 8)}`;
-    const priceMinorUnits = Math.round((Number(product.price) || 0) * 100);
+    // UGX has no circulating subunit: a catalog price that is not a whole
+    // shilling would make the charged amount and the reconciled amount differ
+    // forever. Round UP once, at the catalog write, and nowhere else.
+    const priceMinorUnits = Math.max(0, Math.ceil((Number(product.price) || 0))) * 100;
 
     // 1. Ensure category exists in categories table in DB
     let categoryId: string | null = null;
@@ -492,8 +505,8 @@ export async function saveProductToDb(product: ProductItem): Promise<{ success: 
       specs: product.specs || {},
       soundProfile: product.soundProfile || 'Resonant & High Definition',
       badge: product.badge || null,
-      freeShipping: product.freeShipping !== false,
-      originalPrice: product.originalPrice || Math.round((Number(product.price) || 99) * 1.25),
+      freeShipping: product.freeShipping === true,
+      originalPrice: product.originalPrice ? Number(product.originalPrice) : undefined,
       rating: product.rating || 4.9,
       reviewsCount: product.reviewsCount || 28,
       soldCount: product.soldCount || '1k+ sold',
@@ -767,6 +780,67 @@ export async function saveContactMessageToDb(data: {
 /**
  * Fetch list of orders directly from database orders table
  */
+const PAYMENT_STATUS_MAP: Record<string, DbOrder['paymentStatus']> = {
+  paid: 'Paid',
+  pending: 'Pending',
+  failed: 'Failed',
+  refunded: 'Refunded',
+};
+
+const ORDER_STATUS_MAP: Record<string, DbOrder['status']> = {
+  pending: 'Pending',
+  processing: 'Processing',
+  shipped: 'Shipped',
+  delivered: 'Delivered',
+  cancelled: 'Cancelled',
+};
+
+/**
+ * Map a raw `orders` row to the view model WITHOUT touching the money.
+ *
+ * The previous mapper rewrote `Refunded`/`Failed` to `Pending`, replaced a zero
+ * total with the constant 99, and injected a fake line item — which is how the
+ * admin dashboard's "revenue" figure became fiction. Amounts here are only ever
+ * divided by 100 to move from minor to major units.
+ */
+function mapOrderRow(o: any, items: DbOrder['items']): DbOrder {
+  const totalMinorUnits = Number(o?.total_minor_units ?? 0);
+  const safeTotalMinor = Number.isFinite(totalMinorUnits) ? totalMinorUnits : 0;
+
+  const statusKey = String(o?.status || '').toLowerCase();
+  const paymentKey = String(o?.payment_status || '').toLowerCase();
+
+  return {
+    id: o.id,
+    orderNumber: o.order_number || `ORD-${String(o.id).slice(0, 6).toUpperCase()}`,
+    customerName: o.customer_name || 'Customer',
+    customerEmail: o.customer_email || '',
+    items,
+    total: safeTotalMinor / 100,
+    totalMinorUnits: safeTotalMinor,
+    refundedMinorUnits: Number(o.refunded_minor_units || 0),
+    discountMinorUnits: Number(o.discount_minor_units || 0),
+    shippingMinorUnits: Number(o.shipping_minor_units || 0),
+    status: ORDER_STATUS_MAP[statusKey] || 'Pending',
+    paymentStatus: PAYMENT_STATUS_MAP[paymentKey] || 'Pending',
+    createdAt: o.created_at || new Date().toISOString(),
+    shippingAddress:
+      typeof o.shipping_address === 'object' && o.shipping_address
+        ? o.shipping_address.address || JSON.stringify(o.shipping_address)
+        : o.shipping_address || '',
+    paymentMethod: o.payment_method === 'cod' ? 'cod' : 'momo',
+    trackingNumber: typeof o.tracking_number === 'string' && o.tracking_number ? o.tracking_number : undefined,
+  };
+}
+
+/**
+ * Fetch orders for the admin portal.
+ *
+ * NOTE: public.payments is service-role only (no SELECT grant for
+ * anon/authenticated), so it must NOT be embedded in a browser query — doing so
+ * made PostgREST reject the whole request and the portal silently rendered zero
+ * orders and zero revenue.
+ */
 export async function getOrdersFromDb(): Promise<DbOrder[]> {
   try {
     const { data: normOrders, error: normErr } = await (supabase.from('orders') as any)
@@ -782,8 +856,10 @@ export async function getOrdersFromDb(): Promise<DbOrder[]> {
         payment_status,
         currency,
         subtotal_minor_units,
+        discount_minor_units,
+        shipping_minor_units,
         total_minor_units,
-        total_amount,
+        refunded_minor_units,
         payment_method,
         tracking_number,
         created_at,
@@ -793,55 +869,38 @@ export async function getOrdersFromDb(): Promise<DbOrder[]> {
           unit_price_minor_units,
           quantity,
           line_total_minor_units
-        ),
-        payments (
-          id,
-          status,
-          provider,
-          provider_reference
         )
       `)
       .order('created_at', { ascending: false });
 
-    if (!normErr && normOrders && normOrders.length > 0) {
-      return normOrders.map((o: any) => {
-        let items = (o.order_items || []).map((it: any) => ({
-          productName: it.product_name || 'Instrument',
-          quantity: it.quantity || 1,
-          price: it.unit_price_minor_units ? Number(it.unit_price_minor_units) / 100 : 0,
-          variant: it.variant_sku || undefined,
-        }));
-
-        if (items.length === 0 && Array.isArray(o.items) && o.items.length > 0) {
-          items = o.items;
-        }
-
-        const rawStatus = (o.status || '').toLowerCase();
-        let statusText: DbOrder['status'] = 'Processing';
-        if (rawStatus === 'shipped') statusText = 'Shipped';
-        else if (rawStatus === 'delivered') statusText = 'Delivered';
-        else if (rawStatus === 'cancelled') statusText = 'Cancelled';
-        else if (rawStatus === 'pending') statusText = 'Pending';
-
-        const total = o.total_amount ? Number(o.total_amount) : (o.total_minor_units ? Number(o.total_minor_units) / 100 : 0);
-        const address = typeof o.shipping_address === 'object' && o.shipping_address ? (o.shipping_address.address || JSON.stringify(o.shipping_address)) : (o.shipping_address || 'Express Delivery');
-
-        return {
-          id: o.id,
-          orderNumber: o.order_number || `ORD-${o.id.slice(0, 6).toUpperCase()}`,
-          customerName: o.customer_name || 'Customer',
-          customerEmail: o.customer_email || 'user@example.com',
-          items: items.length > 0 ? items : [{ productName: 'Drum Palace Order Item', quantity: 1, price: total }],
-          total: total > 0 ? total : 99,
-          status: statusText,
-          paymentStatus: (o.payment_status?.toLowerCase() === 'paid' ? 'Paid' : 'Pending') as any,
-          createdAt: o.created_at || new Date().toISOString(),
-          shippingAddress: address,
-          paymentMethod: o.payment_method === 'cod' ? 'cod' : 'momo',
-          trackingNumber: typeof o.tracking_number === 'string' && o.tracking_number ? o.tracking_number : undefined,
-        };
-      });
+    let rows: any[] = [];
+    if (!normErr && Array.isArray(normOrders)) {
+      rows = normOrders;
+    } else {
+      // Retry without the embedded relation — a missing column on an older
+      // database must not take the whole admin portal down.
+      if (normErr) console.warn('Orders normalized query failed, retrying flat:', normErr.message);
+      const { data: flatOrders, error: flatErr } = await (supabase.from('orders') as any)
+        .select('*')
+        .order('created_at', { ascending: false });
+      if (flatErr) {
+        console.error('Supabase orders fetch error:', flatErr.message);
+        return [];
+      }
+      rows = Array.isArray(flatOrders) ? flatOrders : [];
     }
+
+    return rows.map((o: any) => {
+      const mapped = (o.order_items || []).map((it: any) => ({
+        productName: it.product_name || 'Instrument',
+        quantity: it.quantity || 1,
+        price: it.unit_price_minor_units ? Number(it.unit_price_minor_units) / 100 : 0,
+        variant: it.variant_sku || undefined,
+      }));
+      const items = mapped.length > 0 ? mapped : Array.isArray(o.items) ? o.items : [];
+      const order = mapOrderRow(o, items);
+      return { ...order, missingItems: items.length === 0 };
+    });
   } catch (err) {
     console.error('Supabase orders fetch error:', err);
   }
@@ -977,7 +1036,9 @@ export async function getOrderByIdOrNumber(idOrNumber: string): Promise<DbOrder 
         payment_status,
         currency,
         total_minor_units,
-        total_amount,
+        refunded_minor_units,
+        payment_method,
+        tracking_number,
         created_at,
         order_items (
           product_name,
@@ -991,39 +1052,14 @@ export async function getOrderByIdOrNumber(idOrNumber: string): Promise<DbOrder 
       .maybeSingle();
 
     if (!error && data) {
-      let items = (data.order_items || []).map((it: any) => ({
+      const mappedItems = (data.order_items || []).map((it: any) => ({
         productName: it.product_name || 'Instrument',
         quantity: it.quantity || 1,
         price: it.unit_price_minor_units ? Number(it.unit_price_minor_units) / 100 : 0,
         variant: it.variant_sku || undefined,
       }));
-
-      if (items.length === 0 && Array.isArray(data.items) && data.items.length > 0) {
-        items = data.items;
-      }
-
-      const rawStatus = (data.status || '').toLowerCase();
-      let statusText: DbOrder['status'] = 'Processing';
-      if (rawStatus === 'shipped') statusText = 'Shipped';
-      else if (rawStatus === 'delivered') statusText = 'Delivered';
-      else if (rawStatus === 'cancelled') statusText = 'Cancelled';
-      else if (rawStatus === 'pending') statusText = 'Pending';
-
-      const total = data.total_amount ? Number(data.total_amount) : (data.total_minor_units ? Number(data.total_minor_units) / 100 : 0);
-      const address = typeof data.shipping_address === 'object' && data.shipping_address ? (data.shipping_address.address || JSON.stringify(data.shipping_address)) : (data.shipping_address || 'Express Delivery, Uganda');
-
-      return {
-        id: data.id,
-        orderNumber: data.order_number || `ORD-${data.id.slice(0, 6).toUpperCase()}`,
-        customerName: data.customer_name || 'Customer',
-        customerEmail: data.customer_email || 'customer@drumpalace.ug',
-        items: items.length > 0 ? items : [{ productName: 'Drum Palace Order Item', quantity: 1, price: total }],
-        total: total > 0 ? total : 99,
-        status: statusText,
-        paymentStatus: (data.payment_status?.toLowerCase() === 'paid' ? 'Paid' : 'Pending') as any,
-        createdAt: data.created_at || new Date().toISOString(),
-        shippingAddress: address,
-      };
+      const items = mappedItems.length > 0 ? mappedItems : Array.isArray(data.items) ? data.items : [];
+      return { ...mapOrderRow(data, items), missingItems: items.length === 0 };
     }
   } catch (err) {
     console.error('Single order database fetch error:', err);
