@@ -37,7 +37,7 @@ export interface DbOrder {
   createdAt: string;
   shippingAddress?: string;
   /** How the customer is paying. COD orders must not be mistaken for unpaid ones. */
-  paymentMethod?: 'momo' | 'cod';
+  paymentMethod?: 'momo' | 'cod' | 'card';
   /** Carrier reference, set when the admin marks the order Shipped. */
   trackingNumber?: string;
 }
@@ -617,7 +617,7 @@ export async function createOrderInDb(orderData: {
   customerEmail: string;
   items: { productName: string; quantity: number; price: number; variant?: string }[];
   total: number;
-  paymentMethod?: string;
+  paymentMethod?: 'momo' | 'cod' | 'card';
   shippingAddress?: string;
   phone?: string;
   customerId?: string;
@@ -651,6 +651,7 @@ export async function createOrderInDb(orderData: {
       total_minor_units: totalMinorUnits,
       total_amount: orderData.total,
       payment_status: 'Pending',
+      payment_method: orderData.paymentMethod || 'momo',
       created_at: createdAt,
       updated_at: createdAt,
     };
@@ -675,6 +676,7 @@ export async function createOrderInDb(orderData: {
         total_minor_units: totalMinorUnits,
         total_amount: orderData.total,
         payment_status: 'Pending',
+        payment_method: orderData.paymentMethod || 'momo',
         created_at: createdAt,
         updated_at: createdAt,
       };
@@ -828,7 +830,8 @@ function mapOrderRow(o: any, items: DbOrder['items']): DbOrder {
       typeof o.shipping_address === 'object' && o.shipping_address
         ? o.shipping_address.address || JSON.stringify(o.shipping_address)
         : o.shipping_address || '',
-    paymentMethod: o.payment_method === 'cod' ? 'cod' : 'momo',
+    paymentMethod:
+      o.payment_method === 'cod' || o.payment_method === 'card' ? o.payment_method : 'momo',
     trackingNumber: typeof o.tracking_number === 'string' && o.tracking_number ? o.tracking_number : undefined,
   };
 }

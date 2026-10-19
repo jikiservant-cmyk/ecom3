@@ -144,7 +144,7 @@ export function FAQsView({ onBack }: { onBack: () => void }) {
     },
     {
       q: "What payment methods are supported?",
-      a: "We accept MTN Mobile Money (MoMo), Airtel Money, Bank Wire Transfer, Visa / Mastercard credit cards, and Cash on Delivery (COD) for verified addresses in the greater Kampala metropolitan area."
+      a: "We accept MTN Mobile Money (MoMo), Airtel Money, Visa / Mastercard credit cards through LivePay's secure checkout, and Cash on Delivery (COD) for verified addresses in the greater Kampala metropolitan area. Card payments are processed in USD at our current exchange rate — the exact USD amount is shown on the LivePay page before you confirm."
     },
     {
       q: "Are the instruments genuine and backed by warranty?",

@@ -133,9 +133,9 @@ export default function DrumPalaceApp() {
   const [activeProductId, setActiveProductId] = useState<string>('');
   const [selectedImageIndex, setSelectedImageIndex] = useState<number>(0);
   const [detailQty, setDetailQty] = useState<number>(1);
-  // LivePay's documented API (docs.livepay.me) supports Mobile Money only —
-  // there is no card option to offer.
-  const [paymentMethod, setPaymentMethod] = useState<'momo' | 'cod'>('momo');
+  // LivePay documents two products: collect-money (MoMo prompt) and
+  // card-collection (hosted USD checkout). Cash on Delivery is handled locally.
+  const [paymentMethod, setPaymentMethod] = useState<'momo' | 'cod' | 'card'>('momo');
   const [momoPhone, setMomoPhone] = useState<string>('');
   const [isProcessingPayment, setIsProcessingPayment] = useState<boolean>(false);
   const isDarkMode = useSyncExternalStore(subscribeTheme, getThemeSnapshot, getThemeServerSnapshot);
@@ -432,6 +432,29 @@ export default function DrumPalaceApp() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
+  // LivePay's card checkout redirects back here with ?order=…&checkout_id=… .
+  // Open the tracking view for that order instead of dumping the customer on
+  // the home page with no confirmation.
+  const [initialTrackOrder, setInitialTrackOrder] = useState<string>('');
+  useEffect(() => {
+    // Deferred so this is an effect-driven navigation rather than a cascading
+    // synchronous render, and so SSR/CSR hydration stays identical.
+    const timer = setTimeout(() => {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const raw = (params.get('order') || '').trim().toUpperCase();
+        if (/^DP-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(raw)) {
+          setInitialTrackOrder(raw);
+          setRoute('track-order');
+          window.scrollTo({ top: 0 });
+        }
+      } catch {
+        /* no window: nothing to do */
+      }
+    }, 0);
+    return () => clearTimeout(timer);
+  }, []);
+
   const openProductDetail = (id: string) => {
     setActiveProductId(id);
     setSelectedImageIndex(0);
@@ -712,6 +735,12 @@ export default function DrumPalaceApp() {
       return;
     }
 
+    // LivePay's card API requires a customer email (it is the receipt address).
+    if (paymentMethod === 'card' && !(currentUser?.email || checkoutEmail).trim()) {
+      showToast('Please enter your email address — the card gateway requires it for your receipt.');
+      return;
+    }
+
     if (!checkoutAddress.trim()) {
       showToast('Please enter your delivery address and location details.');
       return;
@@ -722,7 +751,13 @@ export default function DrumPalaceApp() {
     const customerShipping = checkoutAddress.trim();
 
     setIsProcessingPayment(true);
-    showToast(paymentMethod === 'momo' ? 'Initiating LivePay mobile prompt…' : 'Placing your order…');
+    showToast(
+      paymentMethod === 'momo'
+        ? 'Initiating LivePay mobile prompt…'
+        : paymentMethod === 'card'
+          ? 'Creating your card checkout…'
+          : 'Placing your order…'
+    );
 
     try {
       const orderItems = cart.map((item) => {
@@ -781,6 +816,48 @@ export default function DrumPalaceApp() {
       // 2. For Mobile Money, initiate the LivePay payment. The server reads the
       //    amount from the database order — the client never controls the
       //    charged amount. Cash on Delivery needs no gateway call.
+      if (paymentMethod === 'card') {
+        const payRes = await fetch('/api/payments/livepay', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ orderId: orderData.orderId, paymentMethod: 'card' }),
+        });
+        const payData = await payRes.json().catch(() => null);
+        if (!payRes.ok || !payData?.success || !payData.checkoutUrl) {
+          showToast(
+            `${payData?.error || 'Card payment could not be started.'} Your order #${orderData.orderNumber} is saved as pending — try again from checkout or contact support with this order number.`
+          );
+          return;
+        }
+
+        // Defence in depth: the server already allow-listed the host, but never
+        // navigate the browser somewhere we have not verified.
+        let checkoutUrl: URL;
+        try {
+          checkoutUrl = new URL(String(payData.checkoutUrl));
+        } catch {
+          showToast('The card gateway returned an invalid checkout link. You have not been charged.');
+          return;
+        }
+        if (checkoutUrl.protocol !== 'https:' || !/(^|\.)livepay\.me$/.test(checkoutUrl.hostname)) {
+          showToast('The card gateway returned an untrusted checkout link. You have not been charged.');
+          return;
+        }
+
+        showToast(
+          `Order #${orderData.orderNumber} created. Redirecting to LivePay to pay $${Number(payData.amountUsd).toFixed(2)} by card…`
+        );
+        checkoutAttemptRef.current = null;
+        setCart([]);
+        setMomoPhone('');
+        setCheckoutName('');
+        setCheckoutPhone('');
+        setCheckoutEmail('');
+        setCheckoutAddress('');
+        setTimeout(() => window.location.assign(checkoutUrl.toString()), 900);
+        return;
+      }
+
       if (paymentMethod === 'momo') {
         const payRes = await fetch('/api/payments/livepay', {
           method: 'POST',
@@ -1978,6 +2055,19 @@ export default function DrumPalaceApp() {
                       </button>
 
                       <button
+                        onClick={() => setPaymentMethod('card')}
+                        disabled={isProcessingPayment}
+                        className={`w-full text-left p-3.5 sm:p-4 rounded-xl border transition flex items-center justify-between cursor-pointer text-xs sm:text-sm ${
+                          paymentMethod === 'card'
+                            ? 'border-[var(--accent)] bg-[var(--surface)] ring-1 ring-[var(--accent)] font-bold text-[var(--ink)]'
+                            : 'border-[var(--line)] bg-[var(--surface)] text-[var(--ink)] hover:border-[var(--accent)]'
+                        }`}
+                      >
+                        <span>💳 &nbsp; Visa / Mastercard (LivePay secure checkout)</span>
+                        {paymentMethod === 'card' && <span className="text-[var(--accent)] font-bold">✓</span>}
+                      </button>
+
+                      <button
                         onClick={() => setPaymentMethod('cod')}
                         disabled={isProcessingPayment}
                         className={`w-full text-left p-3.5 sm:p-4 rounded-xl border transition flex items-center justify-between cursor-pointer text-xs sm:text-sm ${
@@ -2012,6 +2102,28 @@ export default function DrumPalaceApp() {
                         className="w-full rounded-xl bg-[var(--accent)] py-3 text-xs sm:text-sm font-bold text-white hover:opacity-90 cursor-pointer disabled:opacity-50"
                       >
                         {isProcessingPayment ? 'Processing LivePay Prompt…' : 'Pay Now with LivePay MoMo'}
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Card checkout notice (hosted redirect flow) */}
+                  {paymentMethod === 'card' && (
+                    <div className="bg-[var(--surface-2)] p-4 sm:p-5 border border-[var(--line)] rounded-xl space-y-2">
+                      <label className="block text-xs font-bold text-[var(--ink)]">
+                        Card payment (Visa / Mastercard)
+                      </label>
+                      <p className="text-[11px] text-[var(--muted)] leading-relaxed">
+                        You will be redirected to LivePay&apos;s secure checkout to pay by card. Card payments are
+                        processed in <strong>USD</strong> at our current exchange rate; the exact amount is shown on
+                        the LivePay page before you confirm. You are returned here afterwards with your order
+                        number.
+                      </p>
+                      <button
+                        onClick={handleCheckoutConfirm}
+                        disabled={isProcessingPayment}
+                        className="w-full rounded-xl bg-[var(--accent)] py-3 text-xs sm:text-sm font-bold text-white hover:opacity-90 cursor-pointer disabled:opacity-50"
+                      >
+                        {isProcessingPayment ? 'Creating card checkout…' : 'Continue to Card Checkout'}
                       </button>
                     </div>
                   )}
@@ -2080,10 +2192,22 @@ export default function DrumPalaceApp() {
                     {isProcessingPayment ? (
                       <>
                         <span className="animate-spin inline-block">◌</span>
-                        <span>{paymentMethod === 'cod' ? 'Placing your order…' : 'Connecting to LivePay…'}</span>
+                        <span>
+                        {paymentMethod === 'cod'
+                          ? 'Placing your order…'
+                          : paymentMethod === 'card'
+                            ? 'Creating card checkout…'
+                            : 'Connecting to LivePay…'}
+                      </span>
                       </>
                     ) : (
-                      <span>{paymentMethod === 'cod' ? 'Place Order — Pay on Delivery' : 'Confirm Payment with LivePay'}</span>
+                      <span>
+                        {paymentMethod === 'cod'
+                          ? 'Place Order — Pay on Delivery'
+                          : paymentMethod === 'card'
+                            ? 'Continue to Secure Card Checkout'
+                            : 'Confirm Payment with LivePay'}
+                      </span>
                     )}
                   </button>
                 </div>
@@ -2628,6 +2752,7 @@ export default function DrumPalaceApp() {
           <TrackOrderView
             onBack={() => navigateTo('home')}
             onNavigate={navigateTo}
+            initialOrderNumber={initialTrackOrder}
           />
         )}
 

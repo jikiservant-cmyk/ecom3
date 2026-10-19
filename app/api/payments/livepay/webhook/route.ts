@@ -8,6 +8,12 @@ import {
   ambiguousProductNames,
 } from '@/lib/server/orders';
 import { validatePricingSnapshot } from '@/lib/pricing';
+import {
+  cardRoundTripToleranceMinor,
+  orderNumberFromReference,
+  ugxMinorFromUsdMinor,
+  usdMinorFromUgxMinor,
+} from '@/lib/server/livepay';
 import { logger } from '@/lib/server/logging';
 
 export const dynamic = 'force-dynamic';
@@ -138,28 +144,53 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ received: true, status: 'ignored' });
   }
 
-  // 6. Resolve the order from customer_reference ("ORD" + order_number).
-  //    Order numbers are generated uppercase; the gateway may normalise case,
-  //    so compare case-insensitively rather than trusting the echoed string.
-  let orderNumberGuess = '';
-  if (customerReference.toUpperCase().startsWith('ORD')) {
-    orderNumberGuess = customerReference.slice(3).trim().toUpperCase();
-  }
-  let order: any = null;
-  if (orderNumberGuess) {
+  // 6. Resolve the order.
+  //
+  //    Two references exist: collect-money uses the stable `ORD` + order_number,
+  //    while card checkout appends a per-attempt suffix (LivePay rejects a
+  //    reused reference). The payment row records the exact reference we sent,
+  //    so look that up FIRST — it also tells us the currency charged and the FX
+  //    rate frozen at initiation, which the reconciliation below needs.
+  let paymentRecord: any = null;
+  if (customerReference) {
     try {
+      const { data } = await (client.from('payments') as any)
+        .select('id, order_id, provider_reference, amount_minor_units, currency, raw_payload')
+        .eq('provider', 'livepay')
+        .eq('provider_reference', customerReference)
+        .maybeSingle();
+      paymentRecord = data || null;
+    } catch (e: any) {
+      // Multiple rows (momo retries reuse a reference) surface as an error —
+      // fall through to the order-number route, which is unambiguous.
+      logger.warn('webhook_payment_lookup_failed', { error: e?.message });
+    }
+  }
+
+  const orderNumberGuess = orderNumberFromReference(customerReference);
+  const ORDER_COLUMNS =
+    'id, order_number, status, payment_status, currency, total_minor_units, ' +
+    'subtotal_minor_units, discount_minor_units, shipping_minor_units, ' +
+    'refunded_minor_units, pricing_snapshot';
+
+  let order: any = null;
+  try {
+    if (paymentRecord?.order_id) {
       const { data } = await (client.from('orders') as any)
-        .select(
-          'id, order_number, status, payment_status, currency, total_minor_units, ' +
-            'subtotal_minor_units, discount_minor_units, shipping_minor_units, ' +
-            'refunded_minor_units, pricing_snapshot'
-        )
+        .select(ORDER_COLUMNS)
+        .eq('id', paymentRecord.order_id)
+        .maybeSingle();
+      order = data || null;
+    }
+    if (!order && orderNumberGuess) {
+      const { data } = await (client.from('orders') as any)
+        .select(ORDER_COLUMNS)
         .eq('order_number', orderNumberGuess)
         .maybeSingle();
-      order = data;
-    } catch (e: any) {
-      logger.error('webhook_order_lookup_error', { error: e?.message });
+      order = data || null;
     }
+  } catch (e: any) {
+    logger.error('webhook_order_lookup_error', { error: e?.message });
   }
   if (!order) {
     logger.warn('webhook_order_not_found', { customerReference, internalReference });
@@ -181,13 +212,50 @@ export async function POST(req: NextRequest) {
   // 7. Amount & currency reconciliation — never mark Paid on a mismatch.
   //    LivePay's signature does NOT cover `amount`, so this is the only defence
   //    against a validly-signed notification carrying a tampered amount.
+  const orderTotalMinor = Number(order.total_minor_units);
+
+  // Card settlements arrive in USD; mobile-money settlements in UGX. Reconcile
+  // in the currency that was actually charged, and cross-check the USD figure
+  // against the order total using the FX rate frozen on the payment row — a
+  // tampered payments row cannot lower the bar on its own.
+  const isCardSettlement =
+    Boolean(paymentRecord) && String(paymentRecord?.currency || '').toUpperCase() === 'USD';
+  const fxRate = isCardSettlement ? Number(paymentRecord?.raw_payload?.fx?.ugx_per_usd) : NaN;
+
+  let expectedMinor: number = orderTotalMinor;
+  let expectedCurrency = String(order.currency || 'UGX').toUpperCase();
+
+  if (isCardSettlement) {
+    const recordedMinor = Number(paymentRecord?.amount_minor_units);
+    const derivedMinor = usdMinorFromUgxMinor(orderTotalMinor, fxRate);
+    if (derivedMinor === null || derivedMinor !== recordedMinor) {
+      logger.error('webhook_card_fx_inconsistent', {
+        orderId: order.id,
+        recordedMinor,
+        derivedMinor,
+        fxRate,
+        orderTotalMinor,
+      });
+      await releaseEventMarker();
+      return NextResponse.json({ received: true, verified: false, reason: 'card fx inconsistent' });
+    }
+    expectedMinor = derivedMinor;
+    expectedCurrency = 'USD';
+  }
+
   const reconciliation = reconcilePaymentAmount({
-    orderTotalMinorUnits: order.total_minor_units,
-    orderCurrency: order.currency,
+    orderTotalMinorUnits: expectedMinor,
+    orderCurrency: expectedCurrency,
     payloadAmount: payload.amount,
     payloadCurrency: payload.currency,
   });
-  const { amountOk, currencyOk, expectedMinor, paidMinor } = reconciliation;
+  const { amountOk, currencyOk, paidMinor } = reconciliation;
+
+  // Express the settlement in the shop's ledger currency (UGX) for every value
+  // check. The card rounding envelope is at most one US cent — any larger
+  // difference is a real underpayment and must still fail closed.
+  const paidOrderMinor = isCardSettlement ? ugxMinorFromUsdMinor(paidMinor, fxRate) ?? 0 : paidMinor;
+  const valuationTolerance = isCardSettlement ? cardRoundTripToleranceMinor(fxRate) : 0;
 
   if (outcome === 'paid' && (!amountOk || !currencyOk)) {
     logger.error('webhook_amount_mismatch', {
@@ -218,14 +286,15 @@ export async function POST(req: NextRequest) {
           storedSubtotalMinorUnits: order.subtotal_minor_units,
           storedDiscountMinorUnits: order.discount_minor_units,
           storedShippingMinorUnits: order.shipping_minor_units,
-          storedTotalMinorUnits: expectedMinor,
+          storedTotalMinorUnits: orderTotalMinor,
         });
-        if (!validation.ok || paidMinor < validation.totalMinorUnits) {
+        if (!validation.ok || paidOrderMinor + valuationTolerance < validation.totalMinorUnits) {
           logger.error('webhook_snapshot_invalid', {
             orderId: order.id,
             reason: validation.reason,
             paidMinor,
-            storedTotalMinor: expectedMinor,
+            paidOrderMinor,
+            storedTotalMinor: orderTotalMinor,
           });
           await releaseEventMarker();
           return NextResponse.json({ received: true, verified: false, reason: 'pricing snapshot invalid' });
@@ -259,11 +328,12 @@ export async function POST(req: NextRequest) {
           storedTotalMinorUnits: expectedMinor,
         });
 
-        if (!valuation.ok || paidMinor < valuation.catalogTotalMinor) {
+        if (!valuation.ok || paidOrderMinor + valuationTolerance < valuation.catalogTotalMinor) {
           logger.error('webhook_amount_below_catalog_value', {
             orderId: order.id,
             paidMinor,
-            storedTotalMinor: expectedMinor,
+            paidOrderMinor,
+            storedTotalMinor: orderTotalMinor,
             catalogTotalMinor: valuation.catalogTotalMinor,
             unknownItems: valuation.unknownItems,
           });
@@ -316,15 +386,21 @@ export async function POST(req: NextRequest) {
         ? 0
         : Math.round(Number(chargeRaw) * 100);
     const feeMinor = Number.isFinite(chargeMinor) && chargeMinor > 0 ? chargeMinor : 0;
-    const settledMinor = outcome === 'paid' ? paidMinor : 0;
+    // Ledger columns are always in the shop currency (UGX) so revenue totals
+    // stay additive; the gateway-currency amount lives in `raw_payload` and in
+    // `amount_minor_units` (which is expressed in this row's `currency`).
+    const feeOrderMinor = isCardSettlement
+      ? Math.round((feeMinor / 100) * (Number.isFinite(fxRate) ? fxRate : 0) * 100)
+      : feeMinor;
+    const settledMinor = outcome === 'paid' ? paidOrderMinor : 0;
 
     let paymentsQuery = (client.from('payments') as any).update({
       status: outcome === 'paid' ? 'success' : 'failed',
       provider_reference: customerReference || undefined,
       provider_transaction_id: typeof payload.provider_transaction_id === 'string' ? payload.provider_transaction_id : null,
       settled_amount_minor_units: settledMinor,
-      fee_minor_units: feeMinor,
-      net_amount_minor_units: settledMinor - feeMinor,
+      fee_minor_units: feeOrderMinor,
+      net_amount_minor_units: settledMinor - feeOrderMinor,
       settled_at: outcome === 'paid' ? now : null,
       raw_payload: payload,
       updated_at: now,

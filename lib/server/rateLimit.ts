@@ -54,6 +54,11 @@ export function consumeRateLimit(key: string, windowMs: number, maxRequests: num
   };
 }
 
+/** Clear every bucket. Used by tests so limits do not leak between cases. */
+export function resetRateLimits(): void {
+  buckets.clear();
+}
+
 export function rateLimitHeaders(res: Headers, result: RateLimitResult) {
   res.set('X-RateLimit-Limit', String(result.limit));
   res.set('X-RateLimit-Remaining', String(result.remaining));

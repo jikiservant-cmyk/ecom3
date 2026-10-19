@@ -3035,7 +3035,7 @@ export default function AdminPortal({
                       <span>Visa & Mastercard</span>
                     </div>
                     <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                      Secure 3D-Secure credit & debit card processing with automated verification.
+                      LivePay card collection: hosted 3D-Secure checkout, charged in USD at the configured rate.
                     </p>
                   </div>
 

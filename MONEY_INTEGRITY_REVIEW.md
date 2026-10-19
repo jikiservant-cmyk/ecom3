@@ -152,6 +152,42 @@ creating a second one and a second mobile-money prompt.
 
 ---
 
+## 2b. LivePay products: collect-money and card-collection
+
+The application previously treated LivePay as mobile-money only. Its documentation
+defines **two** products with different contracts, and the shop advertises card
+acceptance, so the app now implements both:
+
+| | Collect Money (`/collect-money`) | Card Collection (`/card-collection`) |
+|---|---|---|
+| Auth | `Bearer <API key>` | `Bearer <keyId>.<secret>` |
+| Currency | UGX (any, `network` required off-UGX) | **USD only**, $1.00–$5,000.00 |
+| Result | prompt on the handset | hosted redirect checkout |
+| Reference | stable `ORD` + order number | `ORD` + order number + attempt suffix |
+
+Three money-integrity consequences, all handled in `lib/server/livepay.ts` and the
+two routes:
+
+1. **The conversion is server-side and frozen.** The shop prices in UGX; the card
+   product charges USD. `usdMinorFromUgxMinor` converts using
+   `LIVEPAY_USD_RATE_UGX`, rounds **up** to the cent (never undercharging), enforces
+   the documented window, and refuses (422) rather than guessing when no rate is
+   configured. The rate and both amounts are frozen on the `payments` row
+   (`raw_payload.fx`), so the webhook can prove the charge followed from the order.
+2. **Reconciliation is currency-aware.** `reconcilePaymentAmount` previously
+   required a whole-shilling total, which would reject every correct USD
+   settlement; that rule is now UGX-only. A card settlement must equal the frozen
+   USD amount **and** re-derive from the order total at the frozen rate — a
+   tampered payments row cannot lower the bar. Conversions back to UGX allow at
+   most one US cent of rounding.
+3. **The redirect is constrained.** `checkout_url` is only returned when it is
+   `https` on `*.livepay.me`, and `return_url` is built from `APP_URL` (never from
+   the request body), carrying the order number so the customer lands on their
+   tracking view.
+
+The card credential is separate (`LIVEPAY_CARD_API_KEY`): a `keyId.secret` pair is
+not interchangeable with the collect-money key.
+
 ## 3. Penetration test of the remediation
 
 I attacked my own changes two ways: **44 adversarial tests** that drive the real route

@@ -10,33 +10,47 @@ import {
   ambiguousProductNames,
 } from '@/lib/server/orders';
 import { isWholeShillingMinor, validatePricingSnapshot } from '@/lib/pricing';
+import {
+  CARD_MAX_MINOR,
+  CARD_MIN_MINOR,
+  CARD_PATH,
+  COLLECT_PATH,
+  COLLECT_RATE_LIMIT,
+  CARD_RATE_LIMIT,
+  RATE_LIMIT_WINDOW_MS,
+  buildCardReference,
+  buildCardReturnUrl,
+  buildCollectReference,
+  getCardConfig,
+  getCollectConfig,
+  isTrustedCheckoutUrl,
+  usdMinorFromUgxMinor,
+} from '@/lib/server/livepay';
 
 export const dynamic = 'force-dynamic';
 
 /**
- * Initiate a LivePay mobile-money collection for an existing order.
- * Implemented per https://docs.livepay.me (authentication + collect-money).
+ * Initiate a LivePay payment for an existing order.
  *
- * Hard rules:
- * - The order MUST exist; the charged amount is read from the database.
- * - `reference` = "ORD" + order_number (max 30 chars, no spaces — required).
- * - LivePay has no documented card-collection endpoint: momo only.
+ * Two documented products, chosen by the order's own `payment_method`:
+ *
+ * - `momo`  → POST /collect-money   (https://docs.livepay.me/request-money)
+ *             pushes a prompt to the customer's handset; settled by webhook.
+ * - `card`  → POST /card-collection (https://docs.livepay.me/card-collection)
+ *             returns a hosted `checkout_url`; the browser is redirected and
+ *             the customer returns via `return_url?checkout_id=…`.
+ * - `cod`   → nothing to charge now.
+ *
+ * Hard rules, both products:
+ * - The order MUST exist; the amount charged is derived from the DATABASE row,
+ *   never from the request body.
+ * - `reference` is unique, space-free and ≤30 chars (`ORD` + order number, with
+ *   a per-attempt suffix for card because LivePay rejects a reused reference).
  * - No credentials / gateway failure => HTTP error. There is NO simulated
  *   success fallback — an order is marked Paid only by a verified webhook.
+ * - A gateway-supplied `checkout_url` is only ever returned if it is on a
+ *   LivePay host (open-redirect guard).
  */
-
-function getGatewayConfig(): { apiKey: string; accountNumber: string; baseUrl: string } | null {
-  const apiKey = process.env.LIVEPAY_API_KEY;
-  if (!apiKey || apiKey.includes('YOUR_')) return null;
-  let baseUrl = (process.env.LIVEPAY_API_URL || 'https://livepay.me/api').replace(/\/+$/, '');
-  try {
-    const host = new URL(baseUrl).hostname;
-    if (!/(^|\.)livepay\.me$/.test(host)) return null; // SSRF guard: LivePay hosts only
-  } catch {
-    return null;
-  }
-  return { apiKey, accountNumber: process.env.LIVEPAY_MERCHANT_ID || '', baseUrl };
-}
 
 const FETCH_TIMEOUT_MS = 15_000;
 
@@ -50,6 +64,178 @@ async function fetchWithTimeout(url: string, init: RequestInit): Promise<Respons
   }
 }
 
+function tooMany(error: string, retryAfterMs?: number) {
+  return NextResponse.json(
+    { success: false, error },
+    {
+      status: 429,
+      ...(retryAfterMs ? { headers: { 'Retry-After': String(Math.max(1, Math.ceil(retryAfterMs / 1000))) } } : {}),
+    }
+  );
+}
+
+async function initiateCard(opts: {
+  req: NextRequest;
+  order: any;
+  totalMinorUnits: number;
+}): Promise<Response> {
+  const { order } = opts;
+
+  // Card credentials are a separate, dot-separated key pair per the docs.
+  const gateway = getCardConfig();
+  if (!gateway) {
+    logger.error('livepay_card_not_configured');
+    return jsonError('Card payments are not configured. Please choose Mobile Money or Cash on Delivery.', 503);
+  }
+
+  // Card collection is USD-only. The shop prices in UGX, so an operator-set
+  // rate is the single conversion source — never a client-supplied amount.
+  const rate = Number(process.env.LIVEPAY_USD_RATE_UGX);
+  const usdMinor = usdMinorFromUgxMinor(opts.totalMinorUnits, rate);
+  if (usdMinor === null) {
+    logger.error('livepay_card_amount_out_of_bounds', {
+      orderId: order.id,
+      totalMinorUnits: opts.totalMinorUnits,
+      rateConfigured: Number.isFinite(rate) && rate > 0,
+    });
+    return jsonError(
+      'This order cannot be paid by card right now. Please choose Mobile Money or Cash on Delivery.',
+      422
+    );
+  }
+  if (usdMinor < CARD_MIN_MINOR || usdMinor > CARD_MAX_MINOR) {
+    return jsonError('This amount is outside the card gateway limits.', 422);
+  }
+
+  const email = String(order.customer_email || '').trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
+    logger.warn('livepay_card_missing_email', { orderId: order.id });
+    return jsonError('An email address is required for card payments. Please add one and try again.', 400);
+  }
+
+  const appUrl = process.env.APP_URL;
+  const returnUrl = appUrl ? buildCardReturnUrl(appUrl, String(order.order_number)) : null;
+  if (!returnUrl) {
+    logger.error('livepay_card_return_url_unavailable', { orderId: order.id });
+    return jsonError('Card payments are not configured. Please choose Mobile Money or Cash on Delivery.', 503);
+  }
+
+  const now = Date.now().toString(36);
+  const nonce = `${now}${Math.random().toString(36).slice(2, 5)}`.toUpperCase();
+  const reference = buildCardReference(String(order.order_number), nonce);
+
+  const payload = {
+    accountNumber: gateway.accountNumber,
+    amount: usdMinor / 100, // USD, two decimals
+    currency: 'USD',
+    reference,
+    email,
+    description: `Order #${order.order_number}`,
+    return_url: returnUrl,
+  };
+
+  // Record the attempt BEFORE calling out: this row is what the webhook
+  // reconciles against, and it freezes the FX rate that was quoted.
+  try {
+    await (getServerAdminClient() as any)
+      .from('payments')
+      .insert({
+        order_id: order.id,
+        provider: 'livepay',
+        provider_reference: reference,
+        status: 'pending',
+        amount_minor_units: usdMinor,
+        currency: 'USD',
+        raw_payload: {
+          method: 'card',
+          initiated_at: new Date().toISOString(),
+          fx: { ugx_per_usd: rate, ugx_minor: opts.totalMinorUnits, usd_minor: usdMinor },
+          return_url: returnUrl,
+        },
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+  } catch (e: any) {
+    // The card still works, but refuse: without the FX-frozen payment row the
+    // webhook cannot verify what was charged, so the order could never be
+    // settled safely. Failing here is the money-safe choice.
+    logger.error('livepay_card_payment_record_error', { orderId: order.id, error: e?.message });
+    return jsonError('Card payment could not be started. You have not been charged. Please try again.', 500);
+  }
+
+  try {
+    const response = await fetchWithTimeout(`${gateway.baseUrl}${CARD_PATH}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${gateway.apiKey}` },
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json().catch(() => ({}));
+
+    if (response.ok) {
+      if (!isTrustedCheckoutUrl(data?.checkout_url)) {
+        logger.error('livepay_card_untrusted_checkout_url', {
+          orderId: order.id,
+          received: typeof data?.checkout_url === 'string' ? data.checkout_url.slice(0, 120) : typeof data?.checkout_url,
+        });
+        return jsonError('The card gateway returned an invalid checkout link. You have not been charged.', 502);
+      }
+      const internalReference =
+        typeof data?.internal_reference === 'string' ? data.internal_reference : null;
+      if (internalReference) {
+        await (getServerAdminClient() as any)
+          .from('payments')
+          .update({ provider_transaction_id: internalReference, updated_at: new Date().toISOString() })
+          .eq('order_id', order.id)
+          .eq('provider_reference', reference);
+      }
+      logger.info('livepay_card_checkout_created', {
+        orderId: order.id,
+        orderNumber: order.order_number,
+        reference,
+        usdMinor,
+        rate,
+      });
+      return NextResponse.json({
+        success: true,
+        method: 'card',
+        checkoutUrl: data.checkout_url,
+        reference: data.reference || reference,
+        amountMinorUnits: usdMinor,
+        amountUsd: usdMinor / 100,
+        currency: 'USD',
+        message: 'Redirecting you to LivePay’s secure card checkout.',
+        returnUrl,
+      });
+    }
+
+    const errMsg = String(data?.error || data?.message || '').slice(0, 300);
+    logger.error('livepay_card_rejected', { status: response.status, orderId: order.id, error: errMsg });
+
+    if (response.status === 400) {
+      return jsonError(
+        errMsg ? `Card payment could not be started: ${errMsg}` : 'Card payment could not be started. You have not been charged.',
+        400
+      );
+    }
+    if (response.status === 429) {
+      return tooMany('The card gateway is busy right now. Please try again in a few minutes.');
+    }
+    return jsonError(
+      'The card gateway rejected the request. You have not been charged — please try another payment method.',
+      502
+    );
+  } catch (e: any) {
+    const aborted = e?.name === 'AbortError';
+    logger.error('livepay_card_gateway_error', { orderId: order.id, aborted, error: e?.message });
+    return jsonError(
+      aborted
+        ? 'The card gateway took too long to respond. No payment was taken — please try again.'
+        : 'Could not reach the card gateway. You have not been charged. Please try again.',
+      502
+    );
+  }
+}
+
 export async function POST(req: NextRequest) {
   const body = await readJsonBody(req);
   if (!body) return jsonError('Invalid JSON body', 400);
@@ -57,14 +243,15 @@ export async function POST(req: NextRequest) {
   const orderId = isNonEmptyString(body.orderId, 64) ? body.orderId.trim() : null;
   if (!orderId) return jsonError('orderId is required', 400);
 
-  if (isNonEmptyString(body.paymentMethod, 32) && body.paymentMethod !== 'momo') {
-    // LivePay's documented API (docs.livepay.me) covers mobile money only.
-    return jsonError('Only Mobile Money payments are supported by the gateway. Please choose Mobile Money at checkout.', 400);
+  // The client may state which product it is starting; anything else is a
+  // programming error or a probe, and must not reach a gateway call.
+  const methodHint = isNonEmptyString(body.paymentMethod, 16) ? body.paymentMethod.trim().toLowerCase() : null;
+  if (methodHint && methodHint !== 'momo' && methodHint !== 'card') {
+    return jsonError('This order cannot be paid with that method.', 400);
   }
 
-  // Optional post-payment landing URL. Validated against APP_URL so a client
-  // cannot use us to bounce a victim to a phishing origin; anything off-origin
-  // is dropped rather than echoed back.
+  // Optional post-payment landing URL for the momo flow. Validated against
+  // APP_URL so a client cannot use us to bounce a victim to a phishing origin.
   const safeReturn = safeReturnUrl(
     isNonEmptyString(body.returnUrl, 500) ? body.returnUrl.trim() : null,
     process.env.APP_URL
@@ -72,8 +259,9 @@ export async function POST(req: NextRequest) {
 
   const phoneNumber = isNonEmptyString(body.phoneNumber, 32) ? body.phoneNumber.replace(/[^\d+]/g, '') : '';
 
-  const gateway = getGatewayConfig();
-  if (!gateway) {
+  // Any configured product is enough to accept the request; the per-product
+  // check below decides whether THIS order can proceed.
+  if (!getCollectConfig() && !getCardConfig()) {
     logger.error('livepay_not_configured');
     return jsonError('Payment gateway is not configured. Please try another payment method or contact support.', 503);
   }
@@ -86,9 +274,9 @@ export async function POST(req: NextRequest) {
   try {
     const { data, error } = await (client.from('orders') as any)
       .select(
-        'id, order_number, customer_id, customer_name, customer_phone, status, payment_method, payment_status, ' +
-          'subtotal_minor_units, discount_minor_units, shipping_minor_units, total_minor_units, ' +
-          'refunded_minor_units, currency, pricing_snapshot'
+        'id, order_number, customer_id, customer_name, customer_email, customer_phone, ' +
+          'status, payment_method, payment_status, subtotal_minor_units, discount_minor_units, ' +
+          'shipping_minor_units, total_minor_units, refunded_minor_units, currency, pricing_snapshot'
       )
       .eq('id', orderId)
       .maybeSingle();
@@ -104,13 +292,20 @@ export async function POST(req: NextRequest) {
 
   if (!order) return jsonError('Order not found', 404);
 
-  // 1a. STATE GATES. Only an unpaid, non-terminal, mobile-money order may be
+  // 1a. STATE GATES. Only an unpaid, non-terminal, gateway-paid order may be
   //     charged. Without these, a Cancelled order could be paid (silently
   //     un-cancelling it), a Refunded order could be charged again, and a COD
   //     order could be paid online while the courier also collects cash.
   const paymentStatus = String(order.payment_status || '').toLowerCase();
   const orderStatus = String(order.status || '').toLowerCase();
-  const paymentMethod = String(order.payment_method || 'momo').toLowerCase();
+  const orderMethod = String(order.payment_method || 'momo').toLowerCase();
+
+  if (orderMethod !== 'momo' && orderMethod !== 'card') {
+    return jsonError('This order is set to pay on delivery, so there is nothing to charge now.', 409);
+  }
+  if (methodHint && methodHint !== orderMethod) {
+    return jsonError('This order is set to a different payment method. Please place a new order.', 409);
+  }
 
   if (paymentStatus === 'paid') return jsonError('This order has already been paid', 409);
   if (paymentStatus === 'refunded') {
@@ -121,9 +316,6 @@ export async function POST(req: NextRequest) {
   }
   if (orderStatus === 'delivered' || orderStatus === 'shipped') {
     return jsonError('This order has already been dispatched. Please contact support.', 409);
-  }
-  if (paymentMethod !== 'momo') {
-    return jsonError('This order is set to pay on delivery, so there is nothing to charge now.', 409);
   }
   if (Number(order.refunded_minor_units || 0) > 0) {
     return jsonError('This order already has a refund recorded against it. Please contact support.', 409);
@@ -136,7 +328,6 @@ export async function POST(req: NextRequest) {
     logger.error('livepay_invalid_order_amount', { orderId, totalMinorUnits });
     return jsonError('Order has an invalid amount', 422);
   }
-  const amountUgx = totalMinorUnits / 100;
 
   // 1c. FINANCIAL INTEGRITY — the order must be worth what it says it is worth.
   //
@@ -215,6 +406,41 @@ export async function POST(req: NextRequest) {
     return jsonError('Payment could not be started', 500);
   }
 
+  // Per-order cap. Without it a single actor can burn the shared merchant quota
+  // — and spam a victim's phone with Mobile Money prompts — by hammering one
+  // order, which denies payment to every other customer for the whole window.
+  const perOrder = consumeRateLimit(`livepay-order:${order.id}`, RATE_LIMIT_WINDOW_MS, 3);
+  if (!perOrder.allowed) {
+    logger.warn('livepay_per_order_attempts_exhausted', { orderId });
+    return tooMany('Too many payment attempts for this order. Please try again in a few minutes.', perOrder.resetMs);
+  }
+
+  // Merchant-level quota guard. LivePay documents a per-account limit (50/15min
+  // for collections, 500/15min for cards); we stop short of it so a burst of
+  // checkouts can never be the reason the gateway starts rejecting us.
+  const quota = consumeRateLimit(
+    `global:livepay-${orderMethod}`,
+    RATE_LIMIT_WINDOW_MS,
+    Math.floor((orderMethod === 'card' ? CARD_RATE_LIMIT : COLLECT_RATE_LIMIT) * 0.9)
+  );
+  if (!quota.allowed) {
+    logger.warn('livepay_global_quota_exhausted', { method: orderMethod });
+    return tooMany('The payment gateway is busy right now. Please try again in a few minutes.', quota.resetMs);
+  }
+
+  // ── Card: hosted checkout, redirect flow ──────────────────────────────────
+  if (orderMethod === 'card') {
+    return initiateCard({ req, order, totalMinorUnits });
+  }
+
+  // ── Mobile money: prompt on the handset ───────────────────────────────────
+  const collectGateway = getCollectConfig();
+  if (!collectGateway) {
+    logger.error('livepay_collect_not_configured');
+    return jsonError('Mobile Money payments are not configured. Please choose another payment method.', 503);
+  }
+  const gateway = collectGateway;
+
   // PHONE BINDING. Without this, anyone who learns an order id can push a
   // Mobile Money prompt at an arbitrary phone number (payment-prompt spam) or
   // attempt to collect from a third party. A caller may only use the number the
@@ -241,36 +467,12 @@ export async function POST(req: NextRequest) {
     return jsonError('A mobile money phone number is required for this order.', 400);
   }
 
-  // Per-order cap. Without it a single actor can burn the shared merchant quota
-  // — and spam a victim's phone with Mobile Money prompts — by hammering one
-  // order, which denies payment to every other customer for the whole window.
-  const perOrder = consumeRateLimit(`livepay-order:${order.id}`, 15 * 60_000, 3);
-  if (!perOrder.allowed) {
-    logger.warn('livepay_per_order_attempts_exhausted', { orderId });
-    return NextResponse.json(
-      { success: false, error: 'Too many payment attempts for this order. Please try again in a few minutes.' },
-      { status: 429, headers: { 'Retry-After': String(Math.ceil(perOrder.resetMs / 1000)) } }
-    );
-  }
-
-  // Merchant-level quota guard: LivePay rate-limits per merchant account
-  // (documented: 50 req / 15 min on query APIs). Protect the shared quota
-  // regardless of how many client IPs are hitting us.
-  const quota = consumeRateLimit('global:livepay-collect', 15 * 60_000, 45);
-  if (!quota.allowed) {
-    logger.warn('livepay_global_quota_exhausted');
-    return NextResponse.json(
-      { success: false, error: 'The payment gateway is busy right now. Please try again in a few minutes.' },
-      { status: 429 }
-    );
-  }
-
-  // 2. Build the gateway request (docs.livepay.me/collect-money shape).
-  const transactionReference = `ORD${order.order_number}`.replace(/\s+/g, '').substring(0, 30);
+  // 2. Build the gateway request (docs.livepay.me/request-money shape).
+  const transactionReference = buildCollectReference(String(order.order_number));
   const payload = {
     accountNumber: gateway.accountNumber,
     phoneNumber: effectivePhone,
-    amount: amountUgx, // integer UGX
+    amount: totalMinorUnits / 100, // UGX is a zero-decimal-by-practice currency: whole shillings
     currency: 'UGX',
     reference: transactionReference,
     description: `Order #${order.order_number}`,
@@ -296,7 +498,7 @@ export async function POST(req: NextRequest) {
 
   // 4. Call the gateway. Fail closed on any error.
   try {
-    const response = await fetchWithTimeout(`${gateway.baseUrl}/collect-money`, {
+    const response = await fetchWithTimeout(`${gateway.baseUrl}${COLLECT_PATH}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${gateway.apiKey}` },
       body: JSON.stringify(payload),
@@ -315,6 +517,7 @@ export async function POST(req: NextRequest) {
       logger.info('livepay_initiated', { orderId, orderNumber: order.order_number, reference: transactionReference });
       return NextResponse.json({
         success: true,
+        method: 'momo',
         transactionId: data.internal_reference || transactionReference,
         reference: data.reference || transactionReference,
         status: 'pending',
@@ -339,6 +542,7 @@ export async function POST(req: NextRequest) {
           logger.info('livepay_duplicate_reference_recovered', { orderId, status: stData.status });
           return NextResponse.json({
             success: true,
+            method: 'momo',
             transactionId: stData.internal_reference || transactionReference,
             reference: transactionReference,
             status: 'pending',

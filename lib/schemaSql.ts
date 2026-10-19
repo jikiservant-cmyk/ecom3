@@ -116,7 +116,9 @@ CREATE TABLE IF NOT EXISTS public.orders (
   -- How the customer intends to pay. Without this, a Cash-on-Delivery order is
   -- indistinguishable from an unpaid Mobile Money order, so COD orders sit in
   -- Pending forever looking like abandoned payments.
-  payment_method TEXT DEFAULT 'momo' CHECK (payment_method IN ('momo', 'cod')),
+  -- 'momo' = LivePay collect-money prompt, 'card' = LivePay hosted card
+  -- checkout, 'cod' = cash on delivery.
+  payment_method TEXT DEFAULT 'momo' CHECK (payment_method IN ('momo', 'cod', 'card')),
   tracking_number TEXT,
   -- Money already returned to the customer (partial refunds accumulate here).
   refunded_minor_units BIGINT NOT NULL DEFAULT 0,
@@ -137,6 +139,20 @@ ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS refunded_minor_units BIGINT N
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS pricing_snapshot JSONB;
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS client_request_id TEXT;
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_method TEXT DEFAULT 'momo';
+
+-- Card collection is a documented LivePay product, so 'card' is a valid method.
+-- Databases created before it existed still carry the two-value CHECK from the
+-- original CREATE TABLE; replace it (named constraint, so this is idempotent).
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_payment_method_check') THEN
+    ALTER TABLE public.orders DROP CONSTRAINT orders_payment_method_check;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_payment_method_valid') THEN
+    ALTER TABLE public.orders ADD CONSTRAINT orders_payment_method_valid
+      CHECK (payment_method IN ('momo', 'cod', 'card')) NOT VALID;
+  END IF;
+END $$;
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS tracking_number TEXT;
 ALTER TABLE public.products ADD COLUMN IF NOT EXISTS origin TEXT DEFAULT 'local';
 
@@ -193,9 +209,12 @@ CREATE TABLE IF NOT EXISTS public.payments (
   provider TEXT DEFAULT 'livepay',
   provider_reference TEXT,
   status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'success', 'failed', 'refunded')),
-  -- What we ASKED the gateway to collect.
+  -- What we ASKED the gateway to collect, expressed in the row currency
+  -- (UGX for mobile money, USD cents for card collection).
   amount_minor_units BIGINT NOT NULL DEFAULT 0,
-  -- What the gateway says it actually collected, its fee, and the net.
+  -- What the gateway says it actually collected, its fee, and the net — always
+  -- in the shop ledger currency (UGX minor units) so revenue totals add up
+  -- across payment products. The gateway-currency figures stay in raw_payload.
   settled_amount_minor_units BIGINT,
   fee_minor_units BIGINT NOT NULL DEFAULT 0,
   net_amount_minor_units BIGINT,
@@ -515,6 +534,9 @@ BEGIN
   IF p_total_minor_units <= 0 THEN
     RAISE EXCEPTION 'order total must be positive' USING ERRCODE = '22023';
   END IF;
+  IF COALESCE(p_payment_method, 'momo') NOT IN ('momo', 'cod', 'card') THEN
+    RAISE EXCEPTION 'unsupported payment method' USING ERRCODE = '22023';
+  END IF;
   IF p_pricing_snapshot IS NOT NULL
      AND COALESCE((p_pricing_snapshot->>'totalMinorUnits')::BIGINT, -1) <> p_total_minor_units THEN
     RAISE EXCEPTION 'pricing snapshot disagrees with the order total' USING ERRCODE = '22023';
@@ -528,7 +550,7 @@ BEGIN
   ) VALUES (
     p_order_id, p_order_number, p_client_request_id, p_customer_id, p_customer_name, p_customer_email, p_customer_phone,
     jsonb_build_object('address', COALESCE(p_shipping_address, '')), p_items, 'Pending', 'Pending',
-    CASE WHEN p_payment_method = 'cod' THEN 'cod' ELSE 'momo' END, 'UGX',
+    CASE WHEN p_payment_method IN ('cod', 'card') THEN p_payment_method ELSE 'momo' END, 'UGX',
     p_subtotal_minor_units, p_discount_minor_units, p_shipping_minor_units, 0,
     p_total_minor_units, p_total_minor_units / 100.0, p_pricing_snapshot, 0, p_created_at, p_created_at
   );

@@ -10,7 +10,7 @@ E-commerce storefront for musical instruments & pro audio (Uganda, UGX), built w
 
 - Next.js 16 (React 19, TypeScript), Tailwind CSS 4
 - Supabase: Postgres (PostgREST), Auth, Storage
-- LivePay (https://docs.livepay.me/) for Mobile Money collection (MTN/Airtel, UGX only — the documented API has no card endpoint)
+- LivePay (https://docs.livepay.me/) for Mobile Money collection (MTN/Airtel, UGX) and card collection (Visa/Mastercard, USD)
 
 ## Run locally
 
@@ -27,8 +27,11 @@ Required environment variables (see `.env.example` for details):
 | `APP_URL` | Public base URL (gateway callbacks/redirects) |
 | `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Browser-safe Supabase config |
 | `SUPABASE_SERVICE_ROLE_KEY` | **Server-only.** Order writes, webhook processing, admin reads. Without it, checkout/webhooks fail closed (503). |
-| `LIVEPAY_API_KEY` | LivePay API key — the sole gateway credential (`Bearer`). Server-only. |
+| `LIVEPAY_API_KEY` | Collect-money API key (`Authorization: Bearer <key>`). Server-only. |
 | `LIVEPAY_MERCHANT_ID` | Your LivePay account number (e.g. `LP2305443309`) sent as `accountNumber` |
+| `LIVEPAY_CARD_API_KEY` | Card-collection credential — the dot-separated `keyId.secret` pair. Unset ⇒ card checkout disabled. |
+| `LIVEPAY_CARD_MERCHANT_ID` | Optional separate account number for the card product |
+| `LIVEPAY_USD_RATE_UGX` | UGX per USD used to convert order totals for card checkout (**required** for cards; no default, because guessing an exchange rate would misprice every charge) |
 | `LIVEPAY_SECRET_KEY` | Optional/legacy — not used by the documented LivePay API |
 | `LIVEPAY_WEBHOOK_SECRET` | HMAC secret for webhook verification. **Webhook rejects all traffic without it.** |
 | `LIVEPAY_API_URL` | Gateway base URL (default `https://livepay.me/api`; must be `*.livepay.me`) |
@@ -150,17 +153,30 @@ of the suite (`tests/moneyPentest.test.ts`).
   idempotent per `(internal_reference, customer_reference, status)`; retries of
   failed processing are not lost; fails closed (503) when
   `LIVEPAY_WEBHOOK_SECRET` or the service role key is missing.
-- Gateway notes: authentication is `Authorization: Bearer <LIVEPAY_API_KEY>`
-  only; `accountNumber` = your LivePay merchant account number
-  (`LIVEPAY_MERCHANT_ID`); mobile money only (no documented card endpoint);
-  references are unique per account — retries with a live duplicate reference
-  are recovered via `/transaction-status`.
+- Gateway notes: two documented products with different credentials —
+  `collect-money` uses `Authorization: Bearer <LIVEPAY_API_KEY>` and
+  `accountNumber` = `LIVEPAY_MERCHANT_ID`; `card-collection` uses
+  `Authorization: Bearer <keyId>.<secret>` (`LIVEPAY_CARD_API_KEY`) and is
+  **USD only**. References are unique per account, ≤30 chars, no spaces —
+  retries with a live duplicate collect reference are recovered via
+  `/transaction-status`; card attempts get a fresh per-attempt reference.
 - Payment initiation payload (`POST {LIVEPAY_API_URL}/collect-money`, spec at
   docs.livepay.me/request-money):
   `{ accountNumber, phoneNumber, amount (integer UGX), currency: "UGX",
   reference, description }` — `reference` is `"ORD" + order_number`
   (≤ 30 chars, no spaces), amounts come from the DB order, never the client.
-  Success response: `{ success, message, reference, internal_reference }`.
+  Success response: `{ success, message, reference, internal_reference, network }`.
+- Card initiation payload (`POST {LIVEPAY_API_URL}/card-collection`, spec at
+  docs.livepay.me/card-collection):
+  `{ accountNumber, amount (USD, 2 dp), currency: "USD", reference, email,
+  description, return_url }`. The USD amount is derived server-side from the
+  order's UGX total and `LIVEPAY_USD_RATE_UGX`, rounded **up** to the cent and
+  checked against the documented `$1.00–$5,000.00` window. The rate used is
+  frozen on the `payments` row (`raw_payload.fx`) so the webhook can verify the
+  charge. Response: `{ success, checkout_url, reference, internal_reference }`;
+  the browser is redirected to `checkout_url` (host allow-listed to
+  `*.livepay.me`) and returns via `APP_URL?order=…&payment=card&checkout_id=…`,
+  which opens the tracking view for that order.
 - Ancillary documented endpoints used: `GET /check-balance?accountNumber=&currency=UGX`
   (both params required — powers the admin "Test Live Connection") and
   `GET /transaction-status?accountNumber=&currency=&reference=`

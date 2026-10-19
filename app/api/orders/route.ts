@@ -6,7 +6,12 @@ import {
   getServerAnonClient,
   isServerSupabaseConfigured,
 } from '@/lib/server/supabaseServer';
-import { createOrderServer, buildCatalogPriceIndex, ambiguousProductNames } from '@/lib/server/orders';
+import {
+  createOrderServer,
+  buildCatalogPriceIndex,
+  ambiguousProductNames,
+  normalisePaymentMethod,
+} from '@/lib/server/orders';
 import { priceOrder, PromoDeal, toMinorUnits } from '@/lib/pricing';
 import { logger, newRequestId } from '@/lib/server/logging';
 import {
@@ -167,7 +172,8 @@ export async function POST(req: NextRequest) {
   const customerPhone = isNonEmptyString(body.phone, 32) ? sanitizeText(body.phone, 32) : null;
   const shippingAddress = isNonEmptyString(body.shippingAddress, 500) ? sanitizeText(body.shippingAddress, 500) : null;
 
-  const paymentMethod: 'momo' | 'cod' = body.paymentMethod === 'cod' ? 'cod' : 'momo';
+  // Whitelisted: 'momo' | 'card' (both LivePay products) or 'cod'.
+  const paymentMethod = normalisePaymentMethod(body.paymentMethod);
 
   const rawIdempotencyKey = req.headers.get('idempotency-key') || body.clientRequestId;
   const clientRequestId =

@@ -240,16 +240,23 @@ export function reconcilePaymentAmount(opts: {
   const orderCurrency = (opts.orderCurrency || 'UGX').trim().toUpperCase();
   const currencyOk = payloadCurrency === '' || payloadCurrency === orderCurrency;
 
+  // The whole-shilling rule is a UGX invariant (UGX has no circulating
+  // subunit). USD card settlements legitimately land in cents, so applying the
+  // UGX rule there would reject every correct card payment.
+  const requiresWholeShilling = orderCurrency === 'UGX';
+  const expectedUsable =
+    Number.isSafeInteger(expectedMinor) &&
+    expectedMinor > 0 &&
+    (!requiresWholeShilling || isWholeShillingMinor(expectedMinor));
+
   const amountOk =
     !reason &&
-    isWholeShillingMinor(expectedMinor) &&
+    expectedUsable &&
     Number.isFinite(paidMinor) &&
     paidMinor === expectedMinor;
 
   if (!amountOk && !reason) {
-    reason = isWholeShillingMinor(expectedMinor)
-      ? 'amount mismatch'
-      : 'order total is not a whole shilling';
+    reason = expectedUsable ? 'amount mismatch' : 'order total is not a valid whole shilling amount';
   }
 
   return { amountOk, currencyOk, expectedMinor, paidMinor, reason };
@@ -309,8 +316,26 @@ export interface CreateOrderInput {
   pricingSnapshot?: unknown;
   /** Idempotency key: a retried checkout returns the original order. */
   clientRequestId?: string | null;
-  /** 'momo' (gateway) or 'cod' (cash on delivery). Defaults to 'momo'. */
-  paymentMethod?: 'momo' | 'cod';
+  /** 'momo' (gateway prompt), 'card' (gateway hosted checkout) or 'cod'. */
+  paymentMethod?: PaymentMethod;
+}
+
+/**
+ * Payment methods the shop can record. Each maps to a documented LivePay
+ * product ('momo' → collect-money, 'card' → card-collection) or to cash.
+ */
+export type PaymentMethod = 'momo' | 'cod' | 'card';
+
+export const PAYMENT_METHODS: readonly PaymentMethod[] = ['momo', 'cod', 'card'] as const;
+
+/**
+ * Whitelist an untrusted payment-method string. Anything unrecognised becomes
+ * 'momo' (the historical default), never an arbitrary value that would land in
+ * the database and confuse the checkout gates.
+ */
+export function normalisePaymentMethod(value: unknown): PaymentMethod {
+  const v = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return (PAYMENT_METHODS as readonly string[]).includes(v) ? (v as PaymentMethod) : 'momo';
 }
 
 export interface CreateOrderResult {
@@ -453,7 +478,7 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       p_total_minor_units: totalMinorUnits,
       p_pricing_snapshot: input.pricingSnapshot ?? null,
       p_client_request_id: clientRequestId,
-      p_payment_method: input.paymentMethod === 'cod' ? 'cod' : 'momo',
+      p_payment_method: normalisePaymentMethod(input.paymentMethod),
       p_created_at: now,
     });
     if (!error) {
@@ -528,7 +553,7 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       items: input.items,
       status: 'Pending',
       payment_status: 'Pending',
-      payment_method: input.paymentMethod === 'cod' ? 'cod' : 'momo',
+      payment_method: normalisePaymentMethod(input.paymentMethod),
       currency: 'UGX',
       subtotal_minor_units: subtotalMinorUnits,
       discount_minor_units: discountMinorUnits,

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ArrowLeft,
   Search,
@@ -31,10 +31,15 @@ interface TrackedOrder {
 interface TrackOrderViewProps {
   onBack: () => void;
   onNavigate: (route: string) => void;
+  /**
+   * Pre-filled order number, used when the customer is redirected back from
+   * LivePay's hosted card checkout (`return_url?order=…&checkout_id=…`).
+   */
+  initialOrderNumber?: string;
 }
 
-export function TrackOrderView({ onBack, onNavigate }: TrackOrderViewProps) {
-  const [orderQuery, setOrderQuery] = useState('');
+export function TrackOrderView({ onBack, onNavigate, initialOrderNumber }: TrackOrderViewProps) {
+  const [orderQuery, setOrderQuery] = useState((initialOrderNumber || '').trim());
   const [isSearching, setIsSearching] = useState(false);
   const [searchedOrder, setSearchedOrder] = useState<TrackedOrder | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
@@ -44,15 +49,15 @@ export function TrackOrderView({ onBack, onNavigate }: TrackOrderViewProps) {
   // NOTE: we deliberately do NOT auto-load "the latest order" here anymore —
   // that exposed another customer's PII to whoever opened this page.
 
-  const handleSearch = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!orderQuery.trim()) return;
+  const searchFor = async (term: string) => {
+    const query = term.trim();
+    if (!query) return;
     setIsSearching(true);
     setNotFound(false);
 
     try {
       // Public tracking endpoint returns a PII-redacted view of the order.
-      const res = await fetch(`/api/orders?track=${encodeURIComponent(orderQuery.trim())}`);
+      const res = await fetch(`/api/orders?track=${encodeURIComponent(query)}`);
       const data = await res.json().catch(() => null);
       if (res.ok && data?.success && data.order) {
         setSearchedOrder(data.order);
@@ -69,6 +74,22 @@ export function TrackOrderView({ onBack, onNavigate }: TrackOrderViewProps) {
       setIsSearching(false);
     }
   };
+
+  const handleSearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await searchFor(orderQuery);
+  };
+
+  // Returning from the card gateway: show the order that was just paid for.
+  // The query field is seeded from the prop above; this only runs the lookup.
+  useEffect(() => {
+    const term = (initialOrderNumber || '').trim();
+    if (!term) return;
+    // Deferred so the lookup is an effect-driven fetch, not a cascading
+    // synchronous state update on mount.
+    const timer = setTimeout(() => void searchFor(term), 0);
+    return () => clearTimeout(timer);
+  }, [initialOrderNumber]);
 
   const getStepStatus = (status: string) => {
     const s = (status || 'Processing').toLowerCase();
