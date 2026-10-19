@@ -2674,6 +2674,13 @@ export default function AdminPortal({
                               >
                                 💵 Cash on Delivery
                               </span>
+                            ) : order.paymentMethod === "card" ? (
+                              <span
+                                title="Card via LivePay — charged in USD at the checkout rate"
+                                className="text-[10px] font-extrabold uppercase tracking-wide px-2 py-0.5 rounded-md bg-violet-100 text-violet-700 border border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-900"
+                              >
+                                💳 Card (USD)
+                              </span>
                             ) : (
                               <span
                                 title="Mobile Money via LivePay"
