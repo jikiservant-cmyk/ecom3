@@ -109,7 +109,7 @@ function fakeDb(opts: FakeOpts = {}) {
           return Promise.resolve(tableResult(table, op)).then(resolve, reject);
         },
       };
-      for (const m of ['select', 'insert', 'update', 'delete', 'eq', 'in', 'is', 'maybeSingle', 'order', 'range']) {
+      for (const m of ['select', 'insert', 'update', 'delete', 'eq', 'in', 'is', 'maybeSingle', 'order', 'range', 'limit', 'filter']) {
         obj[m] = (...args: any[]) => {
           if (m === 'insert' || m === 'update' || m === 'delete') op = m;
           calls.push([m, ...args]);
@@ -422,6 +422,93 @@ describe('card collection request matches the documented contract', () => {
     const { res } = await initPayment({ orderId: 'order-momo', paymentMethod: 'bitcoin' });
     expect(res.status).toBe(400);
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe('gateway reference handling (the docs echo a reference we did not send)', () => {
+  it('stores the gateway-assigned reference so a webhook carrying it still resolves', async () => {
+    const { sink } = fakeDb({
+      ordersSelect: { data: CARD_ORDER, error: null },
+      paymentsSelect: { data: [], error: null },
+    });
+    stubFetch(() => ({
+      status: 200,
+      body: {
+        success: true,
+        checkout_url: 'https://partners.livepay.me/checkout?ref=REF-MVE60LII-DVFWSB',
+        // The docs' success example returns its own reference, not ours.
+        reference: 'REF-MVE60LII-DVFWSB',
+        internal_reference: 'c33fafc4-e0b6-4235-bf1b-319cc6271b64',
+      },
+    }));
+
+    const { res } = await initPayment({ orderId: 'order-card', paymentMethod: 'card' });
+    expect(res.status).toBe(200);
+
+    const update = sink.map((c) => c.find((x) => x[0] === 'update')).find(Boolean);
+    expect(update?.[1].provider_transaction_id).toBe('c33fafc4-e0b6-4235-bf1b-319cc6271b64');
+    expect(update?.[1].raw_payload.gateway_reference).toBe('REF-MVE60LII-DVFWSB');
+    // The FX freeze must survive the merge.
+    expect(update?.[1].raw_payload.fx).toMatchObject({ ugx_per_usd: RATE, usd_minor: 2895 });
+  });
+
+  it('resolves a webhook that carries only the gateway-assigned reference', async () => {
+    const { sink } = fakeDb({
+      ordersSelect: { data: CARD_ORDER, error: null },
+      paymentsSelect: { data: [], error: null }, // no row matches provider_reference
+    });
+    const { POST } = await import('@/app/api/payments/livepay/webhook/route');
+    const payload = {
+      status: 'Success',
+      customer_reference: 'REF-MVE60LII-DVFWSB',
+      internal_reference: 'int-ref',
+      amount: 28.95,
+      currency: 'USD',
+    };
+    const t = String(Math.floor(Date.now() / 1000));
+    const v = signLivePayWebhook({ webhookUrl: WEBHOOK_URL, timestamp: t, payload, secret: SECRET });
+    const res = await POST(
+      new Request(WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'x-webhook-signature': `t=${t},v=${v}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }) as any
+    );
+    await res.json();
+
+    // It tried every identifier the gateway might echo, including the JSON one.
+    const lookups = sink.flatMap((c) => c).filter((x) => x[0] === 'eq' || x[0] === 'filter');
+    const columns = lookups.map((x) => x[1]);
+    expect(columns).toContain('provider_reference');
+    expect(columns).toContain('provider_transaction_id');
+    expect(columns).toContain('raw_payload->>gateway_reference');
+  });
+
+  it('does not fail on repeated Mobile Money attempts that reuse one reference', async () => {
+    // Two pending rows share provider_reference; the lookup must take the newest
+    // instead of erroring on maybeSingle().
+    fakeDb({
+      ordersSelect: { data: MOMO_ORDER, error: null },
+      paymentsSelect: { data: [{ id: 'pay-2' }, { id: 'pay-1' }], error: null },
+    });
+    const payload = {
+      status: 'Success',
+      customer_reference: 'ORDDP-MOMO-0001',
+      internal_reference: 'int-momo',
+      amount: 110_000,
+      currency: 'UGX',
+    };
+    const t = String(Math.floor(Date.now() / 1000));
+    const v = signLivePayWebhook({ webhookUrl: WEBHOOK_URL, timestamp: t, payload, secret: SECRET });
+    const { POST } = await import('@/app/api/payments/livepay/webhook/route');
+    const res = await POST(
+      new Request(WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'x-webhook-signature': `t=${t},v=${v}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }) as any
+    );
+    expect(res.status).toBe(200);
   });
 });
 

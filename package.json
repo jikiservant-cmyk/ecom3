@@ -10,7 +10,9 @@
     "clean": "next clean",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "pentest:money": "node tools/money-pentest.mjs"
+    "pentest:money": "node tools/money-pentest.mjs",
+    "schema:check": "node tools/schema-drift.mjs --strict",
+    "schema:verify-sql": "node tools/schema-drift.mjs --emit-sql > tools/verify-db.sql"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.3",

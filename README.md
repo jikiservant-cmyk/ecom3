@@ -185,6 +185,20 @@ of the suite (`tests/moneyPentest.test.ts`).
   50 req / 15 min per merchant account; the pay route enforces a global
   45 req / 15 min bucket to stay under it.
 
+## Schema alignment
+
+The app ships the database schema it expects in `lib/schemaSql.ts`. Two tools keep code and
+database honest:
+
+```bash
+npm run schema:check        # static: every column/RPC the code uses exists in the schema
+npm run schema:verify-sql   # regenerate tools/verify-db.sql
+```
+
+`tools/verify-db.sql` is a runnable checklist for a LIVE database: paste it into the Supabase
+SQL editor and every expected column, function, index and constraint reports `OK` or `MISSING`.
+See `SCHEMA_ALIGNMENT.md` for the audit and the upgrade notes.
+
 ## Scripts
 
 ```bash
@@ -194,6 +208,8 @@ npm start          # serve production build
 npm run lint       # eslint
 npm run typecheck  # tsc --noEmit
 npm test           # vitest (webhook signatures, rate limit, order ids, validation)
+npm run schema:check      # fail if code references a column the schema lacks
+npm run pentest:money     # live HTTP money probes against BASE_URL
 ```
 
 ## Operations notes

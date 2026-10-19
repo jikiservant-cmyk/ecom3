@@ -134,10 +134,11 @@ export async function saveStoreSettings(settings: StoreSettings): Promise<boolea
 
     let error = null;
 
+    // Public columns are exactly (id, settings, updated_at). Writing `key`,
+    // `value` or `created_at` made PostgREST reject the whole row with
+    // PGRST204, so hot-deal discounts silently never saved.
     if (existingRow) {
       const res = await (supabase.from('store_settings') as any).update({
-        key: 'default',
-        value: settings,
         settings: settings,
         updated_at: now,
       }).eq('id', 'default_settings');
@@ -145,10 +146,7 @@ export async function saveStoreSettings(settings: StoreSettings): Promise<boolea
     } else {
       const res = await (supabase.from('store_settings') as any).insert({
         id: 'default_settings',
-        key: 'default',
-        value: settings,
         settings: settings,
-        created_at: now,
         updated_at: now,
       });
       error = res.error;

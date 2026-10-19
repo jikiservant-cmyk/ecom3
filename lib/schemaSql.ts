@@ -365,11 +365,23 @@ CREATE TABLE IF NOT EXISTS public.payment_webhook_events (
 CREATE INDEX IF NOT EXISTS idx_orders_customer_id ON public.orders (customer_id);
 CREATE INDEX IF NOT EXISTS idx_orders_created_at ON public.orders (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders (status);
--- Idempotent checkout: one order per client request key.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_client_request_id
-  ON public.orders (client_request_id) WHERE client_request_id IS NOT NULL;
+-- Idempotent checkout: one order per client request key, PER CUSTOMER.
+--
+-- The application looks a replay up scoped to the caller (customer_id = <me>,
+-- or IS NULL for guests). A globally unique key would let anybody who guesses
+-- a key block that customer's checkout forever (the insert fails as a duplicate
+-- but the scoped lookup finds nothing). Guests are folded into one scope with
+-- COALESCE because NULLs are distinct in a unique index.
+DROP INDEX IF EXISTS public.idx_orders_client_request_id;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_customer_request_id
+  ON public.orders (COALESCE(customer_id::text, 'guest'), client_request_id)
+  WHERE client_request_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_refunds_order_id ON public.refunds (order_id);
 CREATE INDEX IF NOT EXISTS idx_payments_provider_transaction_id ON public.payments (provider_transaction_id);
+-- The webhook may receive the gateway's OWN reference for a card transaction
+-- (the docs' success example returns a REF-... value, not the one sent).
+-- Both are stored; this index makes the fallback lookup cheap.
+CREATE INDEX IF NOT EXISTS idx_payments_provider_reference ON public.payments (provider, provider_reference);
 CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON public.order_items (order_id);
 CREATE INDEX IF NOT EXISTS idx_payments_order_id ON public.payments (order_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_product_id ON public.reviews (product_id);

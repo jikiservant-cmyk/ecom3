@@ -151,21 +151,46 @@ export async function POST(req: NextRequest) {
   //    reused reference). The payment row records the exact reference we sent,
   //    so look that up FIRST — it also tells us the currency charged and the FX
   //    rate frozen at initiation, which the reconciliation below needs.
-  let paymentRecord: any = null;
-  if (customerReference) {
-    try {
-      const { data } = await (client.from('payments') as any)
-        .select('id, order_id, provider_reference, amount_minor_units, currency, raw_payload')
-        .eq('provider', 'livepay')
-        .eq('provider_reference', customerReference)
-        .maybeSingle();
-      paymentRecord = data || null;
-    } catch (e: any) {
-      // Multiple rows (momo retries reuse a reference) surface as an error —
-      // fall through to the order-number route, which is unambiguous.
-      logger.warn('webhook_payment_lookup_failed', { error: e?.message });
+  const PAYMENT_COLUMNS =
+    'id, order_id, provider_reference, amount_minor_units, currency, raw_payload, provider_transaction_id, created_at';
+
+  /**
+   * Find the payment row matching a reference. Tries every identifier the
+   * gateway might echo:
+   *   1. the reference WE sent           (payments.provider_reference)
+   *   2. the gateway's transaction id    (payments.provider_transaction_id)
+   *   3. the reference the gateway ASSIGNED (raw_payload.gateway_reference)
+   * Ordered newest-first with limit(1): repeated Mobile Money attempts reuse one
+   * reference, so the column is not unique and `maybeSingle()` would error.
+   */
+  const findPayment = async (ref: string): Promise<any | null> => {
+    if (!ref) return null;
+    const attempts: [string, boolean][] = [
+      ['provider_reference', false],
+      ['provider_transaction_id', false],
+      ['raw_payload->>gateway_reference', true],
+    ];
+    for (const [column, isJson] of attempts) {
+      try {
+        let query = (client.from('payments') as any)
+          .select(PAYMENT_COLUMNS)
+          .eq('provider', 'livepay');
+        query = isJson ? query.filter(column, 'eq', ref) : query.eq(column, ref);
+        const { data, error } = await query.order('created_at', { ascending: false }).limit(1);
+        if (error) {
+          logger.warn('webhook_payment_lookup_error', { column, error: error.message });
+          continue;
+        }
+        const row = Array.isArray(data) ? data[0] : data;
+        if (row) return row;
+      } catch (e: any) {
+        logger.warn('webhook_payment_lookup_exception', { column, error: e?.message });
+      }
     }
-  }
+    return null;
+  };
+
+  const paymentRecord = await findPayment(customerReference);
 
   const orderNumberGuess = orderNumberFromReference(customerReference);
   const ORDER_COLUMNS =

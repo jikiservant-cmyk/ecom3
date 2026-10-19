@@ -124,6 +124,13 @@ async function initiateCard(opts: {
   const nonce = `${now}${Math.random().toString(36).slice(2, 5)}`.toUpperCase();
   const reference = buildCardReference(String(order.order_number), nonce);
 
+  const storedPayload = {
+    method: 'card',
+    initiated_at: new Date().toISOString(),
+    fx: { ugx_per_usd: rate, ugx_minor: opts.totalMinorUnits, usd_minor: usdMinor },
+    return_url: returnUrl,
+  };
+
   const payload = {
     accountNumber: gateway.accountNumber,
     amount: usdMinor / 100, // USD, two decimals
@@ -146,12 +153,7 @@ async function initiateCard(opts: {
         status: 'pending',
         amount_minor_units: usdMinor,
         currency: 'USD',
-        raw_payload: {
-          method: 'card',
-          initiated_at: new Date().toISOString(),
-          fx: { ugx_per_usd: rate, ugx_minor: opts.totalMinorUnits, usd_minor: usdMinor },
-          return_url: returnUrl,
-        },
+        raw_payload: storedPayload,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       });
@@ -181,13 +183,21 @@ async function initiateCard(opts: {
       }
       const internalReference =
         typeof data?.internal_reference === 'string' ? data.internal_reference : null;
-      if (internalReference) {
-        await (getServerAdminClient() as any)
-          .from('payments')
-          .update({ provider_transaction_id: internalReference, updated_at: new Date().toISOString() })
-          .eq('order_id', order.id)
-          .eq('provider_reference', reference);
-      }
+      // LivePay may ASSIGN its own reference for card transactions (the docs'
+      // success example echoes `REF-…`, not the reference we sent). Store it, so
+      // a webhook carrying either value still resolves to this payment.
+      const gatewayReference =
+        typeof data?.reference === 'string' && data.reference !== reference ? data.reference : null;
+
+      await (getServerAdminClient() as any)
+        .from('payments')
+        .update({
+          ...(internalReference ? { provider_transaction_id: internalReference } : {}),
+          ...(gatewayReference ? { raw_payload: { ...storedPayload, gateway_reference: gatewayReference } } : {}),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('order_id', order.id)
+        .eq('provider_reference', reference);
       logger.info('livepay_card_checkout_created', {
         orderId: order.id,
         orderNumber: order.order_number,
