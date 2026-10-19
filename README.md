@@ -225,6 +225,8 @@ npm run pentest:money     # live HTTP money probes against BASE_URL
 
 ## Launch requirements that cannot be fixed in application code
 
+> A step-by-step go/no-go checklist lives in [`LAUNCH_READINESS.md`](LAUNCH_READINESS.md).
+
 These need action outside this repository. They are listed here so they are not
 silently forgotten.
 
