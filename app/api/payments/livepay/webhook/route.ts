@@ -421,7 +421,7 @@ export async function POST(req: NextRequest) {
     const settledMinor = outcome === 'paid' ? paidOrderMinor : 0;
 
     let paymentsQuery = (client.from('payments') as any).update({
-      status: outcome === 'paid' ? PAYMENT_ROW_STATUS.success : PAYMENT_ROW_STATUS.failed,
+      status: outcome === 'paid' ? PAYMENT_ROW_STATUS.paid : PAYMENT_ROW_STATUS.failed,
       provider_reference: customerReference || undefined,
       provider_transaction_id: typeof payload.provider_transaction_id === 'string' ? payload.provider_transaction_id : null,
       settled_amount_minor_units: settledMinor,

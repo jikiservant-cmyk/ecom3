@@ -190,9 +190,9 @@ do not exist yet.
 
 | # | Live database | What the app needs | Consequence if unchanged |
 |---|---|---|---|
-| L1 | `orders` has **no `payment_status`**; payment state is folded into `status` (`paid`, `refunded`, `completed`) | a separate `payment_status` (`Pending`/`Paid`/`Failed`/`Refunded`) | every checkout insert fails (unknown column), refunds and the webhook cannot mark anything Paid |
-| L2 | `orders.status` CHECK allows **lowercase** `pending…refunded`, and has `paid`/`completed` but **no `Delivered`** | the same **lowercase** vocabulary (`pending`,`processing`,`shipped`,`delivered`,`cancelled`) | inserts rejected for `Delivered`; `paid`/`completed` belong in `payment_status` |
-| L3 | `payments.status` CHECK allows `pending/processing/paid/failed/cancelled/refunded` | the ledger writes **`success`** for a settled payment (a different vocabulary from the order's `paid`) | the settlement update is rejected → payments stay `pending` forever |
+| L1 | `orders` has **no `payment_status`**; payment state is folded into `status` (`paid`, `refunded`, `completed`) | a separate `payment_status` (`pending`/`paid`/`failed`/`refunded`) | every checkout insert fails (unknown column), refunds and the webhook cannot mark anything Paid |
+| L2 | `orders.status` is an **enum** (`order_status`) with lower-case labels, originally without `delivered` | the same labels, with `delivered` added | `delivered` is now in the type (you added it); no CHECK is created, because a CHECK would reject the type's own `paid`/`completed`/`refunded` |
+| L3 | `payments.status` is an **enum** whose settled label is **`paid`** | an earlier draft wrote `success` for a settled payment | every settlement rejected ("invalid input value for enum") → payments stay `pending` forever. The app now writes `paid` |
 | L4 | No `refunds` table; no `(provider, event_id)` uniqueness on `payment_webhook_events` | refund ledger + idempotent webhooks | refunds 500; a redelivered webhook can be processed twice |
 
 Also missing and created by the schema script: `reviews`, `store_ratings`,
@@ -253,8 +253,15 @@ definitions for exactly these — that is the file that finishes the job.
         Step 2 already replaced the constraints, so this can run before or after.
 ```
 
-Step 2 refuses to run (with a clear message) if step 1 has not been applied, and
-every statement in it is guarded, so it is safe to re-run. **Take a backup first**
+Step 1a (`20261020a_enum_labels.sql`) must be run **on its own, before** the main
+migration: a label added by `ALTER TYPE ... ADD VALUE` cannot be used in the same
+transaction that added it, and the SQL editor runs a paste as one batch. You have
+already added `delivered`, so for you it is a no-op — it exists so the step is
+repeatable on a rebuild.
+
+Step 2 refuses to run (with a clear message) if step 1 has not been applied or if
+the enum still lacks `delivered`, and every statement in it is guarded, so it is
+safe to re-run. **Take a backup first**
 — step 1b rewrites the values the old client wrote. Nothing is re-cased: the
 vocabulary is the database's own, lowercase. What changes is which column holds
 what:
@@ -388,3 +395,34 @@ SQL editor, i.e. how the first admin is provisioned:
 ```sql
 UPDATE public.profiles SET role = 'admin' WHERE email = 'you@example.com';
 ```
+
+### 7.5 What changed after the enum review
+
+The first draft of the migration was written against a TEXT-with-CHECK schema. It
+is not, and four things followed from that:
+
+| Was | Now |
+|---|---|
+| `success` written to `payments.status` | `paid` — the enum label that actually exists; `lib/status.ts` refuses to define `success` at all |
+| `orders_status_valid` / `payments_status_valid` CHECKs | removed; the type is the validator, and a CHECK would reject `paid`/`completed`/`refunded` |
+| `ALTER TYPE ... ADD VALUE` inside the main script | moved to `20261020a_enum_labels.sql` (own batch), with a preflight that stops the main script if `delivered` is missing |
+| guest idempotency scoped to the literal `'guest'` | scoped to `(guest_session_id, client_request_id)`; the customer-scoped index is kept, not dropped |
+
+Three more corrections in the same pass:
+
+* **`create_order_v2` no longer trusts `item.price`.** It resolves the product and
+  variant from the database, takes the price from `product_variants`, and then
+  reconciles: subtotal must equal Σ(catalog × qty), a line price may discount but
+  never exceed the catalog price, and Σ(line prices) must equal subtotal −
+  discount. A line without a valid, active product **and** variant is refused.
+* **Section 2 never deletes.** The webhook unique index already exists, so it is
+  verified and left alone; if duplicates were ever found it reports them instead
+  of destroying audit rows.
+* **The auth trigger is never dropped.** If `auth.users` already has an AFTER
+  INSERT trigger, the migration says so and leaves it alone rather than silently
+  removing whatever else it did.
+
+Also tightened: catalog writes (`products`, `product_variants`, `product_images`,
+`categories`) are admin-only, `payment_webhook_events` is service-role only, and
+`reviews` grants column-level SELECT that excludes `user_email` — a public read
+policy on the row would have published every reviewer's address.

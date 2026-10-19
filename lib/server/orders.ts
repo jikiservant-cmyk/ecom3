@@ -335,6 +335,13 @@ export interface CreateOrderInput {
   pricingSnapshot?: unknown;
   /** Idempotency key: a retried checkout returns the original order. */
   clientRequestId?: string | null;
+  /**
+   * Guest idempotency scope. A retried guest checkout is only a duplicate if it
+   * comes from the same browser, so the session id (generated once per browser)
+   * is part of the uniqueness key. Without it, every guest would share one
+   * namespace.
+   */
+  guestSessionId?: string | null;
   /** 'momo' (gateway prompt), 'card' (gateway hosted checkout) or 'cod'. */
   paymentMethod?: PaymentMethod;
 }
@@ -384,7 +391,7 @@ function withoutKeys(payload: Record<string, any>, keys: string[]): Record<strin
   return copy;
 }
 
-const NEW_ORDER_COLUMNS = ['pricing_snapshot', 'client_request_id', 'refunded_minor_units'];
+const NEW_ORDER_COLUMNS = ['pricing_snapshot', 'client_request_id', 'refunded_minor_units', 'guest_session_id'];
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CLIENT_REQUEST_ID_RE = /^[A-Za-z0-9-]{8,64}$/;
@@ -500,6 +507,7 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       p_client_request_id: clientRequestId,
       p_payment_method: normalisePaymentMethod(input.paymentMethod),
       p_created_at: now,
+      p_guest_session_id: input.guestSessionId ?? null,
     });
     if (!error) {
       return { success: true, orderId, orderNumber };
@@ -572,6 +580,7 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       id: orderId,
       order_number: orderNumber,
       client_request_id: clientRequestId,
+      guest_session_id: input.guestSessionId ?? null,
       customer_id: safeCustomerId,
       customer_name: input.customerName,
       customer_email: input.customerEmail,

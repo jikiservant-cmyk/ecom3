@@ -152,9 +152,12 @@ describe('status vocabulary matches the live database', () => {
     expect(Object.values(PAYMENT_STATUS)).not.toContain('success');
   });
 
-  it('keeps success for the payments ledger row, which is a different thing', () => {
-    expect(PAYMENT_ROW_STATUS.success).toBe('success');
-    expect(paymentRowStatusFor(PAYMENT_STATUS.paid)).toBe('success');
+  it('writes the enum label that exists: a settled payment row is paid', () => {
+    // payments.status is a Postgres enum whose label is `paid`. `success` is not
+    // in the type, and writing it fails the settlement outright.
+    expect(PAYMENT_ROW_STATUS.paid).toBe('paid');
+    expect(Object.values(PAYMENT_ROW_STATUS)).not.toContain('success');
+    expect(paymentRowStatusFor(PAYMENT_STATUS.paid)).toBe('paid');
     expect(paymentRowStatusFor(PAYMENT_STATUS.failed)).toBe('failed');
   });
 
@@ -162,7 +165,9 @@ describe('status vocabulary matches the live database', () => {
     expect(normaliseOrderStatus('Pending')).toBe('pending');
     expect(normaliseOrderStatus('CANCELLED')).toBe('cancelled');
     expect(normalisePaymentStatus('Paid')).toBe('paid');
-    expect(normalisePaymentRowStatus('Success')).toBe('success');
+    // A legacy 'success' from an old row is still understood on read...
+    expect(normalisePaymentRowStatus('success')).toBe('paid');
+    expect(normalisePaymentRowStatus('Paid')).toBe('paid');
   });
 
   it('never invents a paid order from junk input', () => {

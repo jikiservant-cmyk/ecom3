@@ -8,7 +8,10 @@
 --
 --  WHAT IS STILL MISSING AFTER YOUR PARTIAL RUN, AND WHAT BREAKS
 --
---   1. CHECK constraint on orders.status  → checkout may already be failing.
+--   1. `orders.status` is an ENUM (order_status) — there is deliberately NO
+--      CHECK constraint here. A CHECK cannot add a label, duplicates the type,
+--      and would reject labels the type legitimately holds (`paid`, `completed`,
+--      `refunded`). You already added `delivered`. See 20261020a_enum_labels.sql.
 --      Your live table was created with status IN ('pending','paid',
 --      'processing','shipped','completed','cancelled','refunded').
 --
@@ -22,8 +25,9 @@
 --      Verify:  SELECT pg_get_constraintdef(oid), conname FROM pg_constraint
 --                WHERE conrelid = 'public.orders'::regclass AND contype = 'c';
 --
---   2. CHECK on payments.status → the webhook writes 'success'; the legacy
---      check allows 'paid' but not 'success'. Settlements would be rejected.
+--   2. `payments.status` is an ENUM whose settled label is `paid`. The app used
+--      to write 'success', which the type does not contain — that would have
+--      rejected every settlement. lib/status.ts now writes `paid`.
 --
 --   3. create_order_v2 → checkout silently uses the non-atomic fallback:
 --      oversell is possible, and guest idempotency is not enforced.
@@ -31,8 +35,8 @@
 --   4. record_refund → refunds take the optimistic fallback path (safe against
 --      races, but not a single transaction).
 --
---   5. payment_webhook_events unique key → a redelivered webhook is processed
---      twice; the "duplicate" branch in the handler never fires.
+--   5. payment_webhook_events unique key → ALREADY APPLIED. Section 2 only
+--      verifies it and never deletes audit rows.
 --
 --   6. Triggers + is_admin() → a direct PostgREST write can still flip payment_status.
 --
@@ -68,176 +72,275 @@ BEGIN
   IF v_tables IS NOT NULL THEN
     RAISE EXCEPTION 'missing tables [%]. Apply the additive part of lib/schemaSql.ts first. Nothing was changed.', v_tables;
   END IF;
+  -- The app writes `delivered`. If the enum does not have that label yet, this
+  -- migration would half-apply before failing on the first shipped order, so it
+  -- stops here instead. Fix: run 20261020a_enum_labels.sql on its own first.
+  DECLARE
+    v_udt TEXT;
+    v_has_delivered BOOLEAN;
+  BEGIN
+    SELECT c.udt_name INTO v_udt
+      FROM information_schema.columns c
+     WHERE c.table_schema='public' AND c.table_name='orders' AND c.column_name='status';
+
+    IF v_udt IS NOT NULL AND v_udt <> 'text' THEN
+      SELECT EXISTS (
+        SELECT 1 FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
+         WHERE t.typname = v_udt AND e.enumlabel = 'delivered') INTO v_has_delivered;
+      IF NOT v_has_delivered THEN
+        RAISE EXCEPTION 'enum % has no label ''delivered''. Run supabase/migrations/20261020a_enum_labels.sql on its own first, then re-run this file. Nothing was changed.', v_udt;
+      END IF;
+    END IF;
+  END;
+
   RAISE NOTICE 'preflight ok';
 END
 $preflight$;
 
 -- ---------------------------------------------------------------------------
--- 1. Replace the legacy CHECK constraints.
+-- 1. Status constraints — ENUM AWARE.
 --
---    They were created inline by CREATE TABLE, so their names vary between
---    databases. Find every status-ish CHECK by its DEFINITION and drop it, then
---    install named ones. NOT VALID = existing rows are not re-checked (a legacy
---    row with an odd value will not block the deployment), new writes are.
--- ---------------------------------------------------------------------------
-DO $constraints$
+--    `orders.status` is a POSTGRES ENUM (`order_status`), and `payments.status`
+--    is an enum too. You already added `delivered` to the first one.
+--
+--    So this section does NOT create CHECK constraints on those columns. A
+--    CHECK cannot add a label that the type does not have, it duplicates what
+--    the enum already enforces, and a CHECK that lists only the labels we use
+--    would REJECT the labels that are legitimately in the type (`paid`,
+--    `completed`, `refunded`) — turning a working column into a failing one.
+--
+--    What is enforced instead:
+--      * the enum is the validator for `orders.status` and `payments.status`;
+--      * `orders.payment_status` is a TEXT column this project added, so it
+--        gets a real CHECK — but only if it really is text (see the guard).
+--
+--    If `delivered` is missing from the enum, run
+--    `20261020a_enum_labels.sql` FIRST (it must be its own batch: a label added
+--    in a transaction cannot be used in that same transaction).
+DO $status_constraints$
 DECLARE
-  r RECORD;
+  v_udt    TEXT;
 BEGIN
-  FOR r IN
-    SELECT con.conname, rel.relname
-      FROM pg_constraint con
-      JOIN pg_class rel ON rel.oid = con.conrelid
-      JOIN pg_namespace ns ON ns.oid = rel.relnamespace
-     WHERE ns.nspname = 'public'
-       AND rel.relname IN ('orders', 'payments')
-       AND con.contype = 'c'
-       AND (pg_get_constraintdef(con.oid) ILIKE '%payment_status%'
-            OR pg_get_constraintdef(con.oid) ILIKE '%status%')
-       AND con.conname NOT IN ('orders_status_valid', 'orders_payment_status_valid',
-                               'payments_status_valid', 'orders_payment_method_valid',
-                               'orders_amounts_whole_shillings', 'orders_totals_add_up',
-                               'orders_refund_within_total')
-  LOOP
-    EXECUTE format('ALTER TABLE public.%I DROP CONSTRAINT %I', r.relname, r.conname);
-    RAISE NOTICE 'dropped legacy constraint %.%', r.relname, r.conname;
-  END LOOP;
-END
-$constraints$;
+  -- 1a. Only add the payment_status CHECK if the column is genuinely text.
+  SELECT c.udt_name INTO v_udt
+    FROM information_schema.columns c
+   WHERE c.table_schema = 'public' AND c.table_name = 'orders'
+     AND c.column_name = 'payment_status';
 
-DO $add_checks$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='orders_status_valid' AND conrelid='public.orders'::regclass) THEN
-    ALTER TABLE public.orders ADD CONSTRAINT orders_status_valid
-      CHECK (status IN ('pending','processing','shipped','delivered','cancelled')) NOT VALID;
-  END IF;
-
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='orders_payment_status_valid' AND conrelid='public.orders'::regclass) THEN
+  IF v_udt = 'text' AND NOT EXISTS (
+       SELECT 1 FROM pg_constraint
+        WHERE conname = 'orders_payment_status_valid'
+          AND conrelid = 'public.orders'::regclass) THEN
     ALTER TABLE public.orders ADD CONSTRAINT orders_payment_status_valid
       CHECK (payment_status IN ('pending','paid','failed','refunded')) NOT VALID;
+  ELSIF v_udt IS NOT NULL AND v_udt <> 'text' THEN
+    RAISE NOTICE 'orders.payment_status is %, not text - leaving validation to the type', v_udt;
   END IF;
 
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='payments_status_valid' AND conrelid='public.payments'::regclass) THEN
-    ALTER TABLE public.payments ADD CONSTRAINT payments_status_valid
-      CHECK (status IN ('pending','success','failed','refunded')) NOT VALID;
+  -- 1b. Drop a redundant/contradictory status CHECK if a previous run added one.
+  --     (This is the constraint that would reject `paid`/`completed`/`refunded`.)
+  IF EXISTS (SELECT 1 FROM pg_constraint
+              WHERE conname = 'orders_status_valid'
+                AND conrelid = 'public.orders'::regclass) THEN
+    ALTER TABLE public.orders DROP CONSTRAINT orders_status_valid;
+    RAISE NOTICE 'dropped redundant orders_status_valid (the enum already validates status)';
   END IF;
 
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='orders_payment_method_valid' AND conrelid='public.orders'::regclass) THEN
+  IF EXISTS (SELECT 1 FROM pg_constraint
+              WHERE conname = 'payments_status_valid'
+                AND conrelid = 'public.payments'::regclass) THEN
+    ALTER TABLE public.payments DROP CONSTRAINT payments_status_valid;
+    RAISE NOTICE 'dropped payments_status_valid (the enum already validates status)';
+  END IF;
+
+  -- 1c. payment_method and the money invariants are still worth enforcing: they
+  --     are ordinary columns, and these checks are additive (NOT VALID).
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                  WHERE conname='orders_payment_method_valid'
+                    AND conrelid='public.orders'::regclass) THEN
     ALTER TABLE public.orders ADD CONSTRAINT orders_payment_method_valid
       CHECK (payment_method IN ('momo','cod','card')) NOT VALID;
   END IF;
 
-  -- Money invariants (whole shillings, totals add up, refunds within the total).
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='orders_amounts_whole_shillings' AND conrelid='public.orders'::regclass) THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                  WHERE conname='orders_amounts_whole_shillings'
+                    AND conrelid='public.orders'::regclass) THEN
     ALTER TABLE public.orders ADD CONSTRAINT orders_amounts_whole_shillings
       CHECK (total_minor_units % 100 = 0 AND subtotal_minor_units % 100 = 0
              AND discount_minor_units % 100 = 0 AND shipping_minor_units % 100 = 0) NOT VALID;
   END IF;
 
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='orders_refund_within_total' AND conrelid='public.orders'::regclass) THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                  WHERE conname='orders_refund_within_total'
+                    AND conrelid='public.orders'::regclass) THEN
     ALTER TABLE public.orders ADD CONSTRAINT orders_refund_within_total
       CHECK (refunded_minor_units >= 0 AND refunded_minor_units <= total_minor_units) NOT VALID;
   END IF;
 END
-$add_checks$;
+$status_constraints$;
 
 -- ---------------------------------------------------------------------------
--- 1b. Normalise the rows the old code already wrote.
+-- 1b. Normalise the rows the old client already wrote.
 --
---    The application used to write 'Pending' / 'Paid' / 'Delivered'. Those rows
---    are still there, and a mixed-case column silently breaks every report and
---    every `WHERE status = 'delivered'` filter. This rewrites them ONCE, to the
---    live lowercase vocabulary. It also moves the two values that never belonged
---    in `orders.status` (`paid`, `refunded`) into `payment_status`.
+--    Case is the only thing to fix: the enum labels are lowercase, and an
+--    earlier version of the app wrote 'Pending' / 'Processing' — which would not
+--    even have been accepted by the enum, so any such row is from a TEXT-era
+--    table. The cast to the enum type is explicit, because `CASE` yields text
+--    and Postgres will not assign text to an enum column.
+--
+--    `paid` / `completed` / `refunded` are LEFT ALONE: they are valid labels of
+--    your type, and rewriting them would destroy real order history.
 --
 --    Idempotent: a second run matches nothing.
 -- ---------------------------------------------------------------------------
+DO $normalise_rows$
+DECLARE
+  v_udt TEXT;
+BEGIN
+  SELECT c.udt_name INTO v_udt
+    FROM information_schema.columns c
+   WHERE c.table_schema='public' AND c.table_name='orders' AND c.column_name='status';
+
+  IF v_udt IS NULL THEN
+    RAISE NOTICE 'orders.status not found - skipping';
+  ELSIF v_udt = 'text' THEN
+    -- Legacy text column: fix the casing only.
+    UPDATE public.orders
+       SET status = lower(trim(status)),
+           updated_at = NOW()
+     WHERE status <> lower(trim(status));
+  ELSE
+    -- Enum column: only touch rows whose value differs from its lowercase form
+    -- AND whose lowercase form is a label of the type.
+    EXECUTE format($f$
+      UPDATE public.orders o
+         SET status = lower(trim(o.status::text))::public.%I,
+             updated_at = NOW()
+       WHERE o.status::text <> lower(trim(o.status::text))
+         AND lower(trim(o.status::text)) IN (
+               SELECT e.enumlabel FROM pg_enum e
+                 JOIN pg_type t ON t.oid = e.enumtypid
+                WHERE t.typname = %L)
+    $f$, v_udt, v_udt);
+  END IF;
+END
+$normalise_rows$;
+
+-- `payment_status` is our own TEXT column, so it can be normalised directly.
 UPDATE public.orders
-   SET status = CASE lower(trim(status))
-                  WHEN 'pending'     THEN 'pending'
-                  WHEN 'processing'  THEN 'processing'
-                  WHEN 'shipped'     THEN 'shipped'
-                  WHEN 'delivered'   THEN 'delivered'
-                  WHEN 'completed'   THEN 'delivered'
-                  WHEN 'cancelled'   THEN 'cancelled'
-                  WHEN 'canceled'    THEN 'cancelled'
-                  WHEN 'refunded'    THEN 'cancelled'
-                  WHEN 'paid'        THEN 'processing'
-                  ELSE lower(trim(status))
-                END,
-       payment_status = CASE
-                  WHEN lower(trim(status)) = 'paid'     THEN 'paid'
-                  WHEN lower(trim(status)) = 'refunded' THEN 'refunded'
-                  WHEN lower(trim(payment_status)) IN ('paid','success','succeeded','completed') THEN 'paid'
-                  WHEN lower(trim(payment_status)) = 'failed'   THEN 'failed'
-                  WHEN lower(trim(payment_status)) = 'refunded' THEN 'refunded'
-                  ELSE 'pending'
-                END,
+   SET payment_status = CASE
+         WHEN lower(trim(payment_status)) IN ('paid','success','succeeded','completed') THEN 'paid'
+         WHEN lower(trim(payment_status)) = 'failed'   THEN 'failed'
+         WHEN lower(trim(payment_status)) = 'refunded' THEN 'refunded'
+         ELSE 'pending'
+       END,
        updated_at = NOW()
- WHERE status <> lower(trim(status))
+ WHERE payment_status IS NULL
     OR payment_status <> lower(trim(payment_status))
     OR lower(trim(payment_status)) NOT IN ('pending','paid','failed','refunded');
 
--- The payments ledger has its own vocabulary: a settled attempt is `success`.
-UPDATE public.payments
-   SET status = CASE lower(trim(status))
-                  WHEN 'paid'       THEN 'success'
-                  WHEN 'succeeded'  THEN 'success'
-                  WHEN 'completed'  THEN 'success'
-                  WHEN 'processing' THEN 'pending'
-                  WHEN 'cancelled'  THEN 'failed'
-                  WHEN 'canceled'   THEN 'failed'
-                  WHEN 'pending'    THEN 'pending'
-                  WHEN 'success'    THEN 'success'
-                  WHEN 'failed'     THEN 'failed'
-                  WHEN 'refunded'   THEN 'refunded'
-                  ELSE 'pending'
-                END,
-       updated_at = NOW()
- WHERE status <> lower(trim(status));
-
--- ---------------------------------------------------------------------------
--- 2. Webhook idempotency.
---    De-duplicate first, otherwise the unique constraint cannot be created.
---    The handler relies on the 23505 duplicate error to short-circuit retries.
--- ---------------------------------------------------------------------------
-DELETE FROM public.payment_webhook_events a
- USING public.payment_webhook_events b
- WHERE a.provider = b.provider AND a.event_id = b.event_id AND a.ctid > b.ctid;
-
-DO $webhook_key$
+-- The payments ledger is an enum whose settled value is `paid` (NOT `success`),
+-- so there is nothing to map here — writing a label that is not in the type is
+-- exactly the failure this avoids.
+DO $payments_note$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                  WHERE conname='payment_webhook_events_event_id_key'
-                    AND conrelid='public.payment_webhook_events'::regclass) THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
+                  WHERE t.typname = 'status' AND e.enumlabel = 'paid') THEN
+    RAISE NOTICE 'payments.status has no paid label - check the enum before deploying';
+  END IF;
+END
+$payments_note$;
+
+-- ---------------------------------------------------------------------------
+-- 2. Webhook idempotency — VERIFY ONLY, never delete.
+--
+--    The unique (provider, event_id) index already exists on your database, so
+--    this section creates nothing and deletes nothing. An earlier version
+--    DELETEd duplicate rows to make room for the constraint; deleting from an
+--    audit table to satisfy a DDL statement is not acceptable, and it is not
+--    needed now that the index is in place.
+--
+--    If the index is somehow missing, this reports how many duplicates exist
+--    and tells you to inspect them instead of silently destroying evidence.
+DO $webhook_key$
+DECLARE
+  v_dupes INTEGER;
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname='public' AND c.relname='payment_webhook_events_event_id_key')
+     OR EXISTS (SELECT 1 FROM pg_constraint
+                 WHERE conname='payment_webhook_events_event_id_key'
+                   AND conrelid='public.payment_webhook_events'::regclass)
+     OR EXISTS (SELECT 1 FROM pg_indexes
+                 WHERE schemaname='public' AND tablename='payment_webhook_events'
+                   AND indexdef ILIKE '%provider%event_id%') THEN
+    RAISE NOTICE 'webhook (provider, event_id) uniqueness already present - nothing to do';
+    RETURN;
+  END IF;
+
+  SELECT COUNT(*) INTO v_dupes FROM (
+    SELECT provider, event_id FROM public.payment_webhook_events
+     GROUP BY provider, event_id HAVING COUNT(*) > 1) d;
+
+  IF v_dupes = 0 THEN
     ALTER TABLE public.payment_webhook_events
       ADD CONSTRAINT payment_webhook_events_event_id_key UNIQUE (provider, event_id);
+    RAISE NOTICE 'created payment_webhook_events_event_id_key';
+  ELSE
+    RAISE WARNING '% duplicate (provider, event_id) group(s) exist. Nothing was deleted. Inspect with: SELECT provider, event_id, COUNT(*) FROM public.payment_webhook_events GROUP BY 1,2 HAVING COUNT(*) > 1;', v_dupes;
   END IF;
 END
 $webhook_key$;
 
 -- ---------------------------------------------------------------------------
--- 3. Idempotency index — COVERS GUESTS.
+-- 3. Guest idempotency — scoped to a GUEST SESSION, and the customer-scoped
+--    index is KEPT.
 --
---    The index you added keys on customer_id only, so concurrent guest retries
---    (customer_id IS NULL) are not constrained: a retried checkout creates a
---    second order and a second Mobile Money prompt. NULLs are distinct in a
---    unique index, so guests are folded into one scope explicitly.
+--    Keying every guest to the literal 'guest' gave all guests one shared
+--    namespace, and an earlier draft dropped the customer index to do it. Wrong
+--    on both counts. A guest retry is only a duplicate if it comes from the SAME
+--    browser session, so the session id (generated once per browser, sent as
+--    X-Guest-Session-Id) is part of the key.
+--
+--    Two indexes now exist, each with a single job:
+--      * idx_orders_client_request_id        -- guests, scoped by session
+--      * idx_orders_customer_request_id      -- signed-in customers (unchanged)
 -- ---------------------------------------------------------------------------
-DROP INDEX IF EXISTS public.idx_orders_client_request_id;
-DROP INDEX IF EXISTS public.idx_orders_customer_request_id;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS guest_session_id TEXT;
+
+DROP INDEX IF EXISTS public.idx_orders_guest_session_request_id;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_guest_session_request_id
+  ON public.orders (guest_session_id, client_request_id)
+  WHERE customer_id IS NULL
+    AND guest_session_id IS NOT NULL
+    AND client_request_id IS NOT NULL;
+
+-- Signed-in customers: restored/kept, exactly as before.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_customer_request_id
-  ON public.orders (COALESCE(customer_id::text, 'guest'), client_request_id)
-  WHERE client_request_id IS NOT NULL;
+  ON public.orders (customer_id, client_request_id)
+  WHERE customer_id IS NOT NULL
+    AND client_request_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- 4. RPC: create_order_v2 — atomic order + line items + stock decrement.
+--
+--    PRICING: the function does NOT trust `item.price`. It resolves the product
+--    and the variant from the database, takes `price_minor_units` from
+--    `product_variants`, and then reconciles what it was told against that:
+--      * subtotal must equal SUM(catalog price x quantity);
+--      * the submitted line prices may DISCOUNT (promotions) but never exceed
+--        the catalog price;
+--      * SUM(line prices) must equal subtotal - discount;
+--      * total must equal subtotal - discount + shipping.
+--    A line without a valid, active product and variant is refused outright.
 --
 --    SECURITY: SECURITY DEFINER, so EXECUTE is granted to service_role ONLY.
 --    The auth.role() guard inside the body means even a future mis-grant cannot
 --    open it. Without this function checkout falls back to a non-atomic path
 --    where two concurrent buyers can take the same last unit.
 -- ---------------------------------------------------------------------------
+-- Older signatures (no guest session, TEXT ids) are removed so a stale caller
+-- cannot reach a version that trusts the submitted price.
 DROP FUNCTION IF EXISTS public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ);
 DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ);
 
@@ -257,7 +360,8 @@ CREATE OR REPLACE FUNCTION public.create_order_v2(
   p_pricing_snapshot JSONB,
   p_client_request_id TEXT,
   p_payment_method TEXT,
-  p_created_at TIMESTAMPTZ
+  p_created_at TIMESTAMPTZ,
+  p_guest_session_id TEXT
 )
 RETURNS VOID
 LANGUAGE plpgsql
@@ -265,9 +369,13 @@ SECURITY DEFINER
 SET search_path = public
 AS $fn$
 DECLARE
-  item RECORD;
-  v_product_id UUID;
-  v_variant_id UUID;
+  item            RECORD;
+  v_product_id    UUID;
+  v_variant_id    UUID;
+  v_catalog_price BIGINT;
+  v_net_price     BIGINT;
+  v_catalog_sum   BIGINT := 0;
+  v_net_sum       BIGINT := 0;
 BEGIN
   IF COALESCE(auth.role(), '') <> 'service_role' THEN
     RAISE EXCEPTION 'create_order_v2 is server-only' USING ERRCODE = '42501';
@@ -278,6 +386,9 @@ BEGIN
      OR p_shipping_minor_units % 100 <> 0
      OR p_total_minor_units % 100 <> 0 THEN
     RAISE EXCEPTION 'order amounts must be whole shillings' USING ERRCODE = '22023';
+  END IF;
+  IF p_discount_minor_units < 0 OR p_shipping_minor_units < 0 THEN
+    RAISE EXCEPTION 'discount and shipping cannot be negative' USING ERRCODE = '22023';
   END IF;
   IF p_total_minor_units <> p_subtotal_minor_units - p_discount_minor_units + p_shipping_minor_units THEN
     RAISE EXCEPTION 'order totals do not add up' USING ERRCODE = '22023';
@@ -292,72 +403,108 @@ BEGIN
      AND COALESCE((p_pricing_snapshot->>'totalMinorUnits')::BIGINT, -1) <> p_total_minor_units THEN
     RAISE EXCEPTION 'pricing snapshot disagrees with the order total' USING ERRCODE = '22023';
   END IF;
+  IF p_items IS NULL OR jsonb_typeof(p_items) <> 'array' OR jsonb_array_length(p_items) = 0 THEN
+    RAISE EXCEPTION 'an order needs at least one line item' USING ERRCODE = '22023';
+  END IF;
 
   INSERT INTO public.orders (
-    id, order_number, client_request_id, customer_id, customer_name, customer_email, customer_phone,
+    id, order_number, client_request_id, guest_session_id, customer_id,
+    customer_name, customer_email, customer_phone,
     shipping_address, items, status, payment_status, payment_method, currency,
     subtotal_minor_units, discount_minor_units, shipping_minor_units, tax_minor_units,
     total_minor_units, total_amount, pricing_snapshot, refunded_minor_units, created_at, updated_at
   ) VALUES (
-    p_order_id, p_order_number, p_client_request_id, p_customer_id, p_customer_name, p_customer_email, p_customer_phone,
-    jsonb_build_object('address', COALESCE(p_shipping_address, '')), p_items, 'pending', 'pending',
-    CASE WHEN p_payment_method IN ('cod','card') THEN p_payment_method ELSE 'momo' END, 'UGX',
+    p_order_id, p_order_number, p_client_request_id, p_guest_session_id, p_customer_id,
+    p_customer_name, p_customer_email, p_customer_phone,
+    jsonb_build_object('address', COALESCE(p_shipping_address, '')),
+    p_items, 'pending', 'pending',
+    CASE WHEN p_payment_method IN ('cod','card') THEN p_payment_method ELSE 'momo' END,
+    'UGX',
     p_subtotal_minor_units, p_discount_minor_units, p_shipping_minor_units, 0,
     p_total_minor_units, p_total_minor_units / 100.0, p_pricing_snapshot, 0, p_created_at, p_created_at
   );
 
   FOR item IN
     SELECT * FROM jsonb_to_recordset(p_items)
-      AS x("productName" TEXT, "productId" TEXT, "variantId" TEXT, quantity INT, price NUMERIC, variant TEXT)
+      AS x("productName" TEXT, "productId" TEXT, "variantId" TEXT,
+           quantity INT, price NUMERIC, variant TEXT)
   LOOP
-    -- Resolve the product first: prefer the immutable id, fall back to name for
-    -- legacy callers.
-    v_product_id := CASE WHEN COALESCE(item."productId", '') ~ '^[0-9a-fA-F-]{36}$'
-                         THEN item."productId"::uuid ELSE NULL END;
-    IF v_product_id IS NOT NULL THEN
-      SELECT p.id INTO v_product_id FROM public.products p
-        WHERE p.id = v_product_id AND p.status = 'active' LIMIT 1;
+    IF item.quantity IS NULL OR item.quantity < 1 THEN
+      RAISE EXCEPTION 'invalid quantity for %', item."productName" USING ERRCODE = '22023';
     END IF;
+
+    -- ── The product must exist and be active. No name-based fallback: a name is
+    --    neither unique nor immutable, and falling back to it is how a cart gets
+    --    steered at a cheaper twin.
+    v_product_id := CASE
+      WHEN COALESCE(item."productId", '') ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+      THEN item."productId"::uuid ELSE NULL END;
+
     IF v_product_id IS NULL THEN
-      SELECT p.id INTO v_product_id FROM public.products p
-        WHERE p.name = item."productName" AND p.status = 'active' LIMIT 1;
+      RAISE EXCEPTION 'every line needs a valid product id (%)', item."productName" USING ERRCODE = '22023';
     END IF;
 
-    v_variant_id := NULL;
-    IF v_product_id IS NOT NULL THEN
-      -- The variant the customer actually chose wins; otherwise the first
-      -- active one. It must belong to this product, or the line is refused.
-      v_variant_id := CASE WHEN COALESCE(item."variantId", '') ~ '^[0-9a-fA-F-]{36}$'
-                           THEN item."variantId"::uuid ELSE NULL END;
-      IF v_variant_id IS NOT NULL THEN
-        PERFORM 1 FROM public.product_variants pv
-          WHERE pv.id = v_variant_id AND pv.product_id = v_product_id AND pv.status = 'active';
-        IF NOT FOUND THEN
-          RAISE EXCEPTION 'Selected option is not available for product: %', item."productName" USING ERRCODE = 'P0001';
-        END IF;
-      ELSE
-        SELECT pv.id INTO v_variant_id FROM public.product_variants pv
-          WHERE pv.product_id = v_product_id AND pv.status = 'active'
-          ORDER BY pv.position ASC LIMIT 1;
-      END IF;
+    SELECT p.id INTO v_product_id
+      FROM public.products p
+     WHERE p.id = v_product_id AND p.status = 'active';
+    IF v_product_id IS NULL THEN
+      RAISE EXCEPTION 'product is not available: %', item."productName" USING ERRCODE = '22023';
     END IF;
 
-    -- Stock is held against the VARIANT that was bought. The conditional
-    -- UPDATE is the concurrency guard: if another checkout took the last unit
-    -- between our read and this write, zero rows match and we abort the whole
-    -- order rather than overselling.
+    -- ── The variant must exist, be active, and belong to that product.
+    v_variant_id := CASE
+      WHEN COALESCE(item."variantId", '') ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+      THEN item."variantId"::uuid ELSE NULL END;
+
     IF v_variant_id IS NOT NULL THEN
-      UPDATE public.product_variants
-         SET inventory_quantity = inventory_quantity - item.quantity,
-             updated_at = NOW()
-       WHERE id = v_variant_id AND inventory_quantity >= item.quantity;
-      IF NOT FOUND THEN
-        RAISE EXCEPTION 'Insufficient stock for product: %', item."productName" USING ERRCODE = 'P0001';
+      SELECT pv.id, pv.price_minor_units INTO v_variant_id, v_catalog_price
+        FROM public.product_variants pv
+       WHERE pv.id = v_variant_id
+         AND pv.product_id = v_product_id
+         AND pv.status = 'active';
+      IF v_variant_id IS NULL THEN
+        RAISE EXCEPTION 'selected option is not available for %', item."productName" USING ERRCODE = '22023';
+      END IF;
+    ELSE
+      -- No option named: use the product's first active variant, deterministically.
+      SELECT pv.id, pv.price_minor_units INTO v_variant_id, v_catalog_price
+        FROM public.product_variants pv
+       WHERE pv.product_id = v_product_id AND pv.status = 'active'
+       ORDER BY pv.position ASC, pv.id ASC
+       LIMIT 1;
+      IF v_variant_id IS NULL THEN
+        RAISE EXCEPTION 'no active option for %', item."productName" USING ERRCODE = '22023';
       END IF;
     END IF;
 
-    -- The order line records exactly which variant was bought, so a later
-    -- price/stock lookup does not have to guess.
+    -- ── PRICE COMES FROM THE DATABASE, never from the request. The submitted
+    --    price is only allowed to be a DISCOUNT on the catalog price (that is
+    --    what promotions are); it may never exceed it.
+    v_catalog_price := COALESCE(v_catalog_price, 0);
+    IF v_catalog_price <= 0 THEN
+      RAISE EXCEPTION 'catalog price missing for %', item."productName" USING ERRCODE = '22023';
+    END IF;
+
+    v_net_price := ROUND(COALESCE(item.price, 0) * 100)::BIGINT;
+    IF v_net_price <= 0 OR v_net_price > v_catalog_price THEN
+      RAISE EXCEPTION 'line price for % must be between 1 and the catalog price', item."productName"
+        USING ERRCODE = '22023';
+    END IF;
+
+    v_catalog_sum := v_catalog_sum + v_catalog_price * item.quantity;
+    v_net_sum     := v_net_sum + v_net_price * item.quantity;
+
+    -- ── Stock is held against the VARIANT that was bought. The conditional
+    --    UPDATE is the concurrency guard: if another checkout took the last unit
+    --    between our read and this write, zero rows match and we abort.
+    UPDATE public.product_variants
+       SET inventory_quantity = inventory_quantity - item.quantity,
+           updated_at = NOW()
+     WHERE id = v_variant_id AND inventory_quantity >= item.quantity;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Insufficient stock for product: %', item."productName" USING ERRCODE = 'P0001';
+    END IF;
+
     INSERT INTO public.order_items (
       order_id, product_id, variant_id, product_name, product_slug, variant_sku, variant_attributes,
       unit_price_minor_units, quantity, line_total_minor_units, created_at
@@ -369,17 +516,28 @@ BEGIN
       regexp_replace(lower(item."productName"), '[^a-z0-9]+', '-', 'g'),
       COALESCE(item.variant, 'Standard'),
       jsonb_build_object('variant', COALESCE(item.variant, 'Standard')),
-      ROUND(COALESCE(item.price, 0) * 100)::BIGINT,
+      v_net_price,
       item.quantity,
-      ROUND(COALESCE(item.price, 0) * 100 * item.quantity)::BIGINT,
+      v_net_price * item.quantity,
       p_created_at
     );
   END LOOP;
+
+  -- ── Reconcile the totals against what the DATABASE just priced.
+  IF v_catalog_sum <> p_subtotal_minor_units THEN
+    RAISE EXCEPTION 'subtotal % does not match catalog prices %', p_subtotal_minor_units, v_catalog_sum
+      USING ERRCODE = '22023';
+  END IF;
+  IF v_net_sum <> p_subtotal_minor_units - p_discount_minor_units THEN
+    RAISE EXCEPTION 'line prices and discount do not reconcile (lines %, subtotal % - discount %)',
+      v_net_sum, p_subtotal_minor_units, p_discount_minor_units
+      USING ERRCODE = '22023';
+  END IF;
 END;
 $fn$;
 
-REVOKE ALL ON FUNCTION public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ) TO service_role;
+REVOKE ALL ON FUNCTION public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ, TEXT) TO service_role;
 
 -- ---------------------------------------------------------------------------
 -- 5. RPC: record_refund — atomic refund (row lock + balance re-check).
@@ -635,10 +793,35 @@ BEGIN
 END;
 $fn$;
 
-DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
-CREATE TRIGGER on_auth_user_created
-  AFTER INSERT ON auth.users
-  FOR EACH ROW EXECUTE PROCEDURE public.handle_new_user();
+-- Installing the trigger is deliberately conservative: an existing
+-- AFTER INSERT trigger on auth.users may do more than create a profile (audit
+-- rows, tenant setup, welcome mail). Dropping it would silently delete that
+-- behaviour, so it is never dropped here. If one exists, this reports it and
+-- leaves you to decide.
+DO $auth_trigger$
+DECLARE
+  v_existing TEXT;
+BEGIN
+  SELECT t.tgname INTO v_existing
+    FROM pg_trigger t
+    JOIN pg_class c ON c.oid = t.tgrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 'auth' AND c.relname = 'users'
+     AND NOT t.tgisinternal
+     AND (t.tgtype & 4) = 4          -- AFTER
+     AND (t.tgtype & 16) = 16        -- INSERT
+   LIMIT 1;
+
+  IF v_existing IS NULL THEN
+    CREATE TRIGGER on_auth_user_created
+      AFTER INSERT ON auth.users
+      FOR EACH ROW EXECUTE PROCEDURE public.handle_new_user();
+    RAISE NOTICE 'created on_auth_user_created';
+  ELSE
+    RAISE NOTICE 'auth.users already has an AFTER INSERT trigger named %. Nothing was dropped or replaced - confirm it creates the profile row, or call public.handle_new_user() from it.', v_existing;
+  END IF;
+END
+$auth_trigger$;
 
 -- Backfill: every existing auth user must have a profile, or that customer
 -- cannot check out and cannot be recognised as an admin.
@@ -857,6 +1040,112 @@ GRANT SELECT ON public.orders, public.order_items TO authenticated;
 GRANT ALL ON public.orders, public.order_items, public.payments, public.refunds TO service_role;
 
 -- ---------------------------------------------------------------------------
+-- 9a. Catalog writes, webhook events, and review PII.
+--
+--    Catalog: the storefront reads products/variants/images/categories with the
+--    anon key (fine, they are public data), but WRITES must be admin-only. Any
+--    policy that lets anon/authenticated write these tables is dropped here and
+--    replaced by an admin-gated one, whatever it was called.
+--
+--    Webhook events: nothing in the browser has any business reading or writing
+--    the dedupe ledger. No policies at all for anon/authenticated.
+--
+--    Reviews: the row-level policy is public read, which would also publish
+--    `user_email`. Column privileges fix that without breaking the public feed.
+-- ---------------------------------------------------------------------------
+DO $catalog_policies_tighten$
+DECLARE
+  t   TEXT;
+  pol RECORD;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['products','product_variants','product_images','categories'] LOOP
+    CONTINUE WHEN to_regclass('public.' || t) IS NULL;
+
+    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
+
+    -- every write policy, by any name
+    FOR pol IN
+      SELECT policyname FROM pg_policies
+       WHERE schemaname='public' AND tablename=t AND cmd IN ('INSERT','UPDATE','DELETE','ALL')
+    LOOP
+      EXECUTE format('DROP POLICY %I ON public.%I', pol.policyname, t);
+    END LOOP;
+
+    -- permissive reads that are not ours
+    FOR pol IN
+      SELECT policyname FROM pg_policies
+       WHERE schemaname='public' AND tablename=t AND cmd='SELECT'
+         AND policyname NOT IN (
+           'Products public read','Variants public read','Images public read','Catalog public read')
+    LOOP
+      EXECUTE format('DROP POLICY %I ON public.%I', pol.policyname, t);
+    END LOOP;
+
+    EXECUTE format('REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON public.%I FROM anon, authenticated', t);
+    EXECUTE format('GRANT SELECT ON public.%I TO anon, authenticated', t);
+  END LOOP;
+
+  -- Public read + admin-only write, created once per table.
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='products' AND policyname='Products public read') THEN
+    CREATE POLICY "Products public read" ON public.products FOR SELECT USING (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='products' AND policyname='Products admin write') THEN
+    CREATE POLICY "Products admin write" ON public.products FOR ALL TO authenticated
+      USING ((SELECT public.is_admin())) WITH CHECK ((SELECT public.is_admin()));
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='product_variants' AND policyname='Variants public read') THEN
+    CREATE POLICY "Variants public read" ON public.product_variants FOR SELECT USING (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='product_variants' AND policyname='Variants admin write') THEN
+    CREATE POLICY "Variants admin write" ON public.product_variants FOR ALL TO authenticated
+      USING ((SELECT public.is_admin())) WITH CHECK ((SELECT public.is_admin()));
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='product_images' AND policyname='Images public read') THEN
+    CREATE POLICY "Images public read" ON public.product_images FOR SELECT USING (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='product_images' AND policyname='Images admin write') THEN
+    CREATE POLICY "Images admin write" ON public.product_images FOR ALL TO authenticated
+      USING ((SELECT public.is_admin())) WITH CHECK ((SELECT public.is_admin()));
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='categories' AND policyname='Catalog public read') THEN
+    CREATE POLICY "Catalog public read" ON public.categories FOR SELECT USING (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='categories' AND policyname='Catalog admin write') THEN
+    CREATE POLICY "Catalog admin write" ON public.categories FOR ALL TO authenticated
+      USING ((SELECT public.is_admin())) WITH CHECK ((SELECT public.is_admin()));
+  END IF;
+END
+$catalog_policies_tighten$;
+
+-- Webhook dedupe ledger: service role only. RLS on, no policies.
+DO $webhook_events$
+BEGIN
+  IF to_regclass('public.payment_webhook_events') IS NOT NULL THEN
+    ALTER TABLE public.payment_webhook_events ENABLE ROW LEVEL SECURITY;
+    REVOKE ALL ON public.payment_webhook_events FROM anon, authenticated;
+    GRANT ALL ON public.payment_webhook_events TO service_role;
+  END IF;
+END
+$webhook_events$;
+
+-- Reviews: publish the review, never the reviewer's email address.
+DO $reviews_pii$
+BEGIN
+  IF to_regclass('public.reviews') IS NOT NULL
+     AND EXISTS (SELECT 1 FROM information_schema.columns
+                  WHERE table_schema='public' AND table_name='reviews' AND column_name='user_email') THEN
+    REVOKE ALL ON public.reviews FROM anon, authenticated;
+    GRANT SELECT (id, product_id, user_name, rating, comment, verified_purchase, created_at)
+      ON public.reviews TO anon, authenticated;
+    RAISE NOTICE 'reviews: user_email is no longer selectable by anon/authenticated';
+  END IF;
+END
+$reviews_pii$;
+
+-- ---------------------------------------------------------------------------
 -- 9b. Storage: product photos.
 --
 --    AdminPortal uploads product images from the browser, so the bucket needs
@@ -948,11 +1237,16 @@ WITH checks(kind, name, ok) AS (
          EXISTS (SELECT 1 FROM information_schema.columns
                   WHERE table_schema='public' AND table_name='order_items' AND column_name='variant_id')
   UNION ALL
-  SELECT 'constraint', 'orders_status_valid',
-         EXISTS (SELECT 1 FROM pg_constraint WHERE conname='orders_status_valid')
+  SELECT 'enum', 'order_status has delivered',
+         EXISTS (SELECT 1 FROM pg_enum e JOIN pg_type t ON t.oid=e.enumtypid
+                  WHERE t.typname='order_status' AND e.enumlabel='delivered')
   UNION ALL
-  SELECT 'constraint', 'payments_status_valid',
-         EXISTS (SELECT 1 FROM pg_constraint WHERE conname='payments_status_valid')
+  SELECT 'index', 'idx_orders_guest_session_request_id',
+         EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_orders_guest_session_request_id')
+  UNION ALL
+  SELECT 'column', 'orders.guest_session_id',
+         EXISTS (SELECT 1 FROM information_schema.columns
+                  WHERE table_schema='public' AND table_name='orders' AND column_name='guest_session_id')
   UNION ALL
   SELECT 'table', 'reviews',
          EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='reviews')

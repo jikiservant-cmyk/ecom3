@@ -2,7 +2,7 @@ export type UserRole = 'customer' | 'admin' | 'staff';
 export type ProductStatus = 'draft' | 'active' | 'archived';
 export type VariantStatus = 'active' | 'draft' | 'out_of_stock';
 export type OrderStatus = 'pending' | 'processing' | 'shipped' | 'delivered' | 'cancelled';
-export type PaymentStatus = 'pending' | 'success' | 'failed' | 'refunded';
+export type PaymentStatus = 'pending' | 'paid' | 'failed' | 'refunded';
 
 export type Json =
   | string

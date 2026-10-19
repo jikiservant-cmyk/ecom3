@@ -29,13 +29,15 @@ export const PAYMENT_STATUS = {
 } as const;
 
 /**
- * `payments.status` is the LEDGER state of a single payment attempt, which is a
- * different vocabulary from the order's `payment_status`: a settlement is
- * `success`, not `paid`.
+ * `payments.status` is the LEDGER state of a single payment attempt. It is a
+ * POSTGRES ENUM on your database, and the label for a settled payment is
+ * `paid` — `success` does not exist in the type and writing it raises
+ * "invalid input value for enum". (An earlier version of this file assumed
+ * `success`; that would have rejected every settlement.)
  */
 export const PAYMENT_ROW_STATUS = {
   pending: 'pending',
-  success: 'success',
+  paid: 'paid',
   failed: 'failed',
   refunded: 'refunded',
 } as const;
@@ -62,12 +64,15 @@ export function normalisePaymentStatus(value: unknown): PaymentStatus {
 
 export function normalisePaymentRowStatus(value: unknown): PaymentRowStatus {
   const v = String(value ?? '').trim().toLowerCase();
+  // 'success' / 'succeeded' / 'completed' are legacy spellings of a settled
+  // payment. Read them as `paid`; never write them.
+  if (v === 'success' || v === 'succeeded' || v === 'completed') return PAYMENT_ROW_STATUS.paid;
   return (PAYMENT_ROW_VALUES.has(v) ? v : PAYMENT_ROW_STATUS.pending) as PaymentRowStatus;
 }
 
 /** Ledger status for a payment attempt, derived from the order's payment state. */
 export function paymentRowStatusFor(status: PaymentStatus): PaymentRowStatus {
-  if (status === PAYMENT_STATUS.paid) return PAYMENT_ROW_STATUS.success;
+  if (status === PAYMENT_STATUS.paid) return PAYMENT_ROW_STATUS.paid;
   if (status === PAYMENT_STATUS.refunded) return PAYMENT_ROW_STATUS.refunded;
   if (status === PAYMENT_STATUS.failed) return PAYMENT_ROW_STATUS.failed;
   return PAYMENT_ROW_STATUS.pending;

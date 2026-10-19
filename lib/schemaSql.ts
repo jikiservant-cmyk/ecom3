@@ -130,6 +130,9 @@ CREATE TABLE IF NOT EXISTS public.orders (
   pricing_snapshot JSONB,
   -- Idempotency key for checkout: a retried request returns the same order.
   client_request_id TEXT,
+  -- Guest idempotency scope: one id per browser, so a retried guest checkout is
+  -- recognised as the same attempt instead of creating a second order.
+  guest_session_id TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -141,6 +144,7 @@ ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS items JSONB DEFAULT '[]'::jso
 -- VERIFIED webhook says otherwise. It must exist on databases created before it
 -- (CREATE TABLE IF NOT EXISTS does not add columns to an existing table).
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'pending';
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS guest_session_id TEXT;
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS total_amount NUMERIC;
 ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS email TEXT;
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_note TEXT;
@@ -221,7 +225,7 @@ CREATE TABLE IF NOT EXISTS public.payments (
   order_id UUID REFERENCES public.orders(id) ON DELETE SET NULL,
   provider TEXT DEFAULT 'livepay',
   provider_reference TEXT,
-  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'success', 'failed', 'refunded')),
+  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'paid', 'failed', 'refunded')),
   -- What we ASKED the gateway to collect, expressed in the row currency
   -- (UGX for mobile money, USD cents for card collection).
   amount_minor_units BIGINT NOT NULL DEFAULT 0,
@@ -386,9 +390,16 @@ CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders (status);
 -- but the scoped lookup finds nothing). Guests are folded into one scope with
 -- COALESCE because NULLs are distinct in a unique index.
 DROP INDEX IF EXISTS public.idx_orders_client_request_id;
+-- Signed-in customers: their user id scopes the retry key.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_customer_request_id
-  ON public.orders (COALESCE(customer_id::text, 'guest'), client_request_id)
-  WHERE client_request_id IS NOT NULL;
+  ON public.orders (customer_id, client_request_id)
+  WHERE customer_id IS NOT NULL AND client_request_id IS NOT NULL;
+
+-- Guests: the browser session scopes it. A shared 'guest' scope would make one
+-- shopper's retry look like another shopper's duplicate.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_guest_session_request_id
+  ON public.orders (guest_session_id, client_request_id)
+  WHERE customer_id IS NULL AND guest_session_id IS NOT NULL AND client_request_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_refunds_order_id ON public.refunds (order_id);
 CREATE INDEX IF NOT EXISTS idx_payments_provider_transaction_id ON public.payments (provider_transaction_id);
 -- The webhook may receive the gateway's OWN reference for a card transaction
@@ -409,7 +420,12 @@ REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated;
 GRANT USAGE ON SCHEMA public TO anon, authenticated;
 
 GRANT SELECT ON public.categories, public.products, public.product_variants,
-  public.product_images, public.reviews, public.store_settings TO anon, authenticated;
+  public.product_images, public.store_settings TO anon, authenticated;
+
+-- Reviews are public, but the reviewer's email is not: grant the columns the
+-- public feed needs, not the row. (RLS still decides which rows are visible.)
+GRANT SELECT (id, product_id, user_name, rating, comment, verified_purchase, created_at)
+  ON public.reviews TO anon, authenticated;
 
 -- Checkout writes (RLS narrows these further)
 -- anon may NOT insert orders: order rows are written only by the server under
@@ -511,6 +527,8 @@ CREATE TRIGGER profiles_protect_role
 
 -- 20. Atomic order creation with stock decrement (used by the API server).
 -- Drop any older signature first so CREATE OR REPLACE can change the argument list.
+DROP FUNCTION IF EXISTS public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ, TEXT);
+DROP FUNCTION IF EXISTS public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ);
 DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, TIMESTAMPTZ);
 DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ);
 DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TIMESTAMPTZ);
@@ -530,32 +548,35 @@ CREATE OR REPLACE FUNCTION public.create_order_v2(
   p_pricing_snapshot JSONB,
   p_client_request_id TEXT,
   p_payment_method TEXT,
-  p_created_at TIMESTAMPTZ
+  p_created_at TIMESTAMPTZ,
+  p_guest_session_id TEXT
 )
 RETURNS VOID
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $$
+AS $fn$
 DECLARE
-  item RECORD;
-  v_product_id UUID;
-  v_variant_id UUID;
+  item            RECORD;
+  v_product_id    UUID;
+  v_variant_id    UUID;
+  v_catalog_price BIGINT;
+  v_net_price     BIGINT;
+  v_catalog_sum   BIGINT := 0;
+  v_net_sum       BIGINT := 0;
 BEGIN
-  -- SERVER-ONLY. This function is SECURITY DEFINER, so an EXECUTE grant to
-  -- anon/authenticated would let any visitor write an order with a
-  -- caller-chosen total (and decrement real stock). The guard is inside the
-  -- function so a future mis-grant cannot re-open the hole.
   IF COALESCE(auth.role(), '') <> 'service_role' THEN
     RAISE EXCEPTION 'create_order_v2 is server-only' USING ERRCODE = '42501';
   END IF;
 
-  -- Money invariants, enforced at the write as well as in the app.
   IF p_subtotal_minor_units % 100 <> 0
      OR p_discount_minor_units % 100 <> 0
      OR p_shipping_minor_units % 100 <> 0
      OR p_total_minor_units % 100 <> 0 THEN
     RAISE EXCEPTION 'order amounts must be whole shillings' USING ERRCODE = '22023';
+  END IF;
+  IF p_discount_minor_units < 0 OR p_shipping_minor_units < 0 THEN
+    RAISE EXCEPTION 'discount and shipping cannot be negative' USING ERRCODE = '22023';
   END IF;
   IF p_total_minor_units <> p_subtotal_minor_units - p_discount_minor_units + p_shipping_minor_units THEN
     RAISE EXCEPTION 'order totals do not add up' USING ERRCODE = '22023';
@@ -570,72 +591,108 @@ BEGIN
      AND COALESCE((p_pricing_snapshot->>'totalMinorUnits')::BIGINT, -1) <> p_total_minor_units THEN
     RAISE EXCEPTION 'pricing snapshot disagrees with the order total' USING ERRCODE = '22023';
   END IF;
+  IF p_items IS NULL OR jsonb_typeof(p_items) <> 'array' OR jsonb_array_length(p_items) = 0 THEN
+    RAISE EXCEPTION 'an order needs at least one line item' USING ERRCODE = '22023';
+  END IF;
 
   INSERT INTO public.orders (
-    id, order_number, client_request_id, customer_id, customer_name, customer_email, customer_phone,
+    id, order_number, client_request_id, guest_session_id, customer_id,
+    customer_name, customer_email, customer_phone,
     shipping_address, items, status, payment_status, payment_method, currency,
     subtotal_minor_units, discount_minor_units, shipping_minor_units, tax_minor_units,
     total_minor_units, total_amount, pricing_snapshot, refunded_minor_units, created_at, updated_at
   ) VALUES (
-    p_order_id, p_order_number, p_client_request_id, p_customer_id, p_customer_name, p_customer_email, p_customer_phone,
-    jsonb_build_object('address', COALESCE(p_shipping_address, '')), p_items, 'pending', 'pending',
-    CASE WHEN p_payment_method IN ('cod', 'card') THEN p_payment_method ELSE 'momo' END, 'UGX',
+    p_order_id, p_order_number, p_client_request_id, p_guest_session_id, p_customer_id,
+    p_customer_name, p_customer_email, p_customer_phone,
+    jsonb_build_object('address', COALESCE(p_shipping_address, '')),
+    p_items, 'pending', 'pending',
+    CASE WHEN p_payment_method IN ('cod','card') THEN p_payment_method ELSE 'momo' END,
+    'UGX',
     p_subtotal_minor_units, p_discount_minor_units, p_shipping_minor_units, 0,
     p_total_minor_units, p_total_minor_units / 100.0, p_pricing_snapshot, 0, p_created_at, p_created_at
   );
 
   FOR item IN
     SELECT * FROM jsonb_to_recordset(p_items)
-      AS x("productName" TEXT, "productId" TEXT, "variantId" TEXT, quantity INT, price NUMERIC, variant TEXT)
+      AS x("productName" TEXT, "productId" TEXT, "variantId" TEXT,
+           quantity INT, price NUMERIC, variant TEXT)
   LOOP
-    -- Resolve the product first: prefer the immutable id, fall back to name for
-    -- legacy callers.
-    v_product_id := CASE WHEN COALESCE(item."productId", '') ~ '^[0-9a-fA-F-]{36}$'
-                         THEN item."productId"::uuid ELSE NULL END;
-    IF v_product_id IS NOT NULL THEN
-      SELECT p.id INTO v_product_id FROM public.products p
-        WHERE p.id = v_product_id AND p.status = 'active' LIMIT 1;
+    IF item.quantity IS NULL OR item.quantity < 1 THEN
+      RAISE EXCEPTION 'invalid quantity for %', item."productName" USING ERRCODE = '22023';
     END IF;
+
+    -- ── The product must exist and be active. No name-based fallback: a name is
+    --    neither unique nor immutable, and falling back to it is how a cart gets
+    --    steered at a cheaper twin.
+    v_product_id := CASE
+      WHEN COALESCE(item."productId", '') ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+      THEN item."productId"::uuid ELSE NULL END;
+
     IF v_product_id IS NULL THEN
-      SELECT p.id INTO v_product_id FROM public.products p
-        WHERE p.name = item."productName" AND p.status = 'active' LIMIT 1;
+      RAISE EXCEPTION 'every line needs a valid product id (%)', item."productName" USING ERRCODE = '22023';
     END IF;
 
-    v_variant_id := NULL;
-    IF v_product_id IS NOT NULL THEN
-      -- The variant the customer actually chose wins; otherwise the first
-      -- active one. It must belong to this product, or the line is refused.
-      v_variant_id := CASE WHEN COALESCE(item."variantId", '') ~ '^[0-9a-fA-F-]{36}$'
-                           THEN item."variantId"::uuid ELSE NULL END;
-      IF v_variant_id IS NOT NULL THEN
-        PERFORM 1 FROM public.product_variants pv
-          WHERE pv.id = v_variant_id AND pv.product_id = v_product_id AND pv.status = 'active';
-        IF NOT FOUND THEN
-          RAISE EXCEPTION 'Selected option is not available for product: %', item."productName" USING ERRCODE = 'P0001';
-        END IF;
-      ELSE
-        SELECT pv.id INTO v_variant_id FROM public.product_variants pv
-          WHERE pv.product_id = v_product_id AND pv.status = 'active'
-          ORDER BY pv.position ASC LIMIT 1;
-      END IF;
+    SELECT p.id INTO v_product_id
+      FROM public.products p
+     WHERE p.id = v_product_id AND p.status = 'active';
+    IF v_product_id IS NULL THEN
+      RAISE EXCEPTION 'product is not available: %', item."productName" USING ERRCODE = '22023';
     END IF;
 
-    -- Stock is held against the VARIANT that was bought. The conditional
-    -- UPDATE is the concurrency guard: if another checkout took the last unit
-    -- between our read and this write, zero rows match and we abort the whole
-    -- order rather than overselling.
+    -- ── The variant must exist, be active, and belong to that product.
+    v_variant_id := CASE
+      WHEN COALESCE(item."variantId", '') ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+      THEN item."variantId"::uuid ELSE NULL END;
+
     IF v_variant_id IS NOT NULL THEN
-      UPDATE public.product_variants
-         SET inventory_quantity = inventory_quantity - item.quantity,
-             updated_at = NOW()
-       WHERE id = v_variant_id AND inventory_quantity >= item.quantity;
-      IF NOT FOUND THEN
-        RAISE EXCEPTION 'Insufficient stock for product: %', item."productName" USING ERRCODE = 'P0001';
+      SELECT pv.id, pv.price_minor_units INTO v_variant_id, v_catalog_price
+        FROM public.product_variants pv
+       WHERE pv.id = v_variant_id
+         AND pv.product_id = v_product_id
+         AND pv.status = 'active';
+      IF v_variant_id IS NULL THEN
+        RAISE EXCEPTION 'selected option is not available for %', item."productName" USING ERRCODE = '22023';
+      END IF;
+    ELSE
+      -- No option named: use the product's first active variant, deterministically.
+      SELECT pv.id, pv.price_minor_units INTO v_variant_id, v_catalog_price
+        FROM public.product_variants pv
+       WHERE pv.product_id = v_product_id AND pv.status = 'active'
+       ORDER BY pv.position ASC, pv.id ASC
+       LIMIT 1;
+      IF v_variant_id IS NULL THEN
+        RAISE EXCEPTION 'no active option for %', item."productName" USING ERRCODE = '22023';
       END IF;
     END IF;
 
-    -- The order line records exactly which variant was bought, so a later
-    -- price/stock lookup does not have to guess.
+    -- ── PRICE COMES FROM THE DATABASE, never from the request. The submitted
+    --    price is only allowed to be a DISCOUNT on the catalog price (that is
+    --    what promotions are); it may never exceed it.
+    v_catalog_price := COALESCE(v_catalog_price, 0);
+    IF v_catalog_price <= 0 THEN
+      RAISE EXCEPTION 'catalog price missing for %', item."productName" USING ERRCODE = '22023';
+    END IF;
+
+    v_net_price := ROUND(COALESCE(item.price, 0) * 100)::BIGINT;
+    IF v_net_price <= 0 OR v_net_price > v_catalog_price THEN
+      RAISE EXCEPTION 'line price for % must be between 1 and the catalog price', item."productName"
+        USING ERRCODE = '22023';
+    END IF;
+
+    v_catalog_sum := v_catalog_sum + v_catalog_price * item.quantity;
+    v_net_sum     := v_net_sum + v_net_price * item.quantity;
+
+    -- ── Stock is held against the VARIANT that was bought. The conditional
+    --    UPDATE is the concurrency guard: if another checkout took the last unit
+    --    between our read and this write, zero rows match and we abort.
+    UPDATE public.product_variants
+       SET inventory_quantity = inventory_quantity - item.quantity,
+           updated_at = NOW()
+     WHERE id = v_variant_id AND inventory_quantity >= item.quantity;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Insufficient stock for product: %', item."productName" USING ERRCODE = 'P0001';
+    END IF;
+
     INSERT INTO public.order_items (
       order_id, product_id, variant_id, product_name, product_slug, variant_sku, variant_attributes,
       unit_price_minor_units, quantity, line_total_minor_units, created_at
@@ -647,19 +704,30 @@ BEGIN
       regexp_replace(lower(item."productName"), '[^a-z0-9]+', '-', 'g'),
       COALESCE(item.variant, 'Standard'),
       jsonb_build_object('variant', COALESCE(item.variant, 'Standard')),
-      ROUND(COALESCE(item.price, 0) * 100)::BIGINT,
+      v_net_price,
       item.quantity,
-      ROUND(COALESCE(item.price, 0) * 100 * item.quantity)::BIGINT,
+      v_net_price * item.quantity,
       p_created_at
     );
   END LOOP;
+
+  -- ── Reconcile the totals against what the DATABASE just priced.
+  IF v_catalog_sum <> p_subtotal_minor_units THEN
+    RAISE EXCEPTION 'subtotal % does not match catalog prices %', p_subtotal_minor_units, v_catalog_sum
+      USING ERRCODE = '22023';
+  END IF;
+  IF v_net_sum <> p_subtotal_minor_units - p_discount_minor_units THEN
+    RAISE EXCEPTION 'line prices and discount do not reconcile (lines %, subtotal % - discount %)',
+      v_net_sum, p_subtotal_minor_units, p_discount_minor_units
+      USING ERRCODE = '22023';
+  END IF;
 END;
-$$;
+$fn$;
 
 -- EXECUTE is for the service role ONLY. Order rows are written by the API
 -- server, never by a browser holding a user JWT.
-REVOKE ALL ON FUNCTION public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ) TO service_role;
+REVOKE ALL ON FUNCTION public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, TIMESTAMPTZ, TEXT) TO service_role;
 
 -- 20a2. Atomic refund recording (server only).
 -- Two concurrent refunds (double click, two admin tabs, a retried request) must

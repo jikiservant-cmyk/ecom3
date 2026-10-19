@@ -201,6 +201,14 @@ export async function POST(req: NextRequest) {
       ? rawIdempotencyKey.trim()
       : null;
 
+  // Guest idempotency scope: one id per browser, generated client-side. Only the
+  // shape is validated here — it is a retry scope, not a credential.
+  const guestSessionHeader = req.headers.get('x-guest-session-id');
+  const guestSessionId =
+    typeof guestSessionHeader === 'string' && UUID_RE.test(guestSessionHeader.trim())
+      ? guestSessionHeader.trim()
+      : null;
+
   if (!customerName) return jsonError('A valid customer name is required', 400);
   if (!customerEmail) return jsonError('A valid customer email is required', 400);
   if (!shippingAddress) return jsonError('A shipping address is required', 400);
@@ -395,6 +403,8 @@ export async function POST(req: NextRequest) {
     shippingMinorUnits: pricing.shippingMinorUnits,
     pricingSnapshot: pricing,
     clientRequestId,
+    // Only meaningful for guests; a signed-in customer is scoped by their user id.
+    guestSessionId: auth?.userId ? null : guestSessionId,
   });
 
   if (!result.success) {
@@ -543,7 +553,7 @@ export async function PATCH(req: NextRequest) {
             order_id: orderId,
             provider: 'manual',
             provider_reference: `MANUAL-${existing.order_number || orderId}`,
-            status: PAYMENT_ROW_STATUS.success,
+            status: PAYMENT_ROW_STATUS.paid,
             amount_minor_units: amount,
             settled_amount_minor_units: amount,
             net_amount_minor_units: amount,

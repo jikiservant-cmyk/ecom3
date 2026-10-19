@@ -83,6 +83,36 @@ const PHOTOS = {
   mic: 'https://images.unsplash.com/photo-1516280440614-37939bbacd81?auto=format&fit=crop&w=700&q=85'
 };
 
+
+/**
+ * One id per browser, reused for every guest checkout from this device. It is
+ * only an idempotency scope: it stops a double-click or a retry from creating
+ * two orders and two Mobile Money prompts. Not an identity, no personal data.
+ *
+ * Called from the checkout handler (not during render) because it touches
+ * localStorage.
+ */
+function getGuestSessionId(): string {
+  if (typeof window === 'undefined') return '';
+  const KEY = 'drum-palace-guest-session';
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  let id = '';
+  try {
+    id = window.localStorage.getItem(KEY) || '';
+  } catch {
+    id = '';
+  }
+  if (UUID.test(id)) return id;
+  id = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : '';
+  if (!UUID.test(id)) return '';
+  try {
+    window.localStorage.setItem(KEY, id);
+  } catch {
+    // Storage disabled (private mode): the id lives for this checkout only.
+  }
+  return id;
+}
+
 const themeListeners = new Set<() => void>();
 const subscribeTheme = (callback: () => void) => {
   themeListeners.add(callback);
@@ -138,6 +168,8 @@ export default function DrumPalaceApp() {
   const [selectedImageIndex, setSelectedImageIndex] = useState<number>(0);
   const [detailQty, setDetailQty] = useState<number>(1);
   const [detailVariantId, setDetailVariantId] = useState<string>('');
+
+
   // LivePay documents two products: collect-money (MoMo prompt) and
   // card-collection (hosted USD checkout). Cash on Delivery is handled locally.
   const [paymentMethod, setPaymentMethod] = useState<'momo' | 'cod' | 'card'>('momo');
@@ -815,11 +847,14 @@ export default function DrumPalaceApp() {
             ? crypto.randomUUID()
             : `ck-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
       }
+      const guestSessionId = accessToken ? '' : getGuestSessionId();
       const orderRes = await fetch('/api/orders', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Idempotency-Key': checkoutAttemptRef.current,
+          // Guest-scoped retry key: same browser + same attempt = one order.
+          ...(guestSessionId ? { 'X-Guest-Session-Id': guestSessionId } : {}),
           ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
         },
         body: JSON.stringify({
