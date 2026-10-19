@@ -201,18 +201,52 @@ client_request_id,refunded_minor_units,payment_note,tracking_number}`,
 `payments.{settled_amount_minor_units,fee_minor_units,net_amount_minor_units,
 provider_transaction_id,settled_at}`, and `profiles.email`.
 
-### 6.2 Run these two files, in this order
+### 6.1b The database is now Partially Aligned
+
+The additive half of `lib/schemaSql.ts` has been applied. Present now: `orders.items`,
+`orders.payment_status`, `orders.total_amount`, `orders.payment_note`,
+`orders.refunded_minor_units`, `orders.pricing_snapshot`, `orders.client_request_id`,
+`orders.payment_method`, `orders.tracking_number`, `profiles.email`, `products.origin`,
+the five `payments` settlement columns, and a `refunds` table (RLS on, `anon`/
+`authenticated` revoked, `service_role` granted, `ON DELETE RESTRICT`).
+
+Deliberately **not** applied: the functions, triggers, policies, broad grants, and the
+tables whose definitions looked incomplete.
+
+Consequences while it stays that way:
+
+| Still missing | Runtime consequence |
+|---|---|
+| `orders.status` CHECK (legacy values) | **checkout insert may fail** — the app writes `Pending`/`Processing`/`Delivered` |
+| `payments.status` CHECK (legacy values) | settlement writes `success`, which the legacy check rejects |
+| `create_order_v2` | checkout uses the non-atomic fallback: **oversell possible** |
+| guest idempotency index | a retried guest checkout creates a **second order and a second money prompt** |
+| `record_refund` | refunds work via the optimistic fallback, but not in one transaction |
+| `payment_webhook_events` unique key | a redelivered webhook is processed twice |
+| triggers + `is_admin()` | nothing stops a direct PostgREST write from flipping `payment_status` |
+| `reviews`, `store_ratings`, `contact_messages` | those three features return 500 |
+
+`supabase/migrations/20261020_finish_alignment.sql` supplies **complete, reviewed**
+definitions for exactly these — that is the file that finishes the job.
+
+### 6.2 Run these files, in this order
 
 ```text
 1.  lib/schemaSql.ts                          (Admin Portal → Cloud Sync → Copy Complete SQL Schema)
       ↳ creates the missing tables, adds the missing columns, installs the RPCs,
         triggers, RLS policies and grants. Idempotent.
 
-2.  supabase/migrations/20261019_align_live_db.sql
-      ↳ backfills payment_status from the legacy status, rewrites status values to
-        the app's vocabulary, REPLACES the three CHECK constraints (schemaSql cannot
-        alter an existing table's constraint), de-duplicates webhook events and adds
-        their unique key, and drops stale RPC overloads.
+2.  supabase/migrations/20261020_finish_alignment.sql   ← run this next
+      ↳ complete definitions of everything the partial run skipped: the CHECK
+        constraint replacement, the guest-safe idempotency index, the webhook
+        unique key, `create_order_v2`, `record_refund`, `is_admin()`, all four
+        triggers, and `reviews` / `store_ratings` / `contact_messages` with
+        least-privilege policies. Ends with a checklist query.
+
+3.  supabase/migrations/20261019_align_live_db.sql      (optional)
+      ↳ only needed if you still hold rows whose `status` uses the legacy
+        vocabulary (`paid`, `completed`, `refunded`). It normalises those values.
+        Step 2 already replaced the constraints, so this can run before or after.
 ```
 
 Step 2 refuses to run (with a clear message) if step 1 has not been applied, and
@@ -235,7 +269,8 @@ every statement in it is guarded, so it is safe to re-run. **Take a backup first
 ### 6.3 Verify
 
 ```bash
-npm run schema:live     # code vs the reported live inventory (should print 0 broken)
+npm run schema:live       # code vs the reported live inventory (should print 0 broken)
+npm run schema:sql-lint   # every .sql and the embedded schema parses under libpg_query
 npm run schema:verify-sql
 ```
 

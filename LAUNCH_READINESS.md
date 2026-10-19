@@ -16,7 +16,7 @@ Rule of thumb: **do not open the store until sections 1–3 are all ticked.** Se
 
 | # | Item | Why it blocks | How to check |
 |---|---|---|---|
-| B1 | Apply `lib/schemaSql.ts` **then** `supabase/migrations/20261019_align_live_db.sql` | No RLS, no triggers, no `create_order_v2`, no `record_refund`, and the `orders_payment_method_valid` constraint does not exist, so **card orders fail at insert** | `tools/verify-db.sql` → every row `OK`, and the migration's `bad_rows` all 0 |
+| B1 | Apply `lib/schemaSql.ts` **then** `supabase/migrations/20261020_finish_alignment.sql` (the additive part is already applied; this supplies the functions, triggers, constraints and missing tables) | No RLS, no triggers, no `create_order_v2`, no `record_refund`, and the `orders_payment_method_valid` constraint does not exist, so **card orders fail at insert** | `tools/verify-db.sql` → every row `OK`, and the migration's `bad_rows` all 0 |
 | B2 | `SUPABASE_SERVICE_ROLE_KEY` set in the host | Checkout, webhook, refunds and admin all return 503 without it (fail-closed by design) | `GET /api/health` shows `serviceRoleConfigured: true` |
 | B3 | `LIVEPAY_API_KEY` + `LIVEPAY_MERCHANT_ID` | MoMo checkout cannot start | `/api/payments/livepay` → not 503 |
 | B4 | `LIVEPAY_WEBHOOK_SECRET` | The webhook rejects all traffic, so **no order ever becomes Paid** | A signed test delivery returns 200 |

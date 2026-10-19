@@ -13,7 +13,8 @@
     "pentest:money": "node tools/money-pentest.mjs",
     "schema:check": "node tools/schema-drift.mjs --strict",
     "schema:verify-sql": "node tools/schema-drift.mjs --emit-sql > tools/verify-db.sql",
-    "schema:live": "node tools/schema-drift.mjs --live --strict"
+    "schema:live": "node tools/schema-drift.mjs --live --strict",
+    "schema:sql-lint": "node tools/sql-lint.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.3",
@@ -36,6 +37,7 @@
     "@types/react-dom": "^19",
     "eslint": "9.39.1",
     "eslint-config-next": "^16.3.8",
+    "pgsql-parser": "^18.2.12",
     "tailwindcss": "4.1.11",
     "tw-animate-css": "^1.4.0",
     "typescript": "5.9.3",

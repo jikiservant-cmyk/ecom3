@@ -198,9 +198,12 @@ npm run schema:verify-sql   # regenerate tools/verify-db.sql
 `tools/verify-db.sql` is a runnable checklist for a LIVE database: paste it into the Supabase
 SQL editor and every expected column, function, index and constraint reports `OK` or `MISSING`.
 
-**Upgrading an existing database** (the live one is the older normalized design) takes two files,
-in order: `lib/schemaSql.ts`, then `supabase/migrations/20261019_align_live_db.sql` — the second
-converts legacy `orders.status` values and replaces CHECK constraints the first cannot alter.
+**Upgrading an existing database** (the live one is the older normalized design) takes:
+`lib/schemaSql.ts` (additive tables/columns/RPCs), then
+`supabase/migrations/20261020_finish_alignment.sql` (reviewed definitions of the constraints,
+triggers, functions and the three missing tables), and optionally
+`supabase/migrations/20261019_align_live_db.sql` if legacy `orders.status` rows need normalising.
+`npm run schema:sql-lint` parses every migration with libpg_query before you paste it anywhere.
 `npm run schema:live` diffs the code against the recorded live inventory. See
 `SCHEMA_ALIGNMENT.md` §6.
 
