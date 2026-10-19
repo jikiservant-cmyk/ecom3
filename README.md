@@ -120,7 +120,8 @@ price a customer sees is the price they are charged.
 ### Penetration test
 
 ```bash
-npm run pentest:money            # against BASE_URL (default http://localhost:3000)
+npm run pentest:money
+npm run pentest:auth            # against BASE_URL (default http://localhost:3000)
 LIVEPAY_WEBHOOK_SECRET=… BASE_URL=https://staging.example.com npm run pentest:money
 ```
 

@@ -112,6 +112,9 @@ gateway. These are the only checks that exercise the real thing.
       negative `payments` row + `refunded_minor_units` updated.
 - [ ] **Stock**: buy the last unit of something → the next checkout refuses.
 - [ ] **Tracking**: `?order=DP-XXXX-XXXX` shows status, no PII.
+- [ ] **Auth probes**: `npm run pentest:auth` against the production URL → every
+      probe passes. On a configured deployment this also proves two real accounts
+      get the same answer for "wrong password" and "no such account".
 
 If any of these fail, stop. Everything else in this repo depends on them working.
 
@@ -151,7 +154,7 @@ marked Paid**.
 
 Money handling is now in good shape: pricing is recomputed server-side, totals are
 reconciled against a verified webhook, refunds are atomic, the ledger records
-settlements rather than intents, and 269 tests plus 19 live probes cover the
+settlements rather than intents, and 283 tests plus 50 live probes cover the
 attack surface. But **none of it has ever run against your real database or your
 real LivePay account**, and the schema that makes it safe is still text in a
 file. Apply the schema, set the six environment variables, run one real payment

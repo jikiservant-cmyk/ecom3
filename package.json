@@ -14,7 +14,8 @@
     "schema:check": "node tools/schema-drift.mjs --strict",
     "schema:verify-sql": "node tools/schema-drift.mjs --emit-sql > tools/verify-db.sql",
     "schema:live": "node tools/schema-drift.mjs --live --strict",
-    "schema:sql-lint": "node tools/sql-lint.mjs"
+    "schema:sql-lint": "node tools/sql-lint.mjs",
+    "pentest:auth": "node tools/auth-pentest.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.3",
