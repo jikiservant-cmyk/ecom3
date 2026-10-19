@@ -12,6 +12,32 @@ Rule of thumb: **do not open the store until sections 1–3 are all ticked.** Se
 
 ---
 
+## 0. Launching tomorrow? Run this list, in this order
+
+Roughly four focused hours, and the order matters — several steps check the one
+before it.
+
+| # | Step | Time | Done when |
+|---|---|---|---|
+| 1 | Supabase backup, then confirm you can see it restorable | 15 min | Backup listed with today's timestamp |
+| 2 | `lib/schemaSql.ts` → then `supabase/migrations/20261020_finish_alignment.sql` (B1). Run **sections 0–8 and 10–11**, stop before section 9 | 45 min | Migration's checklist all `OK`, `bad_rows` 0 |
+| 3 | Set the env vars on the host: `SUPABASE_SERVICE_ROLE_KEY`, `LIVEPAY_API_KEY`, `LIVEPAY_MERCHANT_ID`, `LIVEPAY_WEBHOOK_SECRET`, `APP_URL`, `TRUSTED_PROXY_HOPS` | 30 min | `/api/health` → 200 with `serviceRoleConfigured: true` |
+| 4 | Deploy the app (B1a) | 30 min | Storefront loads; admin can sign in |
+| 5 | Run migration **section 9** (tighten policies) | 5 min | Admin status button still works — proves the new `PATCH /api/orders` path |
+| 6 | Seed the catalog, all products `active` (B8) | 30 min | Products appear with prices |
+| 7 | Register the webhook URL in the LivePay dashboard (B6) | 10 min | Dashboard shows `https://<domain>/api/payments/livepay/webhook` |
+| 8 | Real-money smoke test, section 2: one MoMo order, one decline, one refund, one stock exhaustion | 45 min | Each behaves as listed |
+| 9 | Uptime check on `/api/health` + alert to your phone (M1) | 20 min | Kill the DB URL in a preview env → you get an alert |
+
+**If you cannot finish the webhook steps (7–8), launch Cash on Delivery only.**
+COD needs no gateway, no webhook and no secret: the order is written `pending`,
+the customer pays on delivery, and you mark it `paid` from the admin portal
+(audited, ledger row created). That is a genuinely safe store for tomorrow. Turn
+Mobile Money on the day the signed webhook test passes — a half-configured
+gateway is worse than none, because the customer pays and nothing turns green.
+
+---
+
 ## 1. Blocking — the store cannot take a real payment without these
 
 | # | Item | Why it blocks | How to check |
@@ -91,10 +117,10 @@ marked Paid**.
 
 Money handling is now in good shape: pricing is recomputed server-side, totals are
 reconciled against a verified webhook, refunds are atomic, the ledger records
-settlements rather than intents, and 227 tests plus 21 live probes cover the
+settlements rather than intents, and 245 tests plus 19 live probes cover the
 attack surface. But **none of it has ever run against your real database or your
 real LivePay account**, and the schema that makes it safe is still text in a
 file. Apply the schema, set the six environment variables, run one real payment
-per method, and put an uptime check on `/api/health` — that is roughly half a day
-of work. Do that and yes, it is fit to take customers. Skip it and the most likely
+per method, and put an uptime check on `/api/health` — section 0 above is that
+work, itemised, roughly half a day. Do that and yes, it is fit to take customers. Skip it and the most likely
 day-one failure is silent: customers pay, and the orders never turn Paid.
