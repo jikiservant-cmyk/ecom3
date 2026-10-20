@@ -16,7 +16,7 @@ E-commerce storefront for musical instruments & pro audio (Uganda, UGX), built w
 
 ```bash
 npm install
-cp .env.example .env.local   # then fill in real values
+cp .env.example (every variable explained in `ENVIRONMENT.md`) .env.local   # then fill in real values
 npm run dev                  # http://localhost:3000
 ```
 
