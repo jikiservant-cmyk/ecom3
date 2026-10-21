@@ -16,6 +16,9 @@ export const viewport: Viewport = {
 export const metadata: Metadata = {
   title: 'Drum Palace — Premium Instruments & Pro Audio',
   description: 'Premium Instruments & Pro Audio Gear. For Stage. For Studio. For You.',
+  verification: {
+    google: 'IGqQuvYC8F7-jHZ1CqugFjPf4nxtGXcMHRfq2tPp1yk',
+  },
   openGraph: {
     title: 'Drum Palace — Premium Instruments & Pro Audio',
     description: 'Premium Instruments & Pro Audio Gear. For Stage. For Studio. For You.',
