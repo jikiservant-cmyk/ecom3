@@ -13,9 +13,12 @@ export async function GET() {
   const checks: Record<string, unknown> = {
     supabaseConfigured: isServerSupabaseConfigured,
     serviceRoleConfigured: hasServiceRoleKey,
+    orderWriteReady: isServerSupabaseConfigured && hasServiceRoleKey,
   };
 
-  let healthy = true;
+  // Checkout order writes require the service-role key. Don't report a healthy
+  // deployment when the catalog is readable but every order write must fail.
+  let healthy = isServerSupabaseConfigured && hasServiceRoleKey;
   if (isServerSupabaseConfigured) {
     try {
       const client = getServerAnonClient();

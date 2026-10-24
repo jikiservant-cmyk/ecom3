@@ -44,7 +44,11 @@ Required environment variables (see `.env.example` for details):
    - **least-privilege RLS** (owner/admin scoping; `payments` and
      `payment_webhook_events` are service-role only),
    - `is_admin()` helper, role-column protection trigger,
-   - `create_order_v2()` atomic order+items+stock-decrement function.
+   - `create_order_v2()` atomic order+items+stock-decrement function (including the selected payment method).
+
+   For an existing production database, apply the updated SQL in Supabase before
+   or alongside the app deployment so the RPC signature matches and
+   `payment_method` is stored correctly.
 4. Create your admin user via normal signup, then **manually** set
    `UPDATE public.profiles SET role='admin' WHERE email='you@store.ug';`
    (signup can never self-assign admin).
