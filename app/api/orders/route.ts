@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { authenticateAdmin, authenticateRequest, getServerAdminClient, getServerAnonClient, isServerSupabaseConfigured } from '@/lib/server/supabaseServer';
+import { authenticateAdmin, authenticateRequest, getServerAdminClient, isServerSupabaseConfigured } from '@/lib/server/supabaseServer';
 import { createOrderServer, computeOrderTotals, totalsMatch } from '@/lib/server/orders';
 import { logger, newRequestId } from '@/lib/server/logging';
 import { readJsonBody, isNonEmptyString, isEmail, isFiniteNumber, isIntInRange, sanitizeText, jsonError } from '@/lib/server/validation';
@@ -109,6 +109,14 @@ export async function POST(req: NextRequest) {
   const body = await readJsonBody(req);
   if (!body) return jsonError('Invalid JSON body', 400);
 
+  if (!isServerSupabaseConfigured) return jsonError('Checkout is not configured', 503);
+  if (!getServerAdminClient()) {
+    logger.error('order_create_no_service_role', {
+      hint: 'Set SUPABASE_SERVICE_ROLE_KEY — order creation is refused without it',
+    });
+    return jsonError('Checkout is temporarily unavailable. Please try again later.', 503);
+  }
+
   const auth = await authenticateRequest(req); // optional: attaches customer id when signed in
 
   const customerName = isNonEmptyString(body.customerName, 200) ? sanitizeText(body.customerName, 200) : null;
@@ -150,8 +158,7 @@ export async function POST(req: NextRequest) {
 
   // SECURITY: re-price every line from the product catalog in the database.
   // Prices submitted by the client are ignored entirely.
-  if (!isServerSupabaseConfigured) return jsonError('Checkout is not configured', 503);
-  const catalogClient = getServerAdminClient() || getServerAnonClient();
+  const catalogClient = getServerAdminClient()!;
   const uniqueIds = [...new Set(items.map((it) => it.productId).filter((v): v is string => Boolean(v)))];
   const uniqueNames = [...new Set(items.map((it) => it.productName))];
 

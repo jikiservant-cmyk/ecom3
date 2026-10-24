@@ -44,7 +44,11 @@ Required environment variables (see `.env.example` for details):
    - **least-privilege RLS** (owner/admin scoping; `payments` and
      `payment_webhook_events` are service-role only),
    - `is_admin()` helper, role-column protection trigger,
-   - `create_order_v2()` atomic order+items+stock-decrement function.
+   - `create_order_v2()` atomic order+items+stock-decrement function (including the selected payment method).
+
+   For an existing production database, apply the updated SQL in Supabase before
+   or alongside the app deployment so the RPC signature matches and
+   `payment_method` is stored correctly.
 4. Create your admin user via normal signup, then **manually** set
    `UPDATE public.profiles SET role='admin' WHERE email='you@store.ug';`
    (signup can never self-assign admin).
@@ -187,8 +191,9 @@ silently forgotten.
   `order_items_require_pending_order` triggers exist only as text until run.
   Until they are applied, an anonymous PostgREST client can still insert an
   order marked `Paid`. The same script also revokes anon `INSERT` on
-  `orders`/`order_items` and anon `EXECUTE` on `create_order_v2`, which is what
-  closes the forged-order-total hole at the database level.
+  `orders`/`order_items` and direct `EXECUTE` on `create_order_v2` from
+  `PUBLIC`/`anon`/`authenticated`, keeping the price-sensitive RPC server-only
+  for `service_role` and closing the forged-order-total hole.
 - **Set `SUPABASE_SERVICE_ROLE_KEY`.** Order creation now refuses to run without
   it (the anon fallback was the forge path). Payments, the webhook and the admin
   portal already required it.

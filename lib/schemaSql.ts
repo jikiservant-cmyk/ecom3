@@ -381,8 +381,10 @@ CREATE TRIGGER profiles_protect_role
   FOR EACH ROW EXECUTE PROCEDURE public.protect_profile_role();
 
 -- 20. Atomic order creation with stock decrement (used by the API server).
--- Drop any older signature first so CREATE OR REPLACE can change the argument list.
+-- Drop older signatures first so CREATE OR REPLACE can change the argument list.
 DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, TIMESTAMPTZ);
+DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ);
+DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ);
 CREATE OR REPLACE FUNCTION public.create_order_v2(
   p_order_id TEXT,
   p_order_number TEXT,
@@ -391,6 +393,7 @@ CREATE OR REPLACE FUNCTION public.create_order_v2(
   p_customer_email TEXT,
   p_customer_phone TEXT,
   p_shipping_address TEXT,
+  p_payment_method TEXT,
   p_items JSONB,
   p_subtotal_minor_units BIGINT,
   p_shipping_minor_units BIGINT,
@@ -409,12 +412,13 @@ DECLARE
 BEGIN
   INSERT INTO public.orders (
     id, order_number, customer_id, customer_name, customer_email, customer_phone,
-    shipping_address, items, status, payment_status, currency,
+    shipping_address, items, status, payment_status, payment_method, currency,
     subtotal_minor_units, discount_minor_units, shipping_minor_units, tax_minor_units,
     total_minor_units, total_amount, created_at, updated_at
   ) VALUES (
     p_order_id, p_order_number, p_customer_id, p_customer_name, p_customer_email, p_customer_phone,
-    jsonb_build_object('address', COALESCE(p_shipping_address, '')), p_items, 'Pending', 'Pending', 'UGX',
+    jsonb_build_object('address', COALESCE(p_shipping_address, '')), p_items, 'Pending', 'Pending',
+    CASE WHEN lower(COALESCE(p_payment_method, 'momo')) = 'cod' THEN 'cod' ELSE 'momo' END, 'UGX',
     p_subtotal_minor_units, 0, p_shipping_minor_units, 0,
     p_total_minor_units, ROUND(p_total_minor_units / 100.0, 2), p_created_at, p_created_at
   );
@@ -456,9 +460,9 @@ BEGIN
 END;
 $$;
 
--- Revoked from anon: calling the RPC directly writes orders with caller-chosen
--- totals, bypassing the catalog re-pricing in app/api/orders/route.ts.
-GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) TO authenticated;
+-- Server-only: direct client calls could bypass the API's catalog re-pricing.
+REVOKE ALL ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) TO service_role;
 
 -- 20b. CRITICAL — order state may never be supplied by a client.
 -- public.orders is INSERTable by anon/authenticated (guest checkout) and

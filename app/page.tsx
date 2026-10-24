@@ -17,6 +17,8 @@ import {
 import { 
   getProductsFromDb, 
   getCategoriesFromDb,
+  DbCategory,
+  slugifyCategoryName,
   saveContactMessageToDb, 
   syncCartWithDb
 } from '@/lib/supabaseDb';
@@ -76,6 +78,44 @@ const PHOTOS = {
   speakers: 'https://images.unsplash.com/photo-1545454675-3531b543be5d?auto=format&fit=crop&w=700&q=85',
   mixers: 'https://images.unsplash.com/photo-1516280440614-37939bbacd81?auto=format&fit=crop&w=700&q=85',
   mic: 'https://images.unsplash.com/photo-1516280440614-37939bbacd81?auto=format&fit=crop&w=700&q=85'
+};
+
+const categoryImageFor = (name: string) => {
+  const category = name.toLowerCase();
+  if (category.includes('drum')) return PHOTOS.drums;
+  if (category.includes('guitar') || category.includes('bass')) return PHOTOS.guitars;
+  if (category.includes('key') || category.includes('piano') || category.includes('synth')) return PHOTOS.keyboards;
+  if (category.includes('light')) return PHOTOS.lighting;
+  if (category.includes('speak') || category.includes('pa')) return PHOTOS.speakers;
+  if (category.includes('mix') || category.includes('audio') || category.includes('mic')) return PHOTOS.mixers;
+  return PHOTOS.drums;
+};
+
+const mapDbCategories = (dbCategories: DbCategory[]): CategoryInfo[] => dbCategories.map((category) => ({
+  id: category.slug || category.id || slugifyCategoryName(category.name),
+  name: category.name,
+  sub: category.description || `${category.name} Gear`,
+  image: category.image || categoryImageFor(category.name),
+}));
+
+const mapDbProducts = (dbProducts: ProductItem[], dbCategories: DbCategory[]): Product[] => {
+  const categorySlugsByName = new Map(
+    dbCategories.map((category) => [category.name.trim().toLowerCase(), category.slug || slugifyCategoryName(category.name)])
+  );
+
+  return dbProducts.map((product) => {
+    const categoryName = (product.category || '').trim();
+    const categorySlug = categorySlugsByName.get(categoryName.toLowerCase()) || slugifyCategoryName(categoryName) || 'other';
+    return {
+      id: product.id,
+      name: product.name,
+      cat: categorySlug,
+      price: product.price,
+      desc: product.description || product.subtitle || '',
+      image: product.image || PHOTOS.drums,
+      images: product.images,
+    };
+  });
 };
 
 const themeListeners = new Set<() => void>();
@@ -173,49 +213,10 @@ export default function DrumPalaceApp() {
         getCategoriesFromDb(),
       ]);
 
-      if (dbCategories && dbCategories.length > 0) {
-        setCategories(
-          dbCategories.map((c) => {
-            const slug = (c.slug || c.name || '').toLowerCase();
-            let img = PHOTOS.drums;
-            if (slug.includes('drum')) img = PHOTOS.drums;
-            else if (slug.includes('guitar') || slug.includes('bass')) img = PHOTOS.guitars;
-            else if (slug.includes('key') || slug.includes('piano') || slug.includes('synth')) img = PHOTOS.keyboards;
-            else if (slug.includes('light')) img = PHOTOS.lighting;
-            else if (slug.includes('speak') || slug.includes('pa')) img = PHOTOS.speakers;
-            else if (slug.includes('mix') || slug.includes('audio') || slug.includes('mic')) img = PHOTOS.mixers;
-
-            return {
-              id: c.slug || c.id,
-              name: c.name,
-              sub: c.description || `${c.name} Gear`,
-              image: c.image || img,
-            };
-          })
-        );
-      }
+      setCategories(mapDbCategories(dbCategories));
 
       if (dbProducts && dbProducts.length > 0) {
-        const mapped: Product[] = dbProducts.map((p) => {
-          let catKey = 'mixers';
-          const c = (p.category || '').toLowerCase();
-          if (c.includes('drum')) catKey = 'drums';
-          else if (c.includes('guitar') || c.includes('bass')) catKey = 'guitars';
-          else if (c.includes('key') || c.includes('piano') || c.includes('synth')) catKey = 'keyboards';
-          else if (c.includes('light')) catKey = 'lighting';
-          else if (c.includes('speak') || c.includes('pa')) catKey = 'speakers';
-          else if (c.includes('mix') || c.includes('audio') || c.includes('mic')) catKey = 'mixers';
-
-          return {
-            id: p.id,
-            name: p.name,
-            cat: catKey,
-            price: p.price,
-            desc: p.description || p.subtitle || '',
-            image: p.image || PHOTOS.drums,
-            images: p.images,
-          };
-        });
+        const mapped = mapDbProducts(dbProducts, dbCategories);
         setProducts(mapped);
         setActiveProductId((prev) => (mapped.some((x) => x.id === prev) ? prev : mapped[0]?.id || ''));
       } else {
@@ -249,49 +250,10 @@ export default function DrumPalaceApp() {
       .then(([dbProducts, dbCategories]) => {
         if (!isMounted) return;
 
-        if (dbCategories && dbCategories.length > 0) {
-          setCategories(
-            dbCategories.map((c) => {
-              const slug = (c.slug || c.name || '').toLowerCase();
-              let img = PHOTOS.drums;
-              if (slug.includes('drum')) img = PHOTOS.drums;
-              else if (slug.includes('guitar') || slug.includes('bass')) img = PHOTOS.guitars;
-              else if (slug.includes('key') || slug.includes('piano') || slug.includes('synth')) img = PHOTOS.keyboards;
-              else if (slug.includes('light')) img = PHOTOS.lighting;
-              else if (slug.includes('speak') || slug.includes('pa')) img = PHOTOS.speakers;
-              else if (slug.includes('mix') || slug.includes('audio') || slug.includes('mic')) img = PHOTOS.mixers;
-
-              return {
-                id: c.slug || c.id,
-                name: c.name,
-                sub: c.description || `${c.name} Gear`,
-                image: c.image || img,
-              };
-            })
-          );
-        }
+        setCategories(mapDbCategories(dbCategories));
 
         if (dbProducts && dbProducts.length > 0) {
-          const mapped: Product[] = dbProducts.map((p) => {
-            let catKey = 'mixers';
-            const c = (p.category || '').toLowerCase();
-            if (c.includes('drum')) catKey = 'drums';
-            else if (c.includes('guitar') || c.includes('bass')) catKey = 'guitars';
-            else if (c.includes('key') || c.includes('piano') || c.includes('synth')) catKey = 'keyboards';
-            else if (c.includes('light')) catKey = 'lighting';
-            else if (c.includes('speak') || c.includes('pa')) catKey = 'speakers';
-            else if (c.includes('mix') || c.includes('audio') || c.includes('mic')) catKey = 'mixers';
-
-            return {
-              id: p.id,
-              name: p.name,
-              cat: catKey,
-              price: p.price,
-              desc: p.description || p.subtitle || '',
-              image: p.image || PHOTOS.drums,
-              images: p.images,
-            };
-          });
+          const mapped = mapDbProducts(dbProducts, dbCategories);
           setProducts(mapped);
           setActiveProductId((prev) => (mapped.some((x) => x.id === prev) ? prev : mapped[0]?.id || ''));
         } else {
@@ -789,6 +751,7 @@ export default function DrumPalaceApp() {
           currentUser={currentUser}
           onClose={() => setShowAdminPortal(false)}
           onProductsUpdated={() => loadDbProducts()}
+          onCategoriesUpdated={() => loadDbProducts()}
           onAdminAuthenticated={(admin) => {
             setCurrentUser(admin as any);
           }}

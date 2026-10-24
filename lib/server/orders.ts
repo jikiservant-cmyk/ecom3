@@ -284,6 +284,7 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       p_customer_email: input.customerEmail,
       p_customer_phone: input.customerPhone || null,
       p_shipping_address: input.shippingAddress || '',
+      p_payment_method: input.paymentMethod === 'cod' ? 'cod' : 'momo',
       p_items: input.items.map((it) => ({
         productName: it.productName,
         quantity: it.quantity,

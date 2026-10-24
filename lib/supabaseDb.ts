@@ -50,6 +50,16 @@ export interface DbCategory {
   image?: string;
 }
 
+export function slugifyCategoryName(name: string): string {
+  return name
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 80);
+}
+
 export interface DbReview {
   id: string;
   productId: string;
@@ -358,30 +368,51 @@ export async function getProductByIdFromDb(productId: string): Promise<ProductIt
 /**
  * Fetch dynamic categories directly from Supabase categories table
  */
-export async function getCategoriesFromDb(): Promise<DbCategory[]> {
-  const defaultCategories: DbCategory[] = [
-    { id: 'cat-drums', name: 'Drums', slug: 'drums', description: 'Acoustic & Electronic drum sets, snares, and cymbals' },
-    { id: 'cat-guitars', name: 'Guitars', slug: 'guitars', description: 'Electric, acoustic, and bass guitars with custom amps' },
-    { id: 'cat-keyboards', name: 'Keyboards', slug: 'keyboards', description: 'Digital pianos, workstations, and analog synthesizers' },
-    { id: 'cat-mixers', name: 'Mixers & Audio', slug: 'mixers', description: 'Stage mixers, USB audio interfaces, and vocal microphones' },
-    { id: 'cat-speakers', name: 'Speakers', slug: 'speakers', description: 'PA speaker systems, active stage monitors, and stands' },
-    { id: 'cat-lighting', name: 'Stage Lighting', slug: 'lighting', description: 'LED pars, moving heads, DMX controllers, and lasers' },
-  ];
+const DEFAULT_CATEGORIES: DbCategory[] = [
+  { id: 'cat-drums', name: 'Drums', slug: 'drums', description: 'Acoustic & Electronic drum sets, snares, and cymbals' },
+  { id: 'cat-guitars', name: 'Guitars', slug: 'guitars', description: 'Electric, acoustic, and bass guitars with custom amps' },
+  { id: 'cat-keyboards', name: 'Keyboards', slug: 'keyboards', description: 'Digital pianos, workstations, and analog synthesizers' },
+  { id: 'cat-mixers', name: 'Mixers & Audio', slug: 'mixers', description: 'Stage mixers, USB audio interfaces, and vocal microphones' },
+  { id: 'cat-speakers', name: 'Speakers', slug: 'speakers', description: 'PA speaker systems, active stage monitors, and stands' },
+  { id: 'cat-lighting', name: 'Stage Lighting', slug: 'lighting', description: 'LED pars, moving heads, DMX controllers, and lasers' },
+];
 
+/** Return only categories actually stored in Supabase (no storefront fallbacks). */
+export async function getStoredCategoriesFromDb(): Promise<DbCategory[]> {
   try {
     const { data, error } = await (supabase.from('categories') as any)
       .select('*')
       .order('name', { ascending: true });
 
-    if (!error && data && data.length > 0) {
-      return data;
+    if (error) {
+      console.warn('Stored categories database query notice:', error.message);
+      return [];
     }
 
-    return defaultCategories;
+    return Array.isArray(data) ? data : [];
   } catch (err) {
-    console.warn('Categories database query notice:', err);
-    return defaultCategories;
+    console.warn('Stored categories database query notice:', err);
+    return [];
   }
+}
+
+/** Fetch database categories, using the built-in starter set only when none exist. */
+export async function getCategoriesFromDb(): Promise<DbCategory[]> {
+  const storedCategories = await getStoredCategoriesFromDb();
+  if (storedCategories.length === 0) return DEFAULT_CATEGORIES;
+
+  const storedByName = new Map(
+    storedCategories.map((category) => [category.name.trim().toLowerCase(), category])
+  );
+  const defaultNames = new Set(DEFAULT_CATEGORIES.map((category) => category.name.toLowerCase()));
+  const merged = DEFAULT_CATEGORIES.map((category) =>
+    storedByName.get(category.name.toLowerCase()) || category
+  );
+  storedCategories.forEach((category) => {
+    if (!defaultNames.has(category.name.trim().toLowerCase())) merged.push(category);
+  });
+
+  return merged.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /**
@@ -402,16 +433,25 @@ export async function saveProductToDb(product: ProductItem): Promise<{ success: 
     // 1. Ensure category exists in categories table in DB
     let categoryId: string | null = null;
     if (product.category) {
-      const catSlug = product.category.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      const catSlug = slugifyCategoryName(product.category);
       try {
-        const { data: existingCat } = await (supabase.from('categories') as any)
+        const { data: existingByName } = await (supabase.from('categories') as any)
           .select('id')
-          .eq('slug', catSlug)
+          .eq('name', product.category)
           .maybeSingle();
+        let existingCategory = existingByName;
 
-        if (existingCat?.id) {
-          categoryId = existingCat.id;
-        } else {
+        if (!existingCategory?.id && catSlug) {
+          const { data: existingBySlug } = await (supabase.from('categories') as any)
+            .select('id')
+            .eq('slug', catSlug)
+            .maybeSingle();
+          existingCategory = existingBySlug;
+        }
+
+        if (existingCategory?.id) {
+          categoryId = existingCategory.id;
+        } else if (catSlug) {
           const { data: newCat } = await (supabase.from('categories') as any)
             .insert({
               name: product.category,
