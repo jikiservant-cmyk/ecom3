@@ -460,9 +460,9 @@ BEGIN
 END;
 $$;
 
--- Revoked from anon: calling the RPC directly writes orders with caller-chosen
--- totals, bypassing the catalog re-pricing in app/api/orders/route.ts.
-GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) TO authenticated;
+-- Server-only: direct client calls could bypass the API's catalog re-pricing.
+REVOKE ALL ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) TO service_role;
 
 -- 20b. CRITICAL — order state may never be supplied by a client.
 -- public.orders is INSERTable by anon/authenticated (guest checkout) and

@@ -191,8 +191,9 @@ silently forgotten.
   `order_items_require_pending_order` triggers exist only as text until run.
   Until they are applied, an anonymous PostgREST client can still insert an
   order marked `Paid`. The same script also revokes anon `INSERT` on
-  `orders`/`order_items` and anon `EXECUTE` on `create_order_v2`, which is what
-  closes the forged-order-total hole at the database level.
+  `orders`/`order_items` and direct `EXECUTE` on `create_order_v2` from
+  `PUBLIC`/`anon`/`authenticated`, keeping the price-sensitive RPC server-only
+  for `service_role` and closing the forged-order-total hole.
 - **Set `SUPABASE_SERVICE_ROLE_KEY`.** Order creation now refuses to run without
   it (the anon fallback was the forge path). Payments, the webhook and the admin
   portal already required it.
