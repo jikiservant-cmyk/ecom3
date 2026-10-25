@@ -136,7 +136,7 @@ export function FAQsView({ onBack }: { onBack: () => void }) {
   const faqs = [
     {
       q: "Where is Drum Palace located in Uganda?",
-      a: "Our main showroom and central distribution warehouse is located in Namungoona, Kampala, Uganda. We welcome in-person sound testing and gear auditions Monday through Saturday from 8:30 AM to 6:30 PM."
+      a: "Our main showroom is located in Namungoona-Kuluyinja, Kampala, Uganda. Contact us for directions and showroom hours before visiting."
     },
     {
       q: "How fast is delivery within Kampala and upcountry Uganda?",
@@ -283,7 +283,34 @@ export function ShippingReturnsView({ onBack }: { onBack: () => void }) {
 // =========================================================
 // 4. ABOUT US VIEW
 // =========================================================
-export function AboutUsView({ onBack, onNavigate }: { onBack: () => void; onNavigate: (route: string) => void }) {
+interface AboutUsViewProps {
+  onBack: () => void;
+  onNavigate: (route: string) => void;
+  contactPhone?: string;
+  contactWhatsapp?: string;
+  contactEmail?: string;
+  contactAddress?: string;
+}
+
+export function AboutUsView({
+  onBack,
+  onNavigate,
+  contactPhone = '+256767733061',
+  contactWhatsapp,
+  contactEmail = 'digifted464@gmail.com',
+  contactAddress = 'Namungoona-Kuluyinja, Kampala - Uganda',
+}: AboutUsViewProps) {
+  const whatsapp = contactWhatsapp || contactPhone;
+  const whatsappDigits = whatsapp.replace(/\D/g, '');
+  const whatsappInternational = whatsappDigits
+    ? whatsappDigits.startsWith('256')
+      ? whatsappDigits
+      : whatsappDigits.startsWith('0')
+        ? `256${whatsappDigits.slice(1)}`
+        : `256${whatsappDigits}`
+    : '256767733061';
+  const whatsappHref = `https://wa.me/${whatsappInternational}`;
+
   return (
     <div className="min-h-screen bg-[#f8fafb] dark:bg-slate-950 text-slate-900 dark:text-slate-100 pb-20 animate-in fade-in duration-200">
       <header className="sticky top-0 z-30 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-b border-slate-200/80 dark:border-slate-800 px-4 h-16 flex items-center justify-between">
@@ -323,13 +350,19 @@ export function AboutUsView({ onBack, onNavigate }: { onBack: () => void; onNavi
         <div className="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-slate-200/80 dark:border-slate-800 shadow-xs space-y-3">
           <h3 className="text-sm font-bold text-slate-900 dark:text-white">Showroom & Workshop Location</h3>
           <p className="text-xs text-slate-600 dark:text-slate-300">
-            📍 Namungoona, Kampala - Hoima Road Junction, Uganda
+            📍 {contactAddress}
           </p>
           <p className="text-xs text-slate-600 dark:text-slate-300">
-            📞 Phone / WhatsApp: +256 700 000 000 / +256 770 000 000
+            📞 Phone: <a href={`tel:${contactPhone.replace(/[^\d+]/g, '')}`} className="hover:text-teal-600">{contactPhone}</a>
           </p>
           <p className="text-xs text-slate-600 dark:text-slate-300">
-            ✉️ Email: info@drumpalace.ug
+            💬 WhatsApp: <a href={whatsappHref} target="_blank" rel="noreferrer" className="hover:text-teal-600">{whatsapp}</a>
+          </p>
+          <p className="text-xs text-slate-600 dark:text-slate-300">
+            ✉️ Email: <a href={`mailto:${contactEmail}`} className="hover:text-teal-600">{contactEmail}</a>
+          </p>
+          <p className="text-xs text-slate-600 dark:text-slate-300">
+            🌐 Website: <a href="https://drumpalace.top" target="_blank" rel="noreferrer" className="hover:text-teal-600">drumpalace.top</a>
           </p>
 
           <button

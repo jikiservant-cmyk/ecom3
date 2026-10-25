@@ -162,6 +162,19 @@ export default function DrumPalaceApp() {
   const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
   const currency = useSyncExternalStore(subscribeCurrency, getCurrencySnapshot, getCurrencyServerSnapshot);
   const storeSettings = useSyncExternalStore(subscribeStoreSettings, getStoreSettingsSnapshot, getStoreSettingsServerSnapshot);
+  const siteContactPhone = storeSettings.contactPhone || DEFAULT_STORE_SETTINGS.contactPhone;
+  const siteContactWhatsapp = storeSettings.contactWhatsapp || siteContactPhone;
+  const siteContactEmail = storeSettings.contactEmail || DEFAULT_STORE_SETTINGS.contactEmail;
+  const siteContactAddress = storeSettings.contactAddress || DEFAULT_STORE_SETTINGS.contactAddress;
+  const siteWhatsappDigits = siteContactWhatsapp.replace(/\D/g, '');
+  const siteWhatsappInternational = siteWhatsappDigits
+    ? siteWhatsappDigits.startsWith('256')
+      ? siteWhatsappDigits
+      : siteWhatsappDigits.startsWith('0')
+        ? `256${siteWhatsappDigits.slice(1)}`
+        : `256${siteWhatsappDigits}`
+    : '256767733061';
+  const siteWhatsappHref = `https://wa.me/${siteWhatsappInternational}`;
   const [categories, setCategories] = useState<CategoryInfo[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [isLoadingProducts, setIsLoadingProducts] = useState<boolean>(true);
@@ -2230,8 +2243,11 @@ export default function DrumPalaceApp() {
                     </span>
                     <div>
                       <strong className="block text-xs text-[var(--ink)] mb-0.5">Phone & WhatsApp</strong>
-                      <a href={`tel:${storeSettings.contactPhone.replace(/\s+/g, '')}`} className="text-xs text-[var(--muted)] hover:text-[var(--accent)]">
-                        {storeSettings.contactPhone || '+256 700 123 456'}
+                      <a href={`tel:${siteContactPhone.replace(/[^\d+]/g, '')}`} className="block text-xs text-[var(--muted)] hover:text-[var(--accent)]">
+                        Call: {siteContactPhone}
+                      </a>
+                      <a href={siteWhatsappHref} target="_blank" rel="noreferrer" className="block text-xs text-[var(--muted)] hover:text-[var(--accent)]">
+                        WhatsApp: {siteContactWhatsapp}
                       </a>
                     </div>
                   </div>
@@ -2242,8 +2258,8 @@ export default function DrumPalaceApp() {
                     </span>
                     <div>
                       <strong className="block text-xs text-[var(--ink)] mb-0.5">Email</strong>
-                      <a href={`mailto:${storeSettings.contactEmail}`} className="text-xs text-[var(--muted)] hover:text-[var(--accent)]">
-                        {storeSettings.contactEmail || 'info@drumpalace.ug'}
+                      <a href={`mailto:${siteContactEmail}`} className="text-xs text-[var(--muted)] hover:text-[var(--accent)]">
+                        {siteContactEmail}
                       </a>
                     </div>
                   </div>
@@ -2255,7 +2271,7 @@ export default function DrumPalaceApp() {
                     <div>
                       <strong className="block text-xs text-[var(--ink)] mb-0.5">Store Location</strong>
                       <span className="text-xs text-[var(--muted)]">
-                        {storeSettings.contactAddress || 'Plot 14, Kampala Road, Music District, Uganda'}
+                        {siteContactAddress}
                       </span>
                     </div>
                   </div>
@@ -2266,8 +2282,8 @@ export default function DrumPalaceApp() {
                     </span>
                     <div>
                       <strong className="block text-xs text-[var(--ink)] mb-0.5">Website</strong>
-                      <a href="https://drumpalace.ug" target="_blank" rel="noreferrer" className="text-xs text-[var(--muted)] hover:text-[var(--accent)]">
-                        www.drumpalace.ug
+                      <a href="https://drumpalace.top" target="_blank" rel="noreferrer" className="text-xs text-[var(--muted)] hover:text-[var(--accent)]">
+                        drumpalace.top
                       </a>
                     </div>
                   </div>
@@ -2536,7 +2552,14 @@ export default function DrumPalaceApp() {
 
         {/* VIEW 15: ABOUT US */}
         {route === 'about' && (
-          <AboutUsView onBack={() => navigateTo('home')} onNavigate={navigateTo} />
+          <AboutUsView
+            onBack={() => navigateTo('home')}
+            onNavigate={navigateTo}
+            contactPhone={siteContactPhone}
+            contactWhatsapp={siteContactWhatsapp}
+            contactEmail={siteContactEmail}
+            contactAddress={siteContactAddress}
+          />
         )}
       </main>
 

@@ -34,6 +34,8 @@ export interface StoreSettings {
   contactWhatsapp: string;
   contactEmail: string;
   contactAddress: string;
+  /** Bumped when default storefront contact details change. */
+  contactInfoVersion?: number;
   freeShippingThreshold: number;
   bannerSlides?: BannerSlide[];
   hotDeals?: HotDealItem[];
@@ -42,6 +44,8 @@ export interface StoreSettings {
 export const DEFAULT_HOT_DEALS: HotDealItem[] = [];
 
 export const DEFAULT_BANNER_SLIDES: BannerSlide[] = [];
+
+const CURRENT_CONTACT_INFO_VERSION = 1;
 
 export const DEFAULT_STORE_SETTINGS: StoreSettings = {
   storeName: "Drum Palace",
@@ -52,14 +56,28 @@ export const DEFAULT_STORE_SETTINGS: StoreSettings = {
   heroSubtitle: "",
   heroBadge: "",
   heroButtonText: "",
-  contactPhone: "",
-  contactWhatsapp: "",
-  contactEmail: "",
-  contactAddress: "",
+  contactPhone: "+256767733061",
+  contactWhatsapp: "+256767733061",
+  contactEmail: "digifted464@gmail.com",
+  contactAddress: "Namungoona-Kuluyinja, Kampala - Uganda",
+  contactInfoVersion: CURRENT_CONTACT_INFO_VERSION,
   freeShippingThreshold: 500000,
   bannerSlides: [],
   hotDeals: [],
 };
+
+/** Apply the current business contact details to settings saved by older app versions. */
+export function normalizeStoreSettings(settings: Partial<StoreSettings> | null | undefined): StoreSettings {
+  const normalized = { ...DEFAULT_STORE_SETTINGS, ...(settings || {}) };
+  if ((settings?.contactInfoVersion || 0) < CURRENT_CONTACT_INFO_VERSION) {
+    normalized.contactPhone = DEFAULT_STORE_SETTINGS.contactPhone;
+    normalized.contactWhatsapp = DEFAULT_STORE_SETTINGS.contactWhatsapp;
+    normalized.contactEmail = DEFAULT_STORE_SETTINGS.contactEmail;
+    normalized.contactAddress = DEFAULT_STORE_SETTINGS.contactAddress;
+    normalized.contactInfoVersion = CURRENT_CONTACT_INFO_VERSION;
+  }
+  return normalized;
+}
 
 let cachedSettingsSnapshot: StoreSettings = DEFAULT_STORE_SETTINGS;
 let isFetchedFromDb = false;
@@ -80,7 +98,7 @@ export function getStoreSettingsSnapshot(): StoreSettings {
     isFetchedFromDb = true;
     fetchStoreSettingsFromDb().then((dbSettings) => {
       if (dbSettings) {
-        cachedSettingsSnapshot = { ...DEFAULT_STORE_SETTINGS, ...dbSettings };
+        cachedSettingsSnapshot = normalizeStoreSettings(dbSettings);
         window.dispatchEvent(new CustomEvent("store_settings_updated", { detail: cachedSettingsSnapshot }));
       }
     });
@@ -99,7 +117,7 @@ export function getStoreSettings(): StoreSettings {
 /**
  * Fetch store settings directly from the database table store_settings
  */
-export async function fetchStoreSettingsFromDb(): Promise<StoreSettings | null> {
+export async function fetchStoreSettingsFromDb(): Promise<Partial<StoreSettings> | null> {
   try {
     const { data, error } = await (supabase.from('store_settings') as any)
       .select('*')
@@ -119,7 +137,8 @@ export async function fetchStoreSettingsFromDb(): Promise<StoreSettings | null> 
  * Save store settings directly into the database table store_settings
  */
 export async function saveStoreSettings(settings: StoreSettings): Promise<boolean> {
-  cachedSettingsSnapshot = { ...DEFAULT_STORE_SETTINGS, ...settings };
+  const normalizedSettings = normalizeStoreSettings(settings);
+  cachedSettingsSnapshot = normalizedSettings;
   if (typeof window !== "undefined") {
     window.dispatchEvent(new CustomEvent("store_settings_updated", { detail: cachedSettingsSnapshot }));
   }
@@ -137,8 +156,8 @@ export async function saveStoreSettings(settings: StoreSettings): Promise<boolea
     if (existingRow) {
       const res = await (supabase.from('store_settings') as any).update({
         key: 'default',
-        value: settings,
-        settings: settings,
+        value: normalizedSettings,
+        settings: normalizedSettings,
         updated_at: now,
       }).eq('id', 'default_settings');
       error = res.error;
@@ -146,8 +165,8 @@ export async function saveStoreSettings(settings: StoreSettings): Promise<boolea
       const res = await (supabase.from('store_settings') as any).insert({
         id: 'default_settings',
         key: 'default',
-        value: settings,
-        settings: settings,
+        value: normalizedSettings,
+        settings: normalizedSettings,
         created_at: now,
         updated_at: now,
       });
