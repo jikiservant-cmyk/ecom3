@@ -1,40 +1,65 @@
 import { NextResponse } from 'next/server';
-import { isServerSupabaseConfigured, hasServiceRoleKey, getServerAnonClient } from '@/lib/server/supabaseServer';
+import {
+  getServerAdminClient,
+  getServerAnonClient,
+  getSupabaseProjectRef,
+  hasServiceRoleKey,
+  isServerSupabaseConfigured,
+} from '@/lib/server/supabaseServer';
 
 export const dynamic = 'force-dynamic';
 
 /**
  * Liveness/readiness endpoint for load balancers and on-call checks.
- * Returns degraded (503) when the database is unreachable so orchestrators
- * can distinguish "process alive" from "service usable".
+ * Verifies both the public database read and the server-only credential used
+ * by checkout, so a healthy anon client cannot mask a broken order writer.
  */
 export async function GET() {
   const startedAt = Date.now();
   const checks: Record<string, unknown> = {
     supabaseConfigured: isServerSupabaseConfigured,
+    supabaseProjectRef: getSupabaseProjectRef() || 'unknown',
     serviceRoleConfigured: hasServiceRoleKey,
     orderWriteReady: isServerSupabaseConfigured && hasServiceRoleKey,
   };
 
-  // Checkout order writes require the service-role key. Don't report a healthy
-  // deployment when the catalog is readable but every order write must fail.
   let healthy = isServerSupabaseConfigured && hasServiceRoleKey;
+
   if (isServerSupabaseConfigured) {
     try {
-      const client = getServerAnonClient();
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000);
-      const { error } = await (client.from('categories') as any)
+      const { error } = await getServerAnonClient()
+        .from('categories')
         .select('id', { count: 'exact', head: true });
-      clearTimeout(timer);
-      checks.database = error ? `error: ${error.message}` : 'ok';
+      checks.database = error ? `error:${error.code || 'unknown'}` : 'ok';
       if (error) healthy = false;
-    } catch (e: any) {
-      checks.database = `exception: ${e?.message || e}`;
+    } catch {
+      checks.database = 'exception';
       healthy = false;
     }
   } else {
     checks.database = 'not configured';
+    healthy = false;
+  }
+
+  if (hasServiceRoleKey) {
+    try {
+      const adminClient = getServerAdminClient();
+      if (!adminClient) {
+        checks.serviceRoleDatabase = 'not configured';
+        healthy = false;
+      } else {
+        const { error } = await adminClient
+          .from('categories')
+          .select('id', { count: 'exact', head: true });
+        checks.serviceRoleDatabase = error ? `error:${error.code || 'unknown'}` : 'ok';
+        if (error) healthy = false;
+      }
+    } catch {
+      checks.serviceRoleDatabase = 'exception';
+      healthy = false;
+    }
+  } else {
+    checks.serviceRoleDatabase = 'not configured';
     healthy = false;
   }
 

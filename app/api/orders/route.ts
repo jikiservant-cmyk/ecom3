@@ -114,7 +114,14 @@ export async function POST(req: NextRequest) {
     logger.error('order_create_no_service_role', {
       hint: 'Set SUPABASE_SERVICE_ROLE_KEY — order creation is refused without it',
     });
-    return jsonError('Checkout is temporarily unavailable. Please try again later.', 503);
+    return NextResponse.json(
+      {
+        success: false,
+        error: 'Checkout is temporarily unavailable. Please try again later.',
+        diagnosticCode: 'SERVICE_ROLE_NOT_CONFIGURED',
+      },
+      { status: 503 }
+    );
   }
 
   const auth = await authenticateRequest(req); // optional: attaches customer id when signed in
@@ -253,7 +260,15 @@ export async function POST(req: NextRequest) {
   });
 
   if (!result.success) {
-    return jsonError(result.error || 'Failed to create order', 500);
+    logger.error('order_create_failed_response', { diagnosticCode: result.diagnosticCode });
+    return NextResponse.json(
+      {
+        success: false,
+        error: result.error || 'Failed to create order',
+        ...(result.diagnosticCode ? { diagnosticCode: result.diagnosticCode } : {}),
+      },
+      { status: 500 }
+    );
   }
   logger.info('order_created', {
     orderId: result.orderId,

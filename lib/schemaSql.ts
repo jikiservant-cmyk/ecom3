@@ -381,12 +381,13 @@ CREATE TRIGGER profiles_protect_role
   FOR EACH ROW EXECUTE PROCEDURE public.protect_profile_role();
 
 -- 20. Atomic order creation with stock decrement (used by the API server).
--- Drop older signatures first so CREATE OR REPLACE can change the argument list.
+-- p_order_id is UUID to match the deployed service-role-only function signature.
+-- Drop older overloads first so PostgREST cannot resolve an ambiguous RPC.
 DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, TIMESTAMPTZ);
 DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ);
 DROP FUNCTION IF EXISTS public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ);
 CREATE OR REPLACE FUNCTION public.create_order_v2(
-  p_order_id TEXT,
+  p_order_id UUID,
   p_order_number TEXT,
   p_customer_id UUID,
   p_customer_name TEXT,
@@ -460,9 +461,10 @@ BEGIN
 END;
 $$;
 
--- Server-only: direct client calls could bypass the API's catalog re-pricing.
-REVOKE ALL ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.create_order_v2(TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) TO service_role;
+-- Server-only: postgres (the function owner) and service_role may execute.
+-- Direct client calls could bypass the API's catalog re-pricing.
+REVOKE ALL ON FUNCTION public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, BIGINT, BIGINT, BIGINT, TIMESTAMPTZ) TO service_role;
 
 -- 20b. CRITICAL — order state may never be supplied by a client.
 -- public.orders is INSERTable by anon/authenticated (guest checkout) and

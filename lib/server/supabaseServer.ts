@@ -32,6 +32,16 @@ export const isServerSupabaseConfigured = Boolean(
 
 export const hasServiceRoleKey = Boolean(SUPABASE_SERVICE_ROLE_KEY && !isPlaceholder(SUPABASE_SERVICE_ROLE_KEY));
 
+/** Public, non-secret Supabase project identifier for deployment diagnostics. */
+export function getSupabaseProjectRef(): string | null {
+  try {
+    const hostname = new URL(SUPABASE_URL || '').hostname;
+    return hostname.endsWith('.supabase.co') ? hostname.slice(0, -'.supabase.co'.length) : null;
+  } catch {
+    return null;
+  }
+}
+
 // Clients are stateless (persistSession/autoRefreshToken are off), so they are
 // safe to build once and reuse. Constructing one per request is pure overhead
 // on an authentication path that runs on every privileged call.
