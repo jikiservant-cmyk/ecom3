@@ -145,9 +145,9 @@ It currently lists the homepage only: shop, product, account, and information
 views are client-side states on that same URL, not separate crawlable pages.
 
 Before deploying, set `APP_URL` in the production environment to the site's
-canonical public URL (for example, `https://drumpalace.ug`) and redeploy. Then:
+canonical public URL (for example, `https://drumpalace.top`) and redeploy. Then:
 
-1. Open `https://drumpalace.ug/sitemap.xml` and confirm it shows the public
+1. Open `https://drumpalace.top/sitemap.xml` and confirm it shows the public
    homepage URL (not `localhost`). Use your actual domain if it differs.
 2. In Google Search Console, select the matching site property and open
    **Indexing → Sitemaps**.

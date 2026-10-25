@@ -27,22 +27,22 @@ describe('server-side order totals', () => {
 });
 
 describe('safeReturnUrl (open-redirect guard)', () => {
-  const appUrl = 'https://drumpalace.ug';
+  const appUrl = 'https://drumpalace.top';
 
   it('accepts same-origin return URLs', () => {
-    expect(safeReturnUrl('https://drumpalace.ug/?order=DP-123', appUrl)).toBe('https://drumpalace.ug/?order=DP-123');
+    expect(safeReturnUrl('https://drumpalace.top/?order=DP-123', appUrl)).toBe('https://drumpalace.top/?order=DP-123');
   });
 
   it('rejects cross-origin URLs', () => {
     expect(safeReturnUrl('https://evil.com/phish', appUrl)).toBe(null);
-    expect(safeReturnUrl('https://drumpalace.ug.evil.com/', appUrl)).toBe(null);
-    expect(safeReturnUrl('http://drumpalace.ug/', appUrl)).toBe(null); // wrong scheme
+    expect(safeReturnUrl('https://drumpalace.top.evil.com/', appUrl)).toBe(null);
+    expect(safeReturnUrl('http://drumpalace.top/', appUrl)).toBe(null); // wrong scheme
   });
 
   it('rejects junk and missing values', () => {
     expect(safeReturnUrl('not a url', appUrl)).toBe(null);
     expect(safeReturnUrl(null, appUrl)).toBe(null);
-    expect(safeReturnUrl('https://drumpalace.ug/x', undefined)).toBe(null);
+    expect(safeReturnUrl('https://drumpalace.top/x', undefined)).toBe(null);
   });
 });
 

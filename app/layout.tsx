@@ -1,6 +1,8 @@
 import type { Metadata, Viewport } from 'next';
 import './globals.css'; // Global styles
 
+const publicSiteUrl = (process.env.APP_URL || 'https://drumpalace.top').replace(/\/+$/, '');
+
 // NOTE: custom web fonts were previously loaded via next/font/google, which made
 // the production build depend on reaching fonts.googleapis.com. Builds must be
 // hermetic, so the app now uses the system font fallback chain defined in
@@ -14,6 +16,8 @@ export const viewport: Viewport = {
 };
 
 export const metadata: Metadata = {
+  metadataBase: new URL(publicSiteUrl),
+  alternates: { canonical: '/' },
   title: 'Drum Palace — Premium Instruments & Pro Audio',
   description: 'Premium Instruments & Pro Audio Gear. For Stage. For Studio. For You.',
   verification: {
@@ -23,6 +27,7 @@ export const metadata: Metadata = {
     title: 'Drum Palace — Premium Instruments & Pro Audio',
     description: 'Premium Instruments & Pro Audio Gear. For Stage. For Studio. For You.',
     type: 'website',
+    url: publicSiteUrl,
   },
   twitter: {
     card: 'summary_large_image',

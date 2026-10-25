@@ -969,7 +969,7 @@ export default function AdminPortal({
   };
 
   const handleCopyWebhookUrl = () => {
-    const origin = typeof window !== "undefined" ? window.location.origin : "https://drumpalace.ug";
+    const origin = typeof window !== "undefined" ? window.location.origin : "https://drumpalace.top";
     const webhookUrl = `${origin}/api/payments/livepay/webhook`;
     navigator.clipboard.writeText(webhookUrl);
     setCopiedWebhook(true);
@@ -2712,6 +2712,17 @@ export default function AdminPortal({
                       </div>
 
                       <div className="space-y-1.5">
+                        <label className="text-[11px] font-semibold text-slate-600 dark:text-slate-400">WhatsApp Support</label>
+                        <input
+                          type="text"
+                          value={storeSettings.contactWhatsapp}
+                          onChange={(e) => setStoreSettings({ ...storeSettings, contactWhatsapp: e.target.value })}
+                          placeholder="+256767733061"
+                          className="w-full px-3 py-2 text-xs rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none dark:bg-slate-800 dark:border-slate-700 dark:text-white font-medium"
+                        />
+                      </div>
+
+                      <div className="space-y-1.5">
                         <label className="text-[11px] font-semibold text-slate-600 dark:text-slate-400">Support Email</label>
                         <input
                           type="text"
@@ -3190,7 +3201,7 @@ export default function AdminPortal({
 
                 <div className="p-3 bg-slate-50 dark:bg-slate-800/60 rounded-xl border border-slate-200/80 dark:border-slate-700 flex items-center justify-between gap-3">
                   <span className="font-mono text-xs text-slate-800 dark:text-slate-200 truncate">
-                    {typeof window !== "undefined" ? `${window.location.origin}/api/payments/livepay/webhook` : "https://drumpalace.ug/api/payments/livepay/webhook"}
+                    {typeof window !== "undefined" ? `${window.location.origin}/api/payments/livepay/webhook` : "https://drumpalace.top/api/payments/livepay/webhook"}
                   </span>
                   <button
                     type="button"
