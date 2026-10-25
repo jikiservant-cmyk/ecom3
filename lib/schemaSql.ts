@@ -108,7 +108,8 @@ CREATE TABLE IF NOT EXISTS public.orders (
   total_minor_units BIGINT DEFAULT 0,
   total_amount NUMERIC,
   currency TEXT DEFAULT 'UGX',
-  status TEXT DEFAULT 'Pending' CHECK (status IN ('Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled', 'pending', 'processing', 'shipped', 'delivered', 'cancelled')),
+  -- Keep order state values lowercase to match the production order_status enum.
+  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'paid', 'processing', 'shipped', 'completed', 'cancelled', 'refunded', 'delivered')),
   payment_status TEXT DEFAULT 'Pending' CHECK (payment_status IN ('Pending', 'Paid', 'Failed', 'Refunded', 'pending', 'paid', 'failed', 'refunded')),
   -- Reason recorded whenever an admin moves payment_status by hand. Manual
   -- Paid/Refunded writes bypass the gateway, so they must leave a trail.
@@ -418,7 +419,8 @@ BEGIN
     total_minor_units, total_amount, created_at, updated_at
   ) VALUES (
     p_order_id, p_order_number, p_customer_id, p_customer_name, p_customer_email, p_customer_phone,
-    jsonb_build_object('address', COALESCE(p_shipping_address, '')), p_items, 'Pending', 'Pending',
+    -- orders.status is an enum with lowercase labels; payment_status is text.
+    jsonb_build_object('address', COALESCE(p_shipping_address, '')), p_items, 'pending', 'Pending',
     CASE WHEN lower(COALESCE(p_payment_method, 'momo')) = 'cod' THEN 'cod' ELSE 'momo' END, 'UGX',
     p_subtotal_minor_units, 0, p_shipping_minor_units, 0,
     p_total_minor_units, ROUND(p_total_minor_units / 100.0, 2), p_created_at, p_created_at
@@ -472,9 +474,8 @@ GRANT EXECUTE ON FUNCTION public.create_order_v2(UUID, TEXT, UUID, TEXT, TEXT, T
 -- 'Paid'. Without a trigger, any browser holding the public anon key could
 -- PostgREST-insert an order already marked Paid for 1 UGX, defeating the
 -- server-side catalog re-pricing and the webhook-only Paid transition.
--- Force EVERY insert to Pending regardless of caller: the server's order
--- creation path (create_order_v2 and the fallback insert) always writes
--- Pending anyway, so this costs nothing and closes the hole at the database.
+-- Force EVERY insert to pending regardless of caller. orders.status uses the
+-- lowercase order_status enum; payment_status is text and stays title-cased.
 CREATE OR REPLACE FUNCTION public.orders_force_pending()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -482,7 +483,7 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
-  NEW.status := 'Pending';
+  NEW.status := 'pending';
   NEW.payment_status := 'Pending';
   RETURN NEW;
 END;

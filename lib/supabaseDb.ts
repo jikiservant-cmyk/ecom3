@@ -818,7 +818,7 @@ export async function updateOrderStatusInDb(orderId: string, newStatus: DbOrder[
       return false;
     }
     const { error } = await (supabase.from('orders') as any)
-      .update({ status: newStatus, updated_at: new Date().toISOString() })
+      .update({ status: newStatus.toLowerCase(), updated_at: new Date().toISOString() })
       .eq('id', orderId);
 
     if (error) {
