@@ -242,14 +242,23 @@ export interface CreateOrderResult {
   orderId?: string;
   orderNumber?: string;
   error?: string;
+  /** Safe, non-sensitive stage/code for checkout support diagnostics. */
+  diagnosticCode?: string;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+function diagnosticCode(stage: string, databaseCode?: unknown): string {
+  const code = typeof databaseCode === 'string' && /^[a-z0-9]+$/i.test(databaseCode)
+    ? databaseCode.toUpperCase()
+    : 'UNKNOWN';
+  return `${stage}_${code}`;
+}
+
 /**
- * Create an order atomically. Uses the service-role client when available
- * (bypasses RLS); otherwise uses the anon client and relies on the public-insert
- * RLS policy documented for guest checkout.
+ * Create an order atomically using the service-role client (bypasses RLS).
+ * There is intentionally no anon-client fallback: the database grants execute
+ * on create_order_v2 only to service_role and postgres.
  */
 export async function createOrderServer(input: CreateOrderInput): Promise<CreateOrderResult> {
   // FINANCIAL INTEGRITY: order writes require the service-role client. The
@@ -263,7 +272,11 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
     logger.error('order_create_no_service_role', {
       hint: 'Set SUPABASE_SERVICE_ROLE_KEY — order creation is refused without it',
     });
-    return { success: false, error: 'Checkout is temporarily unavailable. Please try again.' };
+    return {
+      success: false,
+      error: 'Checkout is temporarily unavailable. Please try again.',
+      diagnosticCode: 'SERVICE_ROLE_NOT_CONFIGURED',
+    };
   }
   const orderId = generateOrderId();
   const orderNumber = generateOrderNumber();
@@ -299,16 +312,22 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
     if (!error) {
       return { success: true, orderId, orderNumber };
     }
-    // PGRST202 / 42883 => function not deployed; fall through to manual path.
+    // Only PostgREST/Postgres missing-function codes should enter the legacy
+    // fallback. A message mentioning create_order_v2 is not enough: permission
+    // errors also mention the function name and must not be misclassified.
     const code = (error as any).code || '';
     const msg = (error as any).message || '';
-    if (!msg.includes('create_order_v2') && code !== 'PGRST202' && code !== '42883') {
-      logger.error('order_create_rpc_failed', { error: msg, code });
-      return { success: false, error: 'Order could not be created. Please try again.' };
+    if (code !== 'PGRST202' && code !== '42883') {
+      logger.error('order_create_rpc_failed', { orderId, error: msg, code });
+      return {
+        success: false,
+        error: 'Order could not be created. Please try again.',
+        diagnosticCode: diagnosticCode('RPC', code),
+      };
     }
-    logger.warn('order_create_rpc_missing_fallback', { code });
+    logger.warn('order_create_rpc_missing_fallback', { orderId, code });
   } catch (e: any) {
-    logger.warn('order_create_rpc_exception_fallback', { error: e?.message });
+    logger.warn('order_create_rpc_exception_fallback', { orderId, error: e?.message });
   }
 
   // Path 2: sequential inserts with strict error propagation (no silent partials).
@@ -349,7 +368,11 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
             requested: item.quantity,
             available,
           });
-          return { success: false, error: `"${item.productName}" does not have enough stock for this order.` };
+          return {
+            success: false,
+            error: `"${item.productName}" does not have enough stock for this order.`,
+            diagnosticCode: 'STOCK_INSUFFICIENT',
+          };
         }
       }
     }
@@ -381,8 +404,12 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       updated_at: now,
     });
     if (orderError) {
-      logger.error('order_insert_failed', { error: orderError.message });
-      return { success: false, error: 'Order could not be created. Please try again.' };
+      logger.error('order_insert_failed', { orderId, error: orderError.message, code: orderError.code });
+      return {
+        success: false,
+        error: 'Order could not be created. Please try again.',
+        diagnosticCode: diagnosticCode('ORDER_INSERT', orderError.code),
+      };
     }
 
     if (input.items.length > 0) {
@@ -401,14 +428,22 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       if (itemsError) {
         // Compensate: do not leave a dangling order header.
         await (client.from('orders') as any).delete().eq('id', orderId);
-        logger.error('order_items_insert_failed', { error: itemsError.message });
-        return { success: false, error: 'Order could not be created. Please try again.' };
+        logger.error('order_items_insert_failed', { orderId, error: itemsError.message, code: itemsError.code });
+        return {
+          success: false,
+          error: 'Order could not be created. Please try again.',
+          diagnosticCode: diagnosticCode('ORDER_ITEMS_INSERT', itemsError.code),
+        };
       }
     }
 
     return { success: true, orderId, orderNumber };
   } catch (e: any) {
-    logger.error('order_create_exception', { error: e?.message });
-    return { success: false, error: 'Order could not be created. Please try again.' };
+    logger.error('order_create_exception', { orderId, error: e?.message });
+    return {
+      success: false,
+      error: 'Order could not be created. Please try again.',
+      diagnosticCode: 'ORDER_CREATE_EXCEPTION',
+    };
   }
 }

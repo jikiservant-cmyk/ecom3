@@ -705,7 +705,12 @@ export default function DrumPalaceApp() {
       });
       const orderData = await orderRes.json().catch(() => null);
       if (!orderRes.ok || !orderData?.success || !orderData.orderId) {
-        showToast(orderData?.error || 'Could not create your order. Please try again.');
+        const message = orderData?.error || 'Could not create your order. Please try again.';
+        const diagnosticCode = typeof orderData?.diagnosticCode === 'string'
+          && /^[A-Z0-9_]+$/.test(orderData.diagnosticCode)
+          ? orderData.diagnosticCode
+          : null;
+        showToast(diagnosticCode ? `${message} (Ref: ${diagnosticCode})` : message);
         return;
       }
 

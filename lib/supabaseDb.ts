@@ -637,7 +637,9 @@ export async function deleteProductFromDb(productId: string): Promise<{ success:
 }
 
 /**
- * Create a new order directly in the database (orders, order_items, payments tables)
+ * Create an order through the server API. Order and payment writes must never
+ * be made with the browser's anon client; /api/orders reprices the cart and
+ * persists it using the server-only service-role client.
  */
 export async function createOrderInDb(orderData: {
   customerName: string;
@@ -648,128 +650,43 @@ export async function createOrderInDb(orderData: {
   shippingAddress?: string;
   phone?: string;
   customerId?: string;
-}): Promise<{ success: boolean; orderId?: string; orderNumber?: string; error?: string }> {
-  const orderNumber = generateSecureOrderNumber();
-  const orderId = generateUuid();
-  const createdAt = new Date().toISOString();
-  const totalMinorUnits = Math.round(orderData.total * 100);
-
-  // Strictly check if customerId is a valid UUID to prevent PostgreSQL type 22P02 error
-  const safeCustomerId = isValidUuid(orderData.customerId) ? orderData.customerId : null;
-
+}): Promise<{
+  success: boolean;
+  orderId?: string;
+  orderNumber?: string;
+  error?: string;
+  diagnosticCode?: string;
+}> {
   try {
-    // 1. Insert into database orders table with safe payload.
-    // SECURITY: orders are ALWAYS created Pending. Only a verified payment
-    // webhook may advance payment_status to Paid.
-    const orderPayload: any = {
-      id: orderId,
-      order_number: orderNumber,
-      customer_id: safeCustomerId,
-      customer_email: orderData.customerEmail || 'customer@drumpalace.ug',
-      customer_name: orderData.customerName || 'Valued Musician',
-      customer_phone: orderData.phone || null,
-      shipping_address: { address: orderData.shippingAddress || 'Standard Delivery, Uganda', phone: orderData.phone || null },
-      status: 'Pending',
-      currency: 'UGX',
-      subtotal_minor_units: totalMinorUnits,
-      discount_minor_units: 0,
-      shipping_minor_units: 0,
-      tax_minor_units: 0,
-      total_minor_units: totalMinorUnits,
-      total_amount: orderData.total,
-      payment_status: 'Pending',
-      created_at: createdAt,
-      updated_at: createdAt,
-    };
-
-    let { error: orderError } = await (supabase.from('orders') as any).insert(orderPayload);
-
-    // If initial insert fails (e.g. FK constraint on customer_id or status case check), retry with sanitized fields
-    if (orderError) {
-      console.warn('Orders initial insert notice, retrying with normalized payload:', orderError.message);
-      
-      const retryPayload: any = {
-        id: orderId,
-        order_number: orderNumber,
-        customer_id: null, // Nullify to prevent foreign key errors
-        customer_email: orderData.customerEmail || 'customer@drumpalace.ug',
-        customer_name: orderData.customerName || 'Valued Musician',
-        customer_phone: orderData.phone || null,
-        shipping_address: { address: orderData.shippingAddress || 'Standard Delivery, Uganda', phone: orderData.phone || null },
-        status: 'pending',
-        currency: 'UGX',
-        subtotal_minor_units: totalMinorUnits,
-        total_minor_units: totalMinorUnits,
-        total_amount: orderData.total,
-        payment_status: 'Pending',
-        created_at: createdAt,
-        updated_at: createdAt,
+    const { data: sessionData } = await supabase.auth.getSession();
+    const accessToken = sessionData?.session?.access_token;
+    const response = await fetch('/api/orders', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+      },
+      body: JSON.stringify({
+        customerName: orderData.customerName,
+        customerEmail: orderData.customerEmail,
+        items: orderData.items,
+        total: orderData.total,
+        paymentMethod: orderData.paymentMethod === 'cod' ? 'cod' : 'momo',
+        shippingAddress: orderData.shippingAddress,
+        phone: orderData.phone,
+      }),
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok || !result?.success || !result.orderId) {
+      return {
+        success: false,
+        error: result?.error || 'Failed to record order',
+        ...(typeof result?.diagnosticCode === 'string' ? { diagnosticCode: result.diagnosticCode } : {}),
       };
-
-      const retryRes = await (supabase.from('orders') as any).insert(retryPayload);
-      if (retryRes.error) {
-        console.error('Orders insert fallback error:', retryRes.error);
-        orderError = retryRes.error;
-      } else {
-        orderError = null;
-      }
     }
-
-    // 2. Insert line items into database order_items table
-    if (orderData.items && orderData.items.length > 0) {
-      const itemsPayload = orderData.items.map((it) => {
-        const itemPriceMinor = Math.round(it.price * 100);
-        return {
-          id: generateUuid(),
-          order_id: orderId,
-          product_name: it.productName,
-          product_slug: it.productName.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
-          variant_sku: it.variant || 'STANDARD',
-          variant_attributes: it.variant ? { variant: it.variant } : {},
-          unit_price_minor_units: itemPriceMinor,
-          quantity: it.quantity,
-          line_total_minor_units: itemPriceMinor * it.quantity,
-          created_at: createdAt,
-        };
-      });
-
-      try {
-        const { error: itemsErr } = await (supabase.from('order_items') as any).insert(itemsPayload);
-        if (itemsErr) {
-          console.warn('Order items insert notice:', itemsErr.message);
-        }
-      } catch (err: any) {
-        console.error('Order items insert exception:', err);
-      }
-    }
-
-    // 3. Insert payment record into database payments table
-    const paymentReference = `LP-UG-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
-    try {
-      await (supabase.from('payments') as any).insert({
-        id: generateUuid(),
-        order_id: orderId,
-        provider: orderData.paymentMethod || 'livepay',
-        provider_reference: paymentReference,
-        status: 'pending',
-        amount_minor_units: totalMinorUnits,
-        currency: 'UGX',
-        raw_payload: {
-          method: orderData.paymentMethod || 'momo',
-          phone: orderData.phone,
-          customer: orderData.customerName,
-        },
-        created_at: createdAt,
-        updated_at: createdAt,
-      });
-    } catch (err: any) {
-      console.warn('Payment insert notice:', err);
-    }
-
-    return { success: true, orderId, orderNumber };
+    return { success: true, orderId: result.orderId, orderNumber: result.orderNumber };
   } catch (err: any) {
-    console.error('Database createOrderInDb error:', err);
-    return { success: false, error: err?.message || 'Failed to record order in database' };
+    return { success: false, error: err?.message || 'Failed to record order' };
   }
 }
 
