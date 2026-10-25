@@ -390,7 +390,9 @@ export async function createOrderServer(input: CreateOrderInput): Promise<Create
       customer_phone: input.customerPhone || null,
       shipping_address: { address: input.shippingAddress || '' },
       items: input.items,
-      status: 'Pending',
+      // The production orders.status column is the order_status enum, whose
+      // labels are lowercase; payment_status remains text and is title-cased.
+      status: 'pending',
       payment_status: 'Pending',
       payment_method: input.paymentMethod === 'cod' ? 'cod' : 'momo',
       currency: 'UGX',

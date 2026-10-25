@@ -8,7 +8,8 @@ export const dynamic = 'force-dynamic';
 
 const MAX_ITEMS = 50;
 const MAX_QUANTITY = 20;
-const ALLOWED_STATUSES = ['Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled'];
+const ALLOWED_STATUSES = new Set(['pending', 'processing', 'shipped', 'delivered', 'cancelled']);
+const ALLOWED_STATUS_LABELS = ['Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled'];
 const ALLOWED_PAYMENT_STATUSES = ['Pending', 'Paid', 'Failed', 'Refunded'];
 
 /** Redact PII for the public order-tracking lookup. */
@@ -277,7 +278,7 @@ export async function POST(req: NextRequest) {
     totalMinorUnits: totals.totalMinorUnits,
   });
   return NextResponse.json(
-    { success: true, orderId: result.orderId, orderNumber: result.orderNumber, status: 'Pending' },
+    { success: true, orderId: result.orderId, orderNumber: result.orderNumber, status: 'pending' },
     { status: 201 }
   );
 }
@@ -300,10 +301,13 @@ export async function PATCH(req: NextRequest) {
 
   const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
   if (status !== undefined) {
-    if (!ALLOWED_STATUSES.includes(status)) {
-      return jsonError(`Status must be one of: ${ALLOWED_STATUSES.join(', ')}`, 400);
+    // The production order_status enum uses lowercase labels. Accept the
+    // storefront's legacy title-case values but always persist lowercase.
+    const normalizedStatus = typeof status === 'string' ? status.trim().toLowerCase() : '';
+    if (!ALLOWED_STATUSES.has(normalizedStatus)) {
+      return jsonError(`Status must be one of: ${ALLOWED_STATUS_LABELS.join(', ')}`, 400);
     }
-    update.status = status;
+    update.status = normalizedStatus;
   }
   if (paymentStatus !== undefined) {
     // Normalize legacy lowercase values ('paid' -> 'Paid').
@@ -324,7 +328,7 @@ export async function PATCH(req: NextRequest) {
     }
     update.payment_status = normalized;
     if (normalized === 'Paid' && status === undefined) {
-      update.status = 'Processing'; // paying an order moves it into the pipeline
+      update.status = 'processing'; // paying an order moves it into the pipeline
     }
   }
   // Shipment tracking. Imported items are dispatched from abroad, so the admin

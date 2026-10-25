@@ -249,7 +249,7 @@ export async function POST(req: NextRequest) {
     const orderUpdate: Record<string, unknown> = { updated_at: now };
     if (outcome === 'paid') {
       orderUpdate.payment_status = 'Paid';
-      if (order.payment_status !== 'Paid') orderUpdate.status = 'Processing';
+      if (order.payment_status !== 'Paid') orderUpdate.status = 'processing';
     } else {
       orderUpdate.payment_status = 'Failed';
     }
